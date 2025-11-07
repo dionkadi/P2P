@@ -5,13 +5,15 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <endian.h>
 #include <span>
 #include <string>
 #include <string_view>
 #include <vector>
 #include <stdexcept>
 
-#include "asio.hpp"
+#include <boost/asio.hpp>
+namespace asio = boost::asio;
 
 
 class BufferWriter {
@@ -70,13 +72,11 @@ private:
 
 
 constexpr std::string_view PROTOCOL_STRING = "MIT-P2P-V1.0";
-constexpr size_t HASH_SIZE = 32;
+constexpr size_t HASH_SIZE = 20;
 constexpr size_t PEER_ID_SIZE = 20;
 constexpr size_t HANDSHAKE_RESERVED_BYTES = 8;
 constexpr size_t HANDSHAKE_BASE_LEN = 1 + PROTOCOL_STRING.size() + HANDSHAKE_RESERVED_BYTES + HASH_SIZE + PEER_ID_SIZE;
 constexpr size_t BLOCK_SIZE = 16384;
-
-constexpr size_t INFO_HASH_SIZE = 32;
 
 using PeerId = std::string;
 using InfoHash = std::vector<char>;
@@ -176,97 +176,47 @@ struct PiecePayload {
 };
 
 
-enum class TrackerMessageType: uint8_t {
-    ErrorResponse = 0,
-    AnnounceRequest = 1,
-    AnnounceResponse = 2,
-    QueryRequest = 3,
-    QueryResponse = 4,
+#pragma pack(push, 1)
+
+struct UdpConnectRequest {
+    uint64_t protocol_id = htobe64(0x41727101980);
+    uint32_t action = htobe32(0);
+    uint32_t transaction_id;
 };
 
+struct UdpConnectResponse {
+    uint32_t action;
+    uint32_t transaction_id;
+    uint64_t connection_id;
+};
 
-struct TrackerAnnouceReqeust {
-    std::string info_hash_bytes;
+struct UdpAnnounceRequest {
+    uint64_t connection_id;
+    uint32_t action = htobe32(1); // 1 for announce
+    uint32_t transaction_id;
+    std::array<char, 20> info_hash;
+    std::array<char, 20> peer_id;
+    uint64_t downloaded;
+    uint64_t left;
+    uint64_t uploaded;
+    uint32_t event = htobe32(0); // 0: none; 1: completed; 2: started; 3: stopped
+    uint32_t ip_address = 0; // 0 for sender's IP
+    uint32_t key = 0; // optional
+    int32_t num_want = htobe32(-1); // default
     uint16_t port;
-
-    static std::vector<char> serialize(const TrackerAnnouceReqeust& req) {
-        std::vector<char> buffer;
-        buffer.push_back(static_cast<char>(TrackerMessageType::AnnounceRequest));
-        BufferWriter writer(buffer);
-        writer.write_bytes(req.info_hash_bytes.data(), INFO_HASH_SIZE);
-        writer.write(asio::detail::socket_ops::host_to_network_short(req.port));
-        return buffer;
-    }
-
-    static TrackerAnnouceReqeust deserialize(std::span<const char> payload) {
-        TrackerAnnouceReqeust req;
-        BufferReader reader(payload);
-        auto info_hash_span = reader.read_bytes(INFO_HASH_SIZE);
-        req.info_hash_bytes.assign(info_hash_span.begin(), info_hash_span.end());
-        req.port = asio::detail::socket_ops::network_to_host_short(reader.read<uint16_t>());
-        return req;
-    }
 };
 
-struct TrackerQueryRequest {
-    std::string info_hash_bytes;
-
-    static std::vector<char> serialize(const TrackerQueryRequest& req) {
-        std::vector<char> buffer;
-        buffer.push_back(static_cast<char>(TrackerMessageType::QueryRequest));
-        BufferWriter writer(buffer);
-        writer.write_bytes(req.info_hash_bytes.data(), INFO_HASH_SIZE);
-        return buffer;
-    }
-
-    static TrackerQueryRequest deserialize(std::span<const char> payload) {
-        TrackerQueryRequest req;
-        BufferReader reader(payload);
-        auto info_hash_span = reader.read_bytes(INFO_HASH_SIZE);
-        req.info_hash_bytes.assign(info_hash_span.begin(), info_hash_span.end());
-        return req;
-    }
+struct UdpAnnounceResponse {
+    uint32_t action;
+    uint32_t transaction_id;
+    uint32_t interval;
+    uint32_t leechers;
+    uint32_t seeders;
 };
 
-struct TrackerQueryResponse {
-    std::vector<std::string> peer_addrs;
-
-    static std::vector<char> serialize(const TrackerQueryResponse& res) {
-        std::vector<char> buffer;
-        buffer.push_back(static_cast<char>(TrackerMessageType::QueryResponse));
-        BufferWriter writer(buffer);
-
-        for (const auto& addr_str : res.peer_addrs) {
-            size_t colon_pos = addr_str.find(':');
-            if (colon_pos == std::string::npos) {
-                throw std::runtime_error("Invalid peer address");
-            }
-            std::string ip_str = addr_str.substr(0, colon_pos);
-            uint16_t port = std::stoul(addr_str.substr(colon_pos+1));
-
-            asio::ip::address_v4 ip = asio::ip::make_address_v4(ip_str);
-            auto ip_bytes = ip.to_bytes();
-
-            writer.write_bytes(ip_bytes.data(), ip_bytes.size());
-            writer.write(asio::detail::socket_ops::host_to_network_short((port)));
-        }
-
-        return buffer;
-    }
-
-    static TrackerQueryResponse deserialize(std::span<const char> payload) {
-        TrackerQueryResponse res;
-        BufferReader reader(payload);
-
-        while (reader.remaining() >= 6) {
-            auto ip_bytes_span = reader.read_bytes(4);
-            std::array<unsigned char, 4> ip_bytes_array;
-            std::copy(ip_bytes_span.begin(), ip_bytes_span.end(), ip_bytes_array.begin());
-            asio::ip::address_v4 ip(ip_bytes_array);
-            uint16_t port = asio::detail::socket_ops::network_to_host_short(reader.read<uint16_t>());
-            res.peer_addrs.push_back(ip.to_string() + ":" + std::to_string(port));
-        }
-
-        return res;
-    }
+struct UdpPeerInfo {
+    uint32_t ip;
+    uint16_t port;
 };
+
+#pragma pack(pop)

@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 4.0)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 project(P2PFileSharing
@@ -20,29 +20,28 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 
 find_package(Threads REQUIRED)
+find_package(Boost REQUIRED)
 
 add_subdirectory(third_party/json)
 add_subdirectory(third_party/picosha2)
 add_subdirectory(third_party/spdlog)
-add_subdirectory(third_party/asio/asio)
 
 add_library(p2p_common
-    src/AsyncSocket.cpp
-    src/Logger.cpp
-    src/Peer.cpp
-    src/Tracker.cpp
-    src/Crypto.cpp
-    src/MetaInfo.cpp
-    src/Protocol.cpp
-    src/ThreadPool.cpp
+    src/Utils/Bencode.cpp
+    src/Peers/Peer.cpp
+    src/Peers/Tracker.cpp
+    src/Peers/TrackerClient.cpp
+    src/Protocols/MetaInfo.cpp
+    src/Protocols/Protocol.cpp
 )
 
 target_include_directories(p2p_common PUBLIC
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include"
     third_party/asio/asio/include
     third_party/picosha2/
     third_party/json/include/nlohmann
     third_party/spdlog/include/spdlog
+    third_party/libtorrent/include/libtorrent
 )
 
 set(INCLUDEDIRS
@@ -55,7 +54,6 @@ target_link_libraries(p2p_common PUBLIC
     spdlog
     Threads::Threads
     picosha2
-    asio
 )
 
 add_executable(tracker src/main_tracker.cpp)

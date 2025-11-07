@@ -1,5 +1,5 @@
-#include "Tracker.hpp"
-#include "Logger.hpp"
+#include "Peers/Tracker.hpp"
+#include "Utils/Logger.hpp"
 #include <csignal>
 
 #include <iostream>
@@ -35,7 +35,8 @@ int main(
             tracker.get_io_context().stop();
         });
 
-        tracker.listen(port);
+        tracker.listen_http(port);
+        tracker.listen_udp(port);
         tracker.run();
     } catch (const std::exception& e) {
         LOGCRITICAL("Tracker failed to initialize: {}", e.what());

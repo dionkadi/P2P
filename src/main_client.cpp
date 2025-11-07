@@ -1,6 +1,6 @@
-#include "Peer.hpp"
-#include "Logger.hpp"
-#include "MetaInfo.hpp"
+#include "Peers/Peer.hpp"
+#include "Utils/Logger.hpp"
+#include "Protocols/MetaInfo.hpp"
 #include <chrono>
 #include <csignal>
 #include <exception>
@@ -23,11 +23,21 @@ std::string generate_peer_id() {
     return peer_id;
 }
 
+std::vector<std::string> split(const std::string& s, char delimiter) {
+    std::vector<std::string> tokens;
+    std::string token;
+    std::istringstream tokenStream(s);
+    while (std::getline(tokenStream, token, delimiter)) {
+        tokens.push_back(token);
+    }
+    return tokens;
+}
+
 void print_usage() {
     std::cerr << "Usage:\n"
-              << "  ./client create <file_to_share> <output_torrent_file>\n"
-              << "  ./client seed <torrent_file> <peer_port> <tracker_addr>:<tracker_port>\n"
-              << "  ./client download <torrent_file> <save_path> <tracker_addr>:<tracker_port>\n";
+              << "  ./client create <file_to_share> <output_torrent_file> <tracker_url>\n" 
+              << "  ./client seed <torrent_file> <content_directory> <peer_port>\n" 
+              << "  ./client download <torrent_file> <save_path> <peer_port>\n";
 }
 
 bool parse_address(const std::string& addr_str, std::string& host, int& port) {
@@ -54,9 +64,6 @@ int main(int argc, char* argv[]) {
  
     
     try {
-        std::string tracker_host;
-        int tracker_port;
-        int tracker_arg_index = -1;
 
         asio::io_context io_context;
         auto work_guard = asio::make_work_guard(io_context);
@@ -66,29 +73,18 @@ int main(int argc, char* argv[]) {
 
         std::string command = argv[1];
 
-        if (command == "create" && argc == 4) {
+        if (command == "create" && argc == 5) {
             std::string source_path = argv[2];
             std::string torrent_path = argv[3];
-            if (!MetaInfo::create_from_file(source_path, torrent_path)) {
+            std::string tracker_urls_str = argv[4];
+
+            std::vector<std::string> tracker_urls = split(tracker_urls_str, ',');
+            if (!MetaInfo::create_from_file(source_path, torrent_path, tracker_urls)) {
                 LOGCRITICAL("Failed to create torrent file.");
                 return 1;
             }
             LOGINFO("Torrent file created successfully.");
             return 0;
-        }
-
-        if (command == "seed" && argc == 5) {
-            tracker_arg_index = 4;
-        } else if (command == "download" && argc == 5) {
-            tracker_arg_index = 4;
-        } else {
-            print_usage();
-            return 1;
-        }
-    
-        if (!parse_address(argv[tracker_arg_index], tracker_host, tracker_port)) {
-            std::cerr << "Invalid tracker address format. Use host:port (e.g., 127.0.0.1:3333).\n";
-            return 1;
         }
 
         if (command == "seed") {
@@ -97,16 +93,15 @@ int main(int argc, char* argv[]) {
                 return 1; 
             }
             std::filesystem::path file_path = argv[2];
-            int peer_port = std::stoi(argv[3]);
-
-            auto content_dir = std::filesystem::path(file_path).parent_path();
+            std::filesystem::path content_dir = argv[3];
+            int peer_port = std::stoi(argv[4]);
             
             LOGINFO("Seeding from torrent '{}', content in '{}'. Listening on port {}", file_path.string(), content_dir.string(), peer_port);
 
             auto seeder = std::make_shared<Seeder>(io_context, my_peer_id, file_path, content_dir, peer_port);
             asio::co_spawn(io_context, 
-                [seeder, tracker_host, tracker_port]() {
-                    return seeder->run(tracker_host, tracker_port);
+                [seeder]() {
+                    return seeder->run();
                 }, 
                 asio::detached
             );
@@ -114,22 +109,28 @@ int main(int argc, char* argv[]) {
         else if (command == "download") {
             std::filesystem::path torrent_path = argv[2];
             std::filesystem::path save_path = argv[3];
-
-            auto leecher = std::make_shared<Leecher>(io_context, my_peer_id, torrent_path, save_path);
+            int peer_port = std::stoi(argv[4]);
 
             asio::co_spawn(io_context, 
-                [leecher, tracker_host, tracker_port, work_guard = std::move(work_guard)]() mutable -> asio::awaitable<void> {
+                [&io_context, my_peer_id, torrent_path, save_path, peer_port, work_guard = std::move(work_guard)]() mutable -> asio::awaitable<void> 
+                {
                     try {
-                        bool success = co_await leecher->run(tracker_host, tracker_port);
-                        if (success) {
-                            LOGINFO("Download process completed successfully.");
+                        auto leecher = co_await Leecher::create(io_context, my_peer_id, torrent_path, save_path, peer_port);
+                        if (leecher) {
+                            bool success = co_await leecher->run();
+                            if (success) {
+                                LOGINFO("Download process completed successfully.");
+                            } else {
+                                LOGWARN("Download process finished with errors.");
+                            }
                         } else {
-                            LOGWARN("Download process finished with errors.");
+                            LOGCRITICAL("Failed to initialize the leecher. Aborting.");
                         }
                     } catch (const std::exception& ex) {
-                        LOGERR("Download coroutine threw an exception: {}", ex.what());
+                        LOGCRITICAL("Download coroutine threw an exception: {}", ex.what());
                     }
-                    work_guard.reset(); // Stop the io_context
+                    
+                    work_guard.reset();
                 },
                 asio::detached
             );
