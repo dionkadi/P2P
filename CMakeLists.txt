@@ -54,6 +54,7 @@ target_link_libraries(p2p_common PUBLIC
     spdlog
     Threads::Threads
     picosha2
+    -lboost_url
 )
 
 add_executable(tracker src/main_tracker.cpp)

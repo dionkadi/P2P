@@ -30,7 +30,7 @@ public:
         auto target = req.target();
         auto query_pos = target.find('?');
         auto path = (query_pos != std::string_view::npos) ? target.substr(0, query_pos) : target;
-        auto it = routes_.find(std::string(path));
+        auto it = routes_.find(path);
         if (it != routes_.end()) {
             co_return co_await it->second(std::move(req));
         } else {
@@ -38,13 +38,13 @@ public:
             res.set(http::field::server, BOOST_BEAST_VERSION_STRING);
             res.set(http::field::content_type, "text/plain");
             res.keep_alive(req.keep_alive());
-            res.body() = "The resource '" + std::string(req.target()) + "' was not found.";
+            res.body() = std::format("The resource '{}' was not found.", req.target());
             res.prepare_payload();
             co_return res;
         }
     }
 private:
-    std::map<std::string, HttpHandler> routes_;
+    std::map<std::string, HttpHandler, std::less<>> routes_;
 };
 
 
@@ -53,26 +53,46 @@ inline asio::awaitable<void> http_session(tcp::socket socket, std::shared_ptr<Ht
     beast::error_code ec;
     beast::tcp_stream stream(std::move(socket));
     beast::flat_buffer buffer;
+    stream.expires_after(std::chrono::seconds(30));
     try {
-        // Read a request
-        HttpRequest req;
-        co_await http::async_read(stream, buffer, req, asio::use_awaitable);
-        // Add remote endpoint info to a custom header for the tracker handler to use
-        req.set("remote_endpoint", stream.socket().remote_endpoint().address().to_string());
-        
-        // Handle the request and get a response
-        HttpResponse res = co_await router->handle_request(std::move(req));
-        // Write the response
-        co_await http::async_write(stream, std::move(res), asio::use_awaitable);
-        
-        // For this simple tracker, we always close the connection.
-        ec = stream.socket().shutdown(tcp::socket::shutdown_send, ec);
-    } catch (const std::exception& e) {
-        // Don't log end-of-stream, it's a normal client disconnect.
-        if (std::string(e.what()).find("End of file") == std::string::npos) {
+        while (true) {
+            // The read operation will reset the timer upon starting.
+            // If the timer expires, the read will fail with a timeout error.
+            HttpRequest req;
+            co_await http::async_read(stream, buffer, req, asio::use_awaitable);
+            
+            req.set("remote_endpoint", stream.socket().remote_endpoint().address().to_string());
+            
+            HttpResponse res = co_await router->handle_request(std::move(req));
+            
+            // Check if we should close the connection before we move the response.
+            bool const keep_alive = res.keep_alive();
+            
+            co_await http::async_write(stream, std::move(res), asio::use_awaitable);
+            
+            if (!keep_alive) {
+                // Client requested to close, or we decided to.
+                break;
+            }
+            // Set the timeout for the next request.
+            stream.expires_after(std::chrono::seconds(30));
+        }
+    } catch (const boost::system::system_error& e) {
+        // This is a common way clients disconnect. No need to log as an error.
+        if (e.code() == http::error::end_of_stream || 
+            e.code() == asio::error::eof ||
+            e.code() == asio::error::connection_reset) 
+        {
+            // Normal disconnect, do nothing or log at a debug level
+        } else {
             LOGERR("HTTP Session error: {}", e.what());
         }
+    } catch (const std::exception& e) {
+        // Catch other potential standard exceptions
+        LOGERR("HTTP Session unexpected error: {}", e.what());
     }
+
+    ec = stream.socket().shutdown(tcp::socket::shutdown_send, ec);
 }
 
 // The listener is a coroutine that accepts connections in a loop.

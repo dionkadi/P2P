@@ -73,6 +73,7 @@ HttpHandler Tracker::create_announce_handler() {
             auto params = parse_query_params(query_str);
             
             std::string info_hash = url_decode(params.at("info_hash"));
+            std::vector<std::byte> info_hash_bytes(reinterpret_cast<std::byte *>(info_hash.data()), reinterpret_cast<std::byte *>(info_hash.data()) + info_hash.size());
             uint16_t port = std::stoi(params.at("port"));
             std::string ip = std::string(req["remote_endpoint"]);
             
@@ -85,7 +86,7 @@ HttpHandler Tracker::create_announce_handler() {
             co_await asio::dispatch(strand_, asio::use_awaitable);
 
             std::string peers_binary;
-            auto it = peers_.find(info_hash);
+            auto it = peers_.find(info_hash_bytes);
             if (it != peers_.end()) {
                 for (const auto& p_addr : it->second) {
                     if (p_addr != compact_peer_addr) {
@@ -93,9 +94,9 @@ HttpHandler Tracker::create_announce_handler() {
                     }
                 }
             }
-            peers_[info_hash].insert(compact_peer_addr);
+            peers_[info_hash_bytes].insert(compact_peer_addr);
             LOGINFO("HTTP announce from {}:{} for hash {}. Total peers for this hash: {}. Returning {} peers.",
-                    ip, port, Crypto::bytes_to_hex(info_hash), peers_[info_hash].size(), peers_binary.size() / 6);
+                    ip, port, Crypto::bytes_to_hex(info_hash_bytes), peers_[info_hash_bytes].size(), peers_binary.size() / 6);
             
 
             Dict response_dict;
@@ -182,11 +183,17 @@ asio::awaitable<void> Tracker::handle_udp_request(asio::ip::udp::endpoint remote
         uint32_t action = be32toh(*reinterpret_cast<const uint32_t *>(request.data() + 8));
         if (action == 0) { // Connect
             LOGINFO("Received UDP Connect request from {}", remote_endpoint.address().to_string());
+            uint64_t new_connection_id = rng_();
+            udp_clients_[remote_endpoint.address()] = {
+                new_connection_id,
+                std::chrono::steady_clock::now() + std::chrono::minutes(2)
+            };
+
             auto *req = reinterpret_cast<const UdpConnectRequest *>(request.data());
             UdpConnectResponse res;
             res.action = htobe32(0);
             res.transaction_id = req->transaction_id;
-            res.connection_id = htobe64(0xDEADBEEFCAFEF00D); // A fixed connection ID for simplicity
+            res.connection_id = htobe64(new_connection_id);
             co_await socket.async_send_to(asio::buffer(&res, sizeof(res)), remote_endpoint, asio::use_awaitable);
         
         } else if (action == 1) { // Announce
@@ -195,8 +202,20 @@ asio::awaitable<void> Tracker::handle_udp_request(asio::ip::udp::endpoint remote
                 co_return;
             }
             auto *req = reinterpret_cast<const UdpAnnounceRequest *>(request.data());
+
+            uint64_t received_conn_id = be64toh(req->connection_id);
+            auto it = udp_clients_.find(remote_endpoint.address());
+            if (it == udp_clients_.end() || 
+                it->second.connection_id != received_conn_id ||
+                it->second.expiry < std::chrono::steady_clock::now()) 
+            {
+                LOGWARN("UDP Announce from {} with invalid/expired connection ID. Ignoring.", remote_endpoint.address().to_string());
+                // Optionally send an error packet back
+                co_return;
+            }
+
             // For UDP, the key for the map should be the raw bytes of the info_hash
-            std::string info_hash_bytes(req->info_hash.begin(), req->info_hash.end());
+            std::vector<std::byte> info_hash_bytes(reinterpret_cast<const std::byte *>(req->info_hash.begin()), reinterpret_cast<const std::byte *>(req->info_hash.begin()) + req->info_hash.size());
             
             // Create the compact peer address (IP:Port)
             std::string peer_addr(6, '\0');

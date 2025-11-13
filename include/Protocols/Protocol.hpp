@@ -15,32 +15,31 @@
 #include <boost/asio.hpp>
 namespace asio = boost::asio;
 
-
 class BufferWriter {
 public:
-    explicit BufferWriter(std::vector<char>& buffer): buffer_(buffer) {}
+    explicit BufferWriter(std::vector<std::byte>& buffer): buffer_(buffer) {}
 
     template<typename T>
     void write(const T& value) {
-        const char* begin = reinterpret_cast<const char*>(&value);
+        const std::byte* begin = reinterpret_cast<const std::byte*>(&value);
         buffer_.insert(buffer_.end(), begin, begin + sizeof(T));
     }
 
     void write_raw(std::string_view sv) {
-        buffer_.insert(buffer_.end(), sv.begin(), sv.end());
+        buffer_.insert(buffer_.end(), reinterpret_cast<const std::byte*>(sv.data()), reinterpret_cast<const std::byte*>(sv.data()) + sv.size());
     }
 
-    void write_bytes(const void *data, size_t size) {
-        buffer_.insert(buffer_.end(), static_cast<const char *>(data), static_cast<const char *>(data) + size);
+    void write_bytes(std::span<const std::byte> data) {
+        buffer_.insert(buffer_.end(), data.begin(), data.end());
     }
 
 private:
-    std::vector<char>& buffer_;
+    std::vector<std::byte>& buffer_;
 };
 
 class BufferReader {
 public:
-    explicit BufferReader(std::span<const char> buffer): view_(buffer) {}
+    explicit BufferReader(std::span<const std::byte> buffer): view_(buffer) {}
 
     template<typename T>
     T read() {
@@ -49,12 +48,12 @@ public:
         }
 
         T value;
-        std::copy_n(view_.begin(), sizeof(T), reinterpret_cast<char*>(&value));
+        std::memcpy(&value, view_.data(), sizeof(T));
         view_ = view_.subspan(sizeof(T));
         return value;
     }
 
-    std::span<const char> read_bytes(size_t size) {
+    std::span<const std::byte> read_bytes(size_t size) {
         if (view_.size() < size) {
             throw std::runtime_error("Not enough data in buffer to read bytes.");
         }
@@ -67,7 +66,7 @@ public:
     size_t remaining() const { return view_.size(); }
 
 private:
-    std::span<const char> view_;
+    std::span<const std::byte> view_;
 };
 
 
@@ -78,28 +77,30 @@ constexpr size_t HANDSHAKE_RESERVED_BYTES = 8;
 constexpr size_t HANDSHAKE_BASE_LEN = 1 + PROTOCOL_STRING.size() + HANDSHAKE_RESERVED_BYTES + HASH_SIZE + PEER_ID_SIZE;
 constexpr size_t BLOCK_SIZE = 16384;
 
-using PeerId = std::string;
-using InfoHash = std::vector<char>;
+using PeerId = std::array<std::byte, 20>;
+using InfoHash = std::vector<std::byte>;
 
 struct Handshake {
-    std::string info_hash_bytes;
-    std::string peer_id_bytes;
+    InfoHash info_hash_bytes;
+    std::array<std::byte, 20> peer_id_bytes;
 
-    std::vector<char> serialize() const {
-        std::vector<char> buffer;
+    std::vector<std::byte> serialize() const {
+        std::vector<std::byte> buffer;
         buffer.reserve(HANDSHAKE_BASE_LEN);
         BufferWriter writer(buffer);
 
         writer.write<uint8_t>(PROTOCOL_STRING.length());
         writer.write_raw(PROTOCOL_STRING);
-        writer.write_bytes(std::string(HANDSHAKE_RESERVED_BYTES, '\0').data(), HANDSHAKE_RESERVED_BYTES);
-        writer.write_bytes(info_hash_bytes.data(), HASH_SIZE);
-        writer.write_bytes(peer_id_bytes.data(), PEER_ID_SIZE);
+
+        std::vector<std::byte> reserved(HANDSHAKE_RESERVED_BYTES, std::byte{0});
+        writer.write_bytes(reserved);
+        writer.write_bytes(info_hash_bytes);
+        writer.write_bytes(peer_id_bytes);
 
         return buffer;
     }
 
-    static Handshake deserialize(std::span<const char> buffer) {
+    static Handshake deserialize(std::span<const std::byte> buffer) {
         if (buffer.size() != HANDSHAKE_BASE_LEN) {
             throw std::runtime_error("Invalid handshake size.");
         }
@@ -112,7 +113,7 @@ struct Handshake {
         }
 
         auto pstr_span = reader.read_bytes(pstrlen);
-        if (std::string_view(pstr_span.data(), pstr_span.size()) != PROTOCOL_STRING) {
+        if (std::string_view(reinterpret_cast<const char*>(pstr_span.data()), pstr_span.size()) != PROTOCOL_STRING) {
             throw std::runtime_error("Protocol mismatch.");
         }
 
@@ -123,7 +124,7 @@ struct Handshake {
         hs.info_hash_bytes.assign(info_hash_span.begin(), info_hash_span.end());
 
         auto peer_id_span = reader.read_bytes(PEER_ID_SIZE);
-        hs.peer_id_bytes.assign(peer_id_span.begin(), peer_id_span.end());
+        std::ranges::copy(peer_id_span, hs.peer_id_bytes.begin());
         
         return hs;
     }
@@ -146,8 +147,8 @@ struct RequestPayload {
     uint32_t begin;
     uint32_t length;
 
-    static std::vector<char> serialize(uint32_t index, uint32_t begin, uint32_t length) {
-        std::vector<char> payload;
+    static std::vector<std::byte> serialize(uint32_t index, uint32_t begin, uint32_t length) {
+        std::vector<std::byte> payload;
         payload.reserve(12);
         BufferWriter writer(payload);
         writer.write(asio::detail::socket_ops::host_to_network_long(index));
@@ -156,7 +157,7 @@ struct RequestPayload {
         return payload;
     }
 
-    static RequestPayload deserialize(std::span<const char> payload) {
+    static RequestPayload deserialize(std::span<const std::byte> payload) {
         if (payload.size() < 12) {
             throw std::runtime_error("Invalid Request payload size");
         }
@@ -194,8 +195,8 @@ struct UdpAnnounceRequest {
     uint64_t connection_id;
     uint32_t action = htobe32(1); // 1 for announce
     uint32_t transaction_id;
-    std::array<char, 20> info_hash;
-    std::array<char, 20> peer_id;
+    std::array<std::byte, 20> info_hash;
+    std::array<std::byte, 20> peer_id;
     uint64_t downloaded;
     uint64_t left;
     uint64_t uploaded;

@@ -15,14 +15,18 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <boost/url.hpp>
 #include <boost/asio/experimental/awaitable_operators.hpp>
+#include <vector>
 using namespace boost::asio::experimental::awaitable_operators;
 
-std::string url_encode(const std::string& value) {
+template <typename Cont>
+std::string url_encode(const Cont& value) {
     std::ostringstream escaped;
     escaped.fill('0');
     escaped << std::hex;
-    for (char c : value) {
+    for (auto b : value) {
+        char c = static_cast<char>(b);
         if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
             escaped << c;
         } else {
@@ -33,40 +37,42 @@ std::string url_encode(const std::string& value) {
 }
 
 std::shared_ptr<ITrackerClient> create_tracker_client(asio::io_context& io_context, const std::string& tracker_url) {
-    std::string url = tracker_url;
-    std::string host;
-    int port;
+    using namespace boost;
+    system::result<urls::url_view> r = urls::parse_uri(tracker_url);
+    if (!r) {
+        throw std::runtime_error("Invalid tracker URL: " + r.error().message());
+    }
+    urls::url_view uv = *r;
 
-    size_t scheme_pos = url.find("://");
-    if (scheme_pos == std::string::npos) {
-        throw std::runtime_error("Invalid tracker URL: missing scheme.");
+    std::string scheme = uv.scheme();
+    std::string host = uv.host();
+    std::string target = uv.path();
+    if (target.empty()) target = "/";
+    if (!uv.query().empty()) {
+        target += "?";
+        target += uv.query();
     }
 
-    std::string scheme = url.substr(0, scheme_pos);
-    url.erase(0, scheme_pos + 3);
-
-    size_t path_pos = url.find("/");
-    std::string target = "/";
-    if (path_pos != std::string::npos) {
-        target = url.substr(path_pos);
-        url = url.substr(0, path_pos);
+    uint16_t port = 0;
+    if (uv.has_port()) {
+        port = uv.port_number();
+    } else {
+        if (scheme == "http") port = 80;
+        else if (scheme == "https") port = 443;
+        // UDP doesn't have a standard default port in this context, 
+        // but often it's 6969. Your manual parsing required it.
     }
-
-    size_t colon_pos = url.find(':');
-    if (colon_pos == std::string::npos) {
-        throw std::runtime_error("Invalid tracker URL: missing port.");
+    if (port == 0) {
+        throw std::runtime_error("Tracker URL must specify a port.");
     }
-
-    host = url.substr(0, colon_pos);
-    port = std::stoi(url.substr(colon_pos + 1));
-
+    
     if (scheme == "udp") {
         LOGINFO("Creating UDP Tracker client for {}:{}", host, port);
-        return std::make_unique<UdpTrackerClient>(io_context, host, port);
+        return std::make_shared<UdpTrackerClient>(io_context, host, port);
     } 
-    else if (scheme == "http" || scheme == "tcp") {
+    else if (scheme == "http") {
         LOGINFO("Creating HTTP Tracker client for {}:{}", host, port);
-        return std::make_unique<HttpTrackerClient>(io_context, host, port, target);
+        return std::make_shared<HttpTrackerClient>(io_context, host, port, target);
     }
     else {
         throw std::runtime_error("Unsupported tracker scheme: " + scheme);
@@ -215,7 +221,7 @@ asio::awaitable<TrackerAnnounceResult> UdpTrackerClient::announce(const Announce
 
 
 HttpTrackerClient::HttpTrackerClient(asio::io_context& io_context, std::string host, int port, std::string target)
-    : io_context_(io_context), host_(std::move(host)), port_(port), target_(std::move(target)) {}
+    : io_context_(io_context), host_(std::move(host)), target_(std::move(target)), port_(port) {}
 
 
 asio::awaitable<TrackerAnnounceResult> HttpTrackerClient::announce(const AnnounceRequestParams& params) {
@@ -267,7 +273,7 @@ asio::awaitable<TrackerAnnounceResult> HttpTrackerClient::announce(const Announc
             throw std::runtime_error("Tracker returned non-200 status: " + std::to_string(res.result_int()));
         }
         
-        Value decoded_body = decode({res.body().data(), res.body().size()});
+        Value decoded_body = decode({reinterpret_cast<std::byte *>(res.body().data()), res.body().size()});
         const auto* dict = std::get_if<std::unique_ptr<Dict>>(&decoded_body.get_variant());
         if (!dict) {
             throw std::runtime_error("Tracker response body is not a dictionary");

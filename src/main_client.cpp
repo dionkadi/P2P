@@ -1,7 +1,8 @@
 #include "Peers/Peer.hpp"
 #include "Utils/Logger.hpp"
 #include "Protocols/MetaInfo.hpp"
-#include <chrono>
+#include "Protocols/Protocol.hpp"
+#include <boost/asio/awaitable.hpp>
 #include <csignal>
 #include <exception>
 #include <filesystem>
@@ -9,19 +10,54 @@
 #include <random>
 #include <string>
 
-std::string generate_peer_id() {
-    static const char alphanum[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+PeerId generate_peer_id() {
+    const std::string prefix = "-MI0001-"; // 8 bytes
+    static constexpr char alphanum[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
-    std::string peer_id = "-MI0001-";
-    std::mt19937 rng(std::chrono::high_resolution_clock::now().time_since_epoch().count());
+    static std::mt19937 rng = []{
+        std::random_device rd;
+        return std::mt19937(rd());
+    }();
+
     std::uniform_int_distribution<int> distrib(0, sizeof(alphanum) - 2);
 
-    for (int i = 0; i < 12; ++i) {
-        peer_id += alphanum[distrib(rng)];
+    PeerId peer_id{};
+    std::transform(prefix.begin(), prefix.end(), peer_id.begin(), 
+        [](char c) { return static_cast<std::byte>(c); });
+    // Fill the remaining 12 bytes with random characters
+    for (size_t i = 0; i < 12; ++i) {
+        peer_id[prefix.size() + i] = static_cast<std::byte>(alphanum[distrib(rng)]);
     }
-
     return peer_id;
 }
+
+// PeerId get_or_create_peer_id() {
+//     const std::filesystem::path id_path = "peer.id";
+    
+//     if (std::filesystem::exists(id_path)) {
+//         std::ifstream id_file(id_path, std::ios::binary);
+//         if (id_file.is_open()) {
+//             PeerId peer_id{};
+//             // fstream functions work with char*, so we must reinterpret_cast
+//             id_file.read(reinterpret_cast<char*>(peer_id.data()), peer_id.size());
+//             if (id_file.gcount() == peer_id.size()) {
+//                 LOGINFO("Loaded existing peer ID from {}", id_path.string());
+//                 return peer_id;
+//             }
+//         }
+//         LOGWARN("Could not read existing peer.id file. A new one will be generated.");
+//     }
+//     // If file doesn't exist or was invalid, generate a new one and save it.
+//     PeerId new_peer_id = generate_peer_id();
+//     LOGINFO("Generated new peer ID. Saving to {}", id_path.string());
+//     std::ofstream id_file(id_path, std::ios::binary);
+//     if (id_file.is_open()) {
+//         id_file.write(reinterpret_cast<const char*>(new_peer_id.data()), new_peer_id.size());
+//     } else {
+//         LOGERR("Failed to save new peer ID to file!");
+//     }
+//     return new_peer_id;
+// }
 
 std::vector<std::string> split(const std::string& s, char delimiter) {
     std::vector<std::string> tokens;
@@ -64,11 +100,14 @@ int main(int argc, char* argv[]) {
  
     
     try {
-
         asio::io_context io_context;
-        auto work_guard = asio::make_work_guard(io_context);
+        asio::signal_set signals(io_context, SIGINT, SIGTERM);
+        signals.async_wait([&](auto, auto) {
+            LOGINFO("Signal received, initiating shutdown...");
+            io_context.stop(); 
+        });
 
-        std::string my_peer_id = generate_peer_id();
+        PeerId my_peer_id = generate_peer_id();
         LOGINFO("Client starting with Peer ID: {}", my_peer_id);
 
         std::string command = argv[1];
@@ -98,10 +137,18 @@ int main(int argc, char* argv[]) {
             
             LOGINFO("Seeding from torrent '{}', content in '{}'. Listening on port {}", file_path.string(), content_dir.string(), peer_port);
 
-            auto seeder = std::make_shared<Seeder>(io_context, my_peer_id, file_path, content_dir, peer_port);
             asio::co_spawn(io_context, 
-                [seeder]() {
-                    return seeder->run();
+                [&io_context, peer_id = std::move(my_peer_id), file_path, content_dir, peer_port]() -> asio::awaitable<void> {
+                    try {
+                        auto seeder = co_await Seeder::create(io_context, peer_id, file_path, content_dir, peer_port);
+                        if (seeder) {
+                            co_return co_await seeder->run();
+                        } else {
+                            LOGCRITICAL("Failed to initialize the seeder. Aborting.");
+                        }
+                    } catch (const std::exception& e) {
+                        LOGCRITICAL("Seed coroutine threw an exception: {}", e.what());
+                    }
                 }, 
                 asio::detached
             );
@@ -112,7 +159,7 @@ int main(int argc, char* argv[]) {
             int peer_port = std::stoi(argv[4]);
 
             asio::co_spawn(io_context, 
-                [&io_context, my_peer_id, torrent_path, save_path, peer_port, work_guard = std::move(work_guard)]() mutable -> asio::awaitable<void> 
+                [&io_context, my_peer_id, torrent_path, save_path, peer_port]() mutable -> asio::awaitable<void> 
                 {
                     try {
                         auto leecher = co_await Leecher::create(io_context, my_peer_id, torrent_path, save_path, peer_port);
@@ -130,7 +177,10 @@ int main(int argc, char* argv[]) {
                         LOGCRITICAL("Download coroutine threw an exception: {}", ex.what());
                     }
                     
-                    work_guard.reset();
+                    if (!io_context.stopped()) {
+                        LOGINFO("Download finished, stopping application.");
+                        io_context.stop();
+                    }
                 },
                 asio::detached
             );
@@ -140,8 +190,6 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
-        asio::signal_set signals(io_context, SIGINT, SIGTERM);
-        signals.async_wait([&](auto, auto) { io_context.stop(); });
         io_context.run();
     
     } catch (const std::exception& e) {

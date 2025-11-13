@@ -8,6 +8,35 @@
 #include <vector>
 #include <filesystem>
 
+#include <Protocols/Protocol.hpp>
+
+namespace fmt {
+
+// To format peer id, which is std::array<std::byte, 20>
+template <>
+struct formatter<PeerId> {
+    // We don't need any special parsing logic for format specifiers like {:x} for now.
+    // The `auto` return type is recommended by the fmtlib documentation.
+    constexpr auto parse(format_parse_context& ctx) {
+        return ctx.begin();
+    }
+
+    std::string to_string(PeerId id) const {
+        std::string s;
+        for (auto& b : id) {
+            s.push_back(static_cast<char>(b));
+        }
+        return s;
+    }
+
+    template <typename FormatContext>
+    auto format(const PeerId& id, FormatContext& ctx) const {
+        return fmt::format_to(ctx.out(), "{}", to_string(id));
+    }
+};
+
+}
+
 static std::once_flag logger_init_flag;
 
 namespace spdlog {

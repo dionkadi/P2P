@@ -1,11 +1,14 @@
 #pragma once
 
+#include <cstddef>
 #include <memory>
 #include <span>
 #include <string>
-#include <unordered_map>
-#include <set>
+#include <random>
+#include <map>
 #include <boost/asio.hpp>
+#include <boost/container/flat_set.hpp>
+#include <vector>
 #include "Http/HttpServer.hpp"
 
 namespace asio = boost::asio;
@@ -30,7 +33,15 @@ private:
     
     asio::io_context io_context_;
     asio::strand<asio::io_context::executor_type> strand_;
-    std::unordered_map<std::string, std::set<std::string>> peers_;
+    std::map<std::vector<std::byte>, boost::container::flat_set<std::string>> peers_;
 
     std::shared_ptr<HttpRouter> http_router_;
+
+    struct UdpClientInfo {
+        uint64_t connection_id;
+        std::chrono::steady_clock::time_point expiry;
+    };
+    // Use asio::ip::address as the key for protocol independence
+    std::unordered_map<asio::ip::address, UdpClientInfo> udp_clients_;
+    std::mt19937_64 rng_{std::random_device{}()};
 };

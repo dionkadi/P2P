@@ -19,17 +19,17 @@ class AsyncSocket {
         LOGINFO("Successfully connected to {}:{}", host, port);
     }
 
-    asio::awaitable<void> send_raw(const std::vector<char>& data) {
+    asio::awaitable<void> send_raw(const std::vector<std::byte>& data) {
         co_await asio::async_write(socket_, asio::buffer(data), asio::use_awaitable);
     }
 
-    asio::awaitable<std::vector<char>> receive_raw(size_t size) {
-        std::vector<char> buffer(size);
+    asio::awaitable<std::vector<std::byte>> receive_raw(size_t size) {
+        std::vector<std::byte> buffer(size);
         co_await asio::async_read(socket_, asio::buffer(buffer), asio::use_awaitable);
         co_return buffer;
     }
 
-    asio::awaitable<void> send_message(std::vector<char> message) {
+    asio::awaitable<void> send_message(std::vector<std::byte> message) {
         // keep-alive message
         if (message.empty()) {
             uint32_t zero_len = 0; // Already in host order, will be converted by buffer.
@@ -37,7 +37,7 @@ class AsyncSocket {
             co_return;
         }
 
-        auto shared_message = std::make_shared<std::vector<char>>(std::move(message));
+        auto shared_message = std::make_shared<std::vector<std::byte>>(std::move(message));
         auto shared_length = std::make_shared<uint32_t>(
             asio::detail::socket_ops::host_to_network_long(
                 static_cast<uint32_t>(shared_message->size())
@@ -51,7 +51,7 @@ class AsyncSocket {
         co_await asio::async_write(socket_, buffer_sequence, asio::use_awaitable);
     }
 
-    asio::awaitable<std::vector<char>> receive_message() {
+    asio::awaitable<std::vector<std::byte>> receive_message() {
         uint32_t net_length;
         co_await asio::async_read(socket_, asio::buffer(&net_length, sizeof(net_length)), asio::use_awaitable);
         uint32_t length = asio::detail::socket_ops::network_to_host_long(net_length);
@@ -59,10 +59,10 @@ class AsyncSocket {
             throw std::runtime_error("Message size limit exceeded: " + std::to_string(length));
         }
         if (length == 0) {
-            co_return std::vector<char>();
+            co_return std::vector<std::byte>();
         }
 
-        std::vector<char> buffer(length);
+        std::vector<std::byte> buffer(length);
         co_await asio::async_read(socket_, asio::buffer(buffer, buffer.size()), asio::use_awaitable);
 
         co_return buffer;

@@ -59,17 +59,17 @@ Value::Value(List&& l) : data_(std::make_unique<List>(std::move(l))) {}
 Value::Value(const Dict& d) : data_(std::make_unique<Dict>(d)) {}
 Value::Value(Dict&& d) : data_(std::make_unique<Dict>(std::move(d))) {}
 
-Value decode_value(std::span<const char>& data);
+Value decode_value(std::span<const std::byte>& data);
 
-String decode_string(std::span<const char>& data) {
-    auto colon_it = std::find(data.begin(), data.end(), ':');
+String decode_string(std::span<const std::byte>& data) {
+    auto colon_it = std::find(data.begin(), data.end(), static_cast<std::byte>(':'));
     if (colon_it == data.end()) {
         throw std::runtime_error("Bencode: Invalid string format, missing colon.");
     }
     size_t colon_pos = std::distance(data.begin(), colon_it);
 
     long long len;
-    auto [ptr, ec] = std::from_chars(data.data(), data.data() + colon_pos, len);
+    auto [ptr, ec] = std::from_chars(reinterpret_cast<const char *>(data.data()), reinterpret_cast<const char *>(data.data()) + colon_pos, len);
     if (ec != std::errc()) {
         throw std::runtime_error("Bencode: Invalid string length.");
     }
@@ -83,27 +83,27 @@ String decode_string(std::span<const char>& data) {
         throw std::runtime_error("Bencode: String length exceeds buffer size.");
     }
 
-    String result(data.data(), len);
+    String result(reinterpret_cast<const char *>(data.data()), len);
     data = data.subspan(len);
     return result;
 }
 
-Integer decode_integer(std::span<const char>& data) {
-    if (data.empty() || data.front() != 'i') {
+Integer decode_integer(std::span<const std::byte>& data) {
+    if (data.empty() || data.front() != static_cast<std::byte>('i')) {
         throw std::runtime_error("Bencode: Invalid integer format, missing 'i'.");
     }
 
     data = data.subspan(1);
 
-    auto end_it = std::find(data.begin(), data.end(), 'e');
+    auto end_it = std::find(data.begin(), data.end(), static_cast<std::byte>('e'));
     if (end_it == data.end()) {
         throw std::runtime_error("Bencode: Invalid integer format, missing 'e'.");
     }
     size_t end_pos = std::distance(data.begin(), end_it);
 
     Integer result;
-    auto [ptr, ec] = std::from_chars(data.data(), data.data() + end_pos, result);
-    if (ec != std::errc() || ptr != data.data() + end_pos) {
+    auto [ptr, ec] = std::from_chars(reinterpret_cast<const char *>(data.data()), reinterpret_cast<const char *>(data.data()) + end_pos, result);
+    if (ec != std::errc() || ptr != reinterpret_cast<const char *>(data.data()) + end_pos) {
         throw std::runtime_error("Bencode: Failed to parse integer value.");
     }
     
@@ -111,18 +111,18 @@ Integer decode_integer(std::span<const char>& data) {
     return result;
 }
 
-List decode_list(std::span<const char>& data) {
-    if (data.empty() || data.front() != 'l') {
+List decode_list(std::span<const std::byte>& data) {
+    if (data.empty() || data.front() != static_cast<std::byte>('l')) {
         throw std::runtime_error("Bencode: Invalid list format, missing 'l'.");
     }
     data = data.subspan(1);
 
     List result;
-    while (!data.empty() && data.front() != 'e') {
+    while (!data.empty() && data.front() != static_cast<std::byte>('e')) {
         result.push_back(decode_value(data));
     }
 
-    if (data.empty() || data.front() != 'e') {
+    if (data.empty() || data.front() != static_cast<std::byte>('e')) {
         throw std::runtime_error("Bencode: Invalid list format, missing 'e'.");
     }
 
@@ -130,20 +130,20 @@ List decode_list(std::span<const char>& data) {
     return result;
 }
 
-Dict decode_dict(std::span<const char>& data) {
-    if (data.empty() || data.front() != 'd') {
+Dict decode_dict(std::span<const std::byte>& data) {
+    if (data.empty() || data.front() != static_cast<std::byte>('d')) {
         throw std::runtime_error("Bencode: Invalid dictionary format, missing 'd'.");
     }
     data = data.subspan(1);
 
     Dict result;
-    while (!data.empty() && data.front() != 'e') {
+    while (!data.empty() && data.front() != static_cast<std::byte>('e')) {
         String key = decode_string(data);
         Value value = decode_value(data);
         result.emplace(std::move(key), std::move(value));
     }
 
-    if (data.empty() || data.front() != 'e') {
+    if (data.empty() || data.front() != static_cast<std::byte>('e')) {
         throw std::runtime_error("Bencode: Invalid dictionary format, missing 'e'.");
     }
     
@@ -151,16 +151,16 @@ Dict decode_dict(std::span<const char>& data) {
     return result;
 }
 
-Value decode_value(std::span<const char>& data) {
+Value decode_value(std::span<const std::byte>& data) {
     if (data.empty()) {
         throw std::runtime_error("Bencode: Unexpected end of data.");
     }
 
-    if (data.front() >= '0' && data.front() <= '9') {
+    if (data.front() >= static_cast<std::byte>('0') && data.front() <= static_cast<std::byte>('9')) {
         return Value(decode_string(data));
     }
 
-    switch (data.front()) {
+    switch (static_cast<char>(data.front())) {
         case 'i': return Value(decode_integer(data));
         case 'l': return Value(decode_list(data));
         case 'd': return Value(decode_dict(data));
@@ -168,7 +168,7 @@ Value decode_value(std::span<const char>& data) {
     }
 }
 
-Value decode(std::span<const char> data) {
+Value decode(std::span<const std::byte> data) {
     auto view = data;
     Value result = decode_value(view);
     if (!view.empty()) {
@@ -177,7 +177,7 @@ Value decode(std::span<const char> data) {
     return result;
 }
 
-std::vector<char> encode(const Value &value) {
+std::vector<std::byte> encode(const Value &value) {
     std::string encode_str;
     std::visit(overloaded {
         [&](Integer i) {
@@ -205,5 +205,5 @@ std::vector<char> encode(const Value &value) {
         }
     }, value.get_variant());
 
-    return {encode_str.begin(), encode_str.end()};
+    return {reinterpret_cast<std::byte*>(encode_str.data()), reinterpret_cast<std::byte*>(encode_str.data()) + encode_str.size()};
 }

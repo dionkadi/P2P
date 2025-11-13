@@ -3,6 +3,7 @@
 #include "Utils/Logger.hpp"
 #include "Utils/Bencode.hpp"
 
+#include <cstddef>
 #include <fstream>
 #include <memory>
 #include <string>
@@ -16,7 +17,7 @@ void gather_files(const std::filesystem::path& base_path, const std::filesystem:
             gather_files(base_path, entry.path(), files, total_size);
         } else if (entry.is_regular_file()) {
             uint64_t file_size = std::filesystem::file_size(entry.path());
-            files.push_back({relative_path, file_size});
+            files.push_back({relative_path, file_size, true});
             total_size += file_size;
         }
     }
@@ -32,7 +33,7 @@ bool MetaInfo::load_from_file(const std::string& file_path, std::vector<std::vec
     std::vector<char> bencoded_data(std::istreambuf_iterator<char>(f), {});
 
     try {
-        Value metainfo_val = decode({bencoded_data.data(), bencoded_data.size()});
+        Value metainfo_val = decode({reinterpret_cast<std::byte *>(bencoded_data.data()), bencoded_data.size()});
         const auto *metainfo_variant_ptr = &metainfo_val.get_variant();
 
         const auto *metainfo_dict_ptr = std::get_if<std::unique_ptr<Dict>>(metainfo_variant_ptr);
@@ -78,16 +79,18 @@ bool MetaInfo::load_from_file(const std::string& file_path, std::vector<std::vec
 
         const auto& info_dict = **info_dict_ptr;
 
-        std::vector<char> info_bencoded = encode(Value(info_dict));
+        std::vector<std::byte> info_bencoded = encode(Value(info_dict));
         info_hash_bytes_ = Crypto::calculate_sha1_hash_data({info_bencoded.data(), info_bencoded.size()});
 
         info_.name = std::get<String>(info_dict.at("name").get_variant());
         info_.piece_size = std::get<Integer>(info_dict.at("piece length").get_variant());
-        info_.pieces = std::get<String>(info_dict.at("pieces").get_variant());
+        const auto& pieces_str = std::get<String>(info_dict.at("pieces").get_variant());
+        info_.pieces.assign(reinterpret_cast<const std::byte*>(pieces_str.data()), 
+                            reinterpret_cast<const std::byte*>(pieces_str.data()) + pieces_str.size());
 
         if (info_dict.count("length")) {
             info_.total_size = std::get<Integer>(info_dict.at("length").get_variant());
-            info_.files.push_back({std::filesystem::path(info_.name), info_.total_size});
+            info_.files.push_back({std::filesystem::path(info_.name), info_.total_size, true});
         } else {
             const List* file_list = std::get_if<std::unique_ptr<List>>(&info_dict.at("files").get_variant())->get();
             for (const auto& file_val : *file_list) {
@@ -100,7 +103,7 @@ bool MetaInfo::load_from_file(const std::string& file_path, std::vector<std::vec
                     file_path /= std::get<String>(part_val.get_variant());
                 }
 
-                info_.files.push_back({file_path, length});
+                info_.files.push_back({file_path, length, true});
                 info_.total_size += length;
             }
         }
@@ -129,7 +132,7 @@ bool MetaInfo::create_from_file(const std::filesystem::path& source_path, const 
 
     if (is_single_file) {
         uint64_t file_size = std::filesystem::file_size(source_path);
-        temp_info.files.push_back({source_path.filename(), file_size});
+        temp_info.files.push_back({source_path.filename(), file_size, true});
         temp_info.total_size = file_size;
         info_dict["length"] = Value(static_cast<Integer>(file_size));
     } else {
@@ -155,8 +158,8 @@ bool MetaInfo::create_from_file(const std::filesystem::path& source_path, const 
     info_dict["name"] = Value(temp_info.name);
     info_dict["piece length"] = Value(static_cast<Integer>(piece_size));
 
-    std::string all_piece_hashes;
-    std::vector<char> piece_buffer(piece_size);
+    std::vector<std::byte> all_piece_hashes;
+    std::vector<std::byte> piece_buffer(piece_size);
     uint32_t buffer_fill = 0;
 
     for (const auto& file_info : temp_info.files) {
@@ -168,20 +171,22 @@ bool MetaInfo::create_from_file(const std::filesystem::path& source_path, const 
         }
 
         while (file) {
-            file.read(piece_buffer.data() + buffer_fill, piece_size - buffer_fill);
+            file.read(reinterpret_cast<char *>(piece_buffer.data()) + buffer_fill, piece_size - buffer_fill);
             buffer_fill += file.gcount();
             if (buffer_fill == piece_size) {
-                all_piece_hashes += Crypto::calculate_sha1_hash_data({piece_buffer.data(), piece_size});
+                auto hash = Crypto::calculate_sha1_hash_data(piece_buffer);
+                all_piece_hashes.insert(all_piece_hashes.end(), hash.begin(), hash.end());
                 buffer_fill = 0;
             }
         }
     }
 
     if (buffer_fill > 0) {
-        all_piece_hashes += Crypto::calculate_sha1_hash_data({piece_buffer.data(), buffer_fill});
+        auto hash = Crypto::calculate_sha1_hash_data(piece_buffer);
+        all_piece_hashes.insert(all_piece_hashes.end(), hash.begin(), hash.end());
     }
 
-    info_dict["pieces"] = Value(all_piece_hashes);
+    info_dict["pieces"] = Value(String(reinterpret_cast<const char*>(all_piece_hashes.data()), all_piece_hashes.size()));
 
     Dict metainfo_dict;
     metainfo_dict["announce"] = Value(tracker_urls[0]);
@@ -194,13 +199,13 @@ bool MetaInfo::create_from_file(const std::filesystem::path& source_path, const 
     metainfo_dict["announce-list"] = Value(std::move(announce_list_tiers));
     metainfo_dict["info"] = Value(info_dict);
 
-    std::vector<char> bencoded_data = encode(Value(metainfo_dict));
+    std::vector<std::byte> bencoded_data = encode(Value(metainfo_dict));
     std::ofstream out_file(torrent_path, std::ios::binary);
     if (!out_file) {
         LOGERR("Failed to open torrent file for writing: {}", torrent_path.string());
         return false;
     }
-    out_file.write(bencoded_data.data(), bencoded_data.size());
+    out_file.write(reinterpret_cast<const char *>(bencoded_data.data()), bencoded_data.size());
 
     LOGINFO("Successfully created torrent file: {}", torrent_path.string());
     return true;

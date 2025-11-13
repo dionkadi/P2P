@@ -2,6 +2,13 @@
 #include "Utils/Crypto.hpp"
 #include "Utils/Logger.hpp"
 #include <algorithm>
+#include <array>
+#include <boost/asio/awaitable.hpp>
+#include <boost/asio/co_spawn.hpp>
+#include <boost/asio/detached.hpp>
+#include <boost/asio/dispatch.hpp>
+#include <boost/asio/steady_timer.hpp>
+#include <boost/asio/use_awaitable.hpp>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -20,8 +27,7 @@
 #include <vector>
 #include <memory>
 
-
-PeerLogic::PeerLogic(asio::io_context& io_context, std::string peer_id, const std::filesystem::path& torrent_path,
+PeerLogic::PeerLogic(asio::io_context& io_context, PeerId peer_id, const std::filesystem::path& torrent_path,
                     int peer_port, 
                     uint64_t upload_rate_bps, uint64_t download_rate_bps)
     : io_context_(io_context),
@@ -32,9 +38,10 @@ PeerLogic::PeerLogic(asio::io_context& io_context, std::string peer_id, const st
       completion_timer_(io_context),
       piece_request_trigger_(io_context),
       file_io_pool_(get_file_io_pool()),
-      peer_port_(peer_port)
+      peer_port_(peer_port),
+      upload_limiter_(io_context, upload_rate_bps),
+      download_limiter_(io_context, download_rate_bps)
 {
-
     std::vector<std::vector<std::string>> tracker_tiers;
     if (!meta_info_.load_from_file(torrent_path, tracker_tiers)) {
         throw std::runtime_error("Could not load torrent file: " + torrent_path.string());
@@ -63,14 +70,20 @@ PeerLogic::PeerLogic(asio::io_context& io_context, std::string peer_id, const st
         throw std::runtime_error("Invalid info hash size after conversion.");
     }
 
-    const size_t num_pieces = meta_info_.get_torrent_info().pieces.length() / 20;
+    const size_t num_pieces = meta_info_.get_torrent_info().pieces.size() / 20;
     piece_availability_.resize(num_pieces, 0);
+
+    std::unordered_set<int> zero_rarity_pieces;
+    for (size_t i = 0; i < num_pieces; ++i) {
+        zero_rarity_pieces.insert(i);
+    }
+    if (!zero_rarity_pieces.empty()) {
+        pieces_by_rarity_[0] = std::move(zero_rarity_pieces);
+    }
 
     completion_timer_.expires_at(asio::steady_timer::time_point::max());
     piece_request_trigger_.expires_at(asio::steady_timer::time_point::max());
 
-    upload_tokens_ = UPLOAD_RATE_BPS_ * TOKEN_BUCKET_CAPACITY_FACTOR;
-    download_tokens_ = DOWNLOAD_RATE_BPS_ * TOKEN_BUCKET_CAPACITY_FACTOR;
 }
 
 asio::awaitable<void> PeerLogic::handle_new_connection(AsyncSocket socket, std::string peer_addr) {
@@ -81,7 +94,7 @@ asio::awaitable<void> PeerLogic::handle_new_connection(AsyncSocket socket, std::
         Handshake my_handshake {info_hash_bytes_, my_peer_id_};
         co_await conn->socket.send_raw(my_handshake.serialize());
 
-        std::vector<char> handshake_buffer = co_await conn->socket.receive_raw(HANDSHAKE_BASE_LEN);
+        std::vector<std::byte> handshake_buffer = co_await conn->socket.receive_raw(HANDSHAKE_BASE_LEN);
         Handshake peer_handshake = Handshake::deserialize(handshake_buffer);
 
         conn->peer_id = peer_handshake.peer_id_bytes;
@@ -110,16 +123,16 @@ asio::awaitable<void> PeerLogic::handle_new_connection(AsyncSocket socket, std::
         active_connections_[conn->peer_id] = conn;
 
         if (pieces_done_count_ > 0) {
-            std::vector<char> my_bitfield_data((piece_status_.size() + 7) / 8, 0);
+            std::vector<uint8_t> my_bitfield_data((piece_status_.size() + 7) / 8, 0);
             for (size_t i = 0; i < piece_status_.size(); ++i) {
                 if (piece_status_[i] == PieceStatus::Have) {
                     my_bitfield_data[i/8] |= (1 << (7 - (i % 8)));
                 }
             }
             
-            std::vector<char> bitfield_msg_body;
-            bitfield_msg_body.push_back(static_cast<char>(MessageType::Bitfield));
-            bitfield_msg_body.insert(bitfield_msg_body.end(), my_bitfield_data.begin(), my_bitfield_data.end());
+            std::vector<std::byte> bitfield_msg_body;
+            bitfield_msg_body.push_back(static_cast<std::byte>(MessageType::Bitfield));
+            bitfield_msg_body.insert(bitfield_msg_body.end(), reinterpret_cast<std::byte *>(my_bitfield_data.data()), reinterpret_cast<std::byte *>(my_bitfield_data.data()) + my_bitfield_data.size());
             co_await conn->socket.send_message(bitfield_msg_body);
         }
 
@@ -143,7 +156,7 @@ asio::awaitable<void> PeerLogic::message_loop(std::shared_ptr<PeerConnection> co
     auto self = shared_from_this();
     try {
         while (true) {
-            std::vector<char> msg = co_await conn->socket.receive_message();
+            std::vector<std::byte> msg = co_await conn->socket.receive_message();
             if (msg.empty()) {
                 // LOGDBG("Received keep-alive from {}", conn->peer_id);
                 continue ;
@@ -163,7 +176,7 @@ asio::awaitable<void> PeerLogic::message_loop(std::shared_ptr<PeerConnection> co
                 continue;
             }
             
-            std::span<const char> payload(msg.data() + 1, msg.size() - 1);
+            std::span<const std::byte> payload(msg.data() + 1, msg.size() - 1);
 
             co_await asio::dispatch(strand_, asio::use_awaitable);
 
@@ -196,11 +209,13 @@ asio::awaitable<void> PeerLogic::message_loop(std::shared_ptr<PeerConnection> co
                         co_return;
                     }
 
-                    conn->bitfield.assign(payload.begin(), payload.end());
+                    conn->bitfield.assign(reinterpret_cast<const uint8_t *>(payload.data()), reinterpret_cast<const uint8_t *>(payload.data()) + payload.size());
 
                     for (size_t i = 0; i < piece_status_.size(); ++i) {
                         if (conn->has_piece(i)) {
-                            ++piece_availability_[i];
+                            uint32_t old_rarity = piece_availability_[i];
+                            uint32_t new_rarity = ++piece_availability_[i];
+                            update_piece_rarity(i, old_rarity, new_rarity);
                         }
                     }
                     
@@ -236,7 +251,9 @@ asio::awaitable<void> PeerLogic::message_loop(std::shared_ptr<PeerConnection> co
 
                     if (index < conn->bitfield.size()) {
                         conn->set_has_piece(index);
-                        ++piece_availability_[index];
+                        uint32_t old_rarity = piece_availability_[index];
+                        uint32_t new_rarity = ++piece_availability_[index];
+                        update_piece_rarity(index, old_rarity, new_rarity);
                     }
 
                     if (piece_status_[index] == PieceStatus::Needed && !conn->am_interested) {
@@ -273,7 +290,9 @@ asio::awaitable<void> PeerLogic::message_loop(std::shared_ptr<PeerConnection> co
         for (size_t i = 0; i < piece_status_.size(); ++i) {
             if (conn->has_piece(i)) {
                 if (piece_availability_[i] > 0) {
-                    --piece_availability_[i];
+                    uint32_t old_rarity = piece_availability_[i];
+                    uint32_t new_rarity = --piece_availability_[i];
+                    update_piece_rarity(i, old_rarity, new_rarity);
                 }
             }
         }
@@ -424,97 +443,76 @@ asio::awaitable<void> PeerLogic::downloader_loop() {
 
 asio::awaitable<void> PeerLogic::request_one_piece_loop() {
     auto self = shared_from_this();
-
-    int piece_index = -1;
-    std::vector<std::shared_ptr<PeerConnection>> available_peers;
-    // uint32_t min_availability = UINT32_MAX;
-
-    const auto& t_info = meta_info_.get_torrent_info();
-    const size_t num_pieces = t_info.pieces.length() / 20;
-
-    struct CandidatePiece {
-        int index;
-        uint32_t availability;
-    };
-    std::vector<CandidatePiece> candidates;
-
     co_await asio::dispatch(strand_, asio::use_awaitable);
-    {
-        for (size_t i = 0; i < piece_status_.size(); ++i) {
-            if (piece_status_[i] == PieceStatus::Needed) {
-                bool is_available = false;
-                for (const auto& [id, conn] : active_connections_) {
-                    if (!conn->peer_is_choking && conn->has_piece(i) && conn->am_interested) {
-                        is_available = true;
-                        break;
-                    }
-                }
-                if (is_available) {
-                    candidates.push_back({static_cast<int>(i), piece_availability_[i]});
+    // Iterate through rarity levels, from rarest to most common
+    for (const auto& [rarity, piece_set] : pieces_by_rarity_) {
+        // We only care about pieces that are actually available (rarity > 0)
+        if (rarity == 0) continue;
+        // Create a shuffled list of candidates at this rarity level
+        // Shuffling prevents multiple clients from requesting the same piece simultaneously
+        std::vector<int> candidates(piece_set.begin(), piece_set.end());
+        std::shuffle(candidates.begin(), candidates.end(), 
+                     std::mt19937{std::random_device{}()});
+        for (int piece_index : candidates) {
+            if (piece_status_[piece_index] != PieceStatus::Needed) {
+                continue; // Already have it or it's in progress
+            }
+            // Find an unchoked peer that has this piece
+            std::vector<std::shared_ptr<PeerConnection>> available_peers;
+            for (const auto& [id, conn] : active_connections_) {
+                if (!conn->peer_is_choking && conn->has_piece(piece_index)) {
+                    available_peers.push_back(conn);
                 }
             }
-        }
-
-        if (candidates.empty()) {
-            LOGDBG("No available pieces to download from any connected peer right now.");
-            co_return ;
-        }
-
-        std::sort(candidates.begin(), candidates.end(), [] (const auto& a, const auto& b) {
-            return a.availability < b.availability;
-        });
-
-        piece_index = candidates.front().index;
-        uint64_t piece_size;
-        if (static_cast<uint64_t>(piece_index) == num_pieces - 1) {
-            uint64_t last_piece_size = t_info.total_size % t_info.piece_size;
-             if (last_piece_size == 0) { // If total size is a multiple of piece size
-                piece_size = t_info.piece_size;
+            if (available_peers.empty()) {
+                continue; // No unchoked peer has this piece right now
+            }
+            
+            // --- We found our piece! ---
+            const auto& t_info = meta_info_.get_torrent_info();
+            const size_t num_pieces = t_info.pieces.size() / 20;
+            uint64_t piece_size;
+            if (static_cast<uint64_t>(piece_index) == num_pieces - 1) {
+                uint64_t last_piece_size = t_info.total_size % t_info.piece_size;
+                piece_size = (last_piece_size == 0) ? t_info.piece_size : last_piece_size;
             } else {
-                piece_size = last_piece_size;
+                piece_size = t_info.piece_size;
             }
-        } else {
-            piece_size = t_info.piece_size;
-        }
-
-        in_progress_pieces_.emplace(piece_index, InProgressPiece(piece_size));
-        piece_status_[piece_index] = PieceStatus::InProgress;
-
-        // LOGDBG("Selected rarest piece {} (size: {}, availability: {}). Starting download.", 
-        //     piece_index, piece_size, candidates.front().availability);
-
-        
-        for (const auto& [id, conn] : active_connections_) {
-            if (!conn->peer_is_choking && conn->has_piece(piece_index)) {
-                available_peers.push_back(conn);
+            // Mark the piece as InProgress
+            piece_status_[piece_index] = PieceStatus::InProgress;
+            // Since it's no longer 'Needed', remove it from rarity consideration for now
+            // We use its current rarity, which we know from the outer loop
+            update_piece_rarity(piece_index, rarity, -1); // Move to a dummy rarity group
+            
+            in_progress_pieces_.emplace(piece_index, InProgressPiece(piece_size));
+            // LOGDBG("Selected rarest piece {} (size: {}, availability: {}). Starting download.", 
+            //        piece_index, piece_size, rarity);
+            // The rest of the logic is the same as before
+            auto& piece_progress = in_progress_pieces_.at(piece_index);
+            uint32_t num_blocks = piece_progress.total_blocks;
+            
+            for (uint32_t block_idx = 0; block_idx < num_blocks; ++block_idx) {
+                uint32_t offset = block_idx * BLOCK_SIZE;
+                uint32_t length = (block_idx == num_blocks - 1) 
+                    ? (piece_progress.data.size() - offset)
+                    : BLOCK_SIZE;
+                // Simple round-robin request distribution among available peers
+                auto& peer_conn = available_peers[block_idx % available_peers.size()];
+                co_await send_request_message(*peer_conn, piece_index, offset, length);
+            
+                piece_progress.outstanding_requests[block_idx].push_back(peer_conn->peer_id);
             }
-        }
-
-        if (available_peers.empty()) {
-            LOGWARN("No available peers for piece {}. Returning to queue.", piece_index);
-            piece_status_[piece_index] = PieceStatus::Needed;
-            in_progress_pieces_.erase(piece_index);
-            co_return ;
+            
+            co_await check_and_enter_endgame();
+            
+            // We've successfully started a piece, so this task is done.
+            co_return; 
         }
     }
-
-    auto& piece_progress = in_progress_pieces_.at(piece_index);
-    uint32_t num_blocks = (piece_progress.data.size() + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    for (uint32_t block_idx = 0; block_idx < num_blocks; ++block_idx) {
-        uint32_t offset = block_idx * BLOCK_SIZE;
-        uint32_t length = (block_idx == num_blocks - 1) 
-            ? (piece_progress.data.size() - offset)
-            : BLOCK_SIZE;
-        auto& peer_conn = available_peers[block_idx % available_peers.size()];
-        co_await send_request_message(*peer_conn, piece_index, offset, length);
-    
-        piece_progress.outstanding_requests[block_idx].push_back(peer_conn->peer_id);
-    }
-    
-    co_await check_and_enter_endgame();
+    LOGDBG("No available and needed pieces to download from any unchoked peer right now.");
 }
 
-asio::awaitable<void> PeerLogic::handle_piece_message(std::shared_ptr<PeerConnection> conn, std::span<const char> payload) {
+asio::awaitable<void> PeerLogic::handle_piece_message(std::shared_ptr<PeerConnection> conn, std::span<const std::byte> payload) {
     if (payload.size() < 8) {
         co_return ;
     }
@@ -558,8 +556,9 @@ asio::awaitable<void> PeerLogic::handle_piece_message(std::shared_ptr<PeerConnec
             ++p.received_count;
 
             if (p.received_count == p.total_blocks) {
-                std::string received_hash_bytes = Crypto::calculate_sha1_hash_data(p.data);
-                std::string expected_hash_bytes = meta_info_.get_torrent_info().pieces.substr(index * 20, 20);
+                auto received_hash_bytes = Crypto::calculate_sha1_hash_data(p.data);
+                auto start = meta_info_.get_torrent_info().pieces.begin() + index * 20;
+                std::vector<std::byte> expected_hash_bytes(start, start + 20);
 
                 if (received_hash_bytes == expected_hash_bytes) {
                     co_await handle_completed_piece(index, p.data);
@@ -573,10 +572,10 @@ asio::awaitable<void> PeerLogic::handle_piece_message(std::shared_ptr<PeerConnec
     }
 }
 
-asio::awaitable<void> PeerLogic::handle_completed_piece(int piece_index, const std::vector<char>& piece_data) {
+asio::awaitable<void> PeerLogic::handle_completed_piece(int piece_index, const std::vector<std::byte>& piece_data) {
     const auto& info = meta_info_.get_torrent_info();
     uint64_t offset = static_cast<uint64_t>(piece_index) * info.piece_size;
-    const size_t num_pieces = info.pieces.length() / 20;
+    const size_t num_pieces = info.pieces.size() / 20;
 
     uint64_t current_file_offset = 0;
     uint32_t written_from_piece = 0;
@@ -590,7 +589,7 @@ asio::awaitable<void> PeerLogic::handle_completed_piece(int piece_index, const s
 
             uint32_t bytes_to_write_to_this_file = std::min(static_cast<uint64_t>(piece_data.size() - written_from_piece), file_info.size - write_pos_in_file);
 
-            std::vector<char> sub_data(bytes_to_write_to_this_file);
+            std::vector<std::byte> sub_data(bytes_to_write_to_this_file);
             std::copy(piece_data.begin() + written_from_piece, piece_data.begin() + written_from_piece + bytes_to_write_to_this_file, sub_data.begin());
 
             std::filesystem::path full_file_path = get_full_path_for_file(file_info);
@@ -635,12 +634,18 @@ asio::awaitable<void> PeerLogic::handle_completed_piece(int piece_index, const s
 }
 
 asio::awaitable<void> PeerLogic::return_piece_to_queue(int piece_index) {
+    // Before this coroutine, the piece would have been removed from in_progress_pieces_
+    // Now we must also update its status and put it back in the rarity map.
     piece_status_[piece_index] = PieceStatus::Needed;
+    
+    // Put it back into the rarity map with its correct, current rarity.
+    // The dummy group is -1, its actual rarity is stored in piece_availability_
+    update_piece_rarity(piece_index, -1, piece_availability_[piece_index]);
     piece_request_trigger_.cancel_one();
-    co_return ;
+    co_return;
 }
 
-asio::awaitable<void> PeerLogic::handle_request_message(std::shared_ptr<PeerConnection> conn, std::span<const char> payload) {
+asio::awaitable<void> PeerLogic::handle_request_message(std::shared_ptr<PeerConnection> conn, std::span<const std::byte> payload) {
     auto self = shared_from_this();
 
     const auto& info = meta_info_.get_torrent_info();
@@ -668,7 +673,7 @@ asio::awaitable<void> PeerLogic::handle_request_message(std::shared_ptr<PeerConn
 
     // LOGINFO("Peer {} requested piece {}, offset {}, length {}", conn->peer_id, req.index, req.begin, req.length);
 
-    std::vector<char> block_data;
+    std::vector<std::byte> block_data;
     try {
         block_data.resize(req.length);
         uint64_t file_offset = static_cast<uint64_t>(req.index) * info.piece_size + req.begin;
@@ -702,16 +707,29 @@ asio::awaitable<void> PeerLogic::handle_request_message(std::shared_ptr<PeerConn
 
     co_await await_upload_tokens(block_data.size());
     
-    std::vector<char> piece_msg;
-    piece_msg.push_back(static_cast<char>(MessageType::Piece));
+    std::vector<std::byte> piece_msg;
+    piece_msg.push_back(static_cast<std::byte>(MessageType::Piece));
     BufferWriter writer(piece_msg);
     writer.write(asio::detail::socket_ops::host_to_network_long(req.index));
     writer.write(asio::detail::socket_ops::host_to_network_long(req.begin));
-    writer.write_bytes(block_data.data(), block_data.size());
+    writer.write_bytes(block_data);
  
     try {
         co_await conn->socket.send_message(piece_msg);
-    } catch (const std::exception& e) {
+    } catch (const boost::system::system_error& e) { // Be more specific
+        // These errors are expected when the peer disconnects abruptly.
+        if (e.code() == asio::error::eof ||
+            e.code() == asio::error::connection_reset ||
+            e.code() == asio::error::broken_pipe)
+        {
+            // Log at a debug level if you want, but it's not a warning.
+            LOGDBG("Failed to send PIECE to {}: Peer disconnected.", conn->peer_id);
+        } else {
+            // Log other, unexpected errors as warnings or errors.
+            LOGWARN("Failed to send PIECE to {}: {}", conn->peer_id, e.what());
+        }
+        co_return;
+    } catch (const std::exception& e) { // Keep this for other exceptions
         LOGWARN("Failed to send PIECE to {}: {}", conn->peer_id, e.what());
         co_return;
     }
@@ -738,17 +756,28 @@ asio::awaitable<void> PeerLogic::keep_alive_loop(std::shared_ptr<PeerConnection>
 
         try {
             co_await conn->socket.send_message({});
-        } catch(...) {
+        } catch (const boost::system::system_error& e) { // Be more specific
+            if (e.code() == asio::error::eof ||
+                e.code() == asio::error::connection_reset ||
+                e.code() == asio::error::broken_pipe)
+            {
+                LOGDBG("Failed to send keep-alive to peer {}, it has disconnected.", conn->peer_id);
+            } else {
+                LOGWARN("Failed to send keep-alive to peer {}, closing connection: {}", conn->peer_id, e.what());
+            }
+            conn->socket.close();
+            co_return;
+        } catch (...) { // Fallback
             LOGWARN("Failed to send keep-alive to peer {}, closing connection.", conn->peer_id);
-            conn->socket.close(); 
+            conn->socket.close();
             co_return;
         }
     }
 }
 
 asio::awaitable<void> PeerLogic::send_have_message_to_all(uint32_t piece_index) {
-    std::vector<char> have_msg;
-    have_msg.push_back(static_cast<char>(MessageType::Have));
+    std::vector<std::byte> have_msg;
+    have_msg.push_back(static_cast<std::byte>(MessageType::Have));
     BufferWriter writer(have_msg);
     writer.write(asio::detail::socket_ops::host_to_network_long(piece_index));
 
@@ -758,8 +787,8 @@ asio::awaitable<void> PeerLogic::send_have_message_to_all(uint32_t piece_index) 
 }
 
 asio::awaitable<void> PeerLogic::send_request_message(PeerConnection& conn, uint32_t index, uint32_t begin, uint32_t length) {
-    std::vector<char> msg_body;
-    msg_body.push_back(static_cast<char>(MessageType::Request));
+    std::vector<std::byte> msg_body;
+    msg_body.push_back(static_cast<std::byte>(MessageType::Request));
     auto payload = RequestPayload::serialize(index, begin, length);
     msg_body.insert(msg_body.end(), payload.begin(), payload.end());
 
@@ -769,8 +798,8 @@ asio::awaitable<void> PeerLogic::send_request_message(PeerConnection& conn, uint
 }
 
 asio::awaitable<void> PeerLogic::send_cancel_message(PeerConnection& conn, uint32_t index, uint32_t begin, uint32_t length) {
-    std::vector<char> msg_body;
-    msg_body.push_back(static_cast<char>(MessageType::Cancel));
+    std::vector<std::byte> msg_body;
+    msg_body.push_back(static_cast<std::byte>(MessageType::Cancel));
     auto payload = RequestPayload::serialize(index, begin, length);
     msg_body.insert(msg_body.end(), payload.begin(), payload.end());
     
@@ -779,8 +808,8 @@ asio::awaitable<void> PeerLogic::send_cancel_message(PeerConnection& conn, uint3
 }
 
 asio::awaitable<void> PeerLogic::send_simple_message(PeerConnection& conn, MessageType type) {
-    std::vector<char> msg_body;
-    msg_body.push_back(static_cast<char>(type));
+    std::vector<std::byte> msg_body;
+    msg_body.push_back(static_cast<std::byte>(type));
 
     // LOGDBG("Sending simple message of type {}. Raw byte value: {:#04x}", 
     //          static_cast<int>(type), static_cast<uint8_t>(msg_body[0]));
@@ -793,7 +822,7 @@ ThreadPool& PeerLogic::get_file_io_pool() {
     return instance;
 }
 
-asio::awaitable<void> PeerLogic::async_write_to_file(std::filesystem::path path, uint64_t offset, const std::vector<char>& data) {
+asio::awaitable<void> PeerLogic::async_write_to_file(std::filesystem::path path, uint64_t offset, const std::vector<std::byte>& data) {
     auto token = asio::use_awaitable;
     co_await asio::async_initiate<void(std::error_code)>(
         [this, path = std::move(path), offset, &data] (auto&& completion_handler) {
@@ -809,7 +838,7 @@ asio::awaitable<void> PeerLogic::async_write_to_file(std::filesystem::path path,
                         throw std::runtime_error("Failed to open file for writing: " + path.string());
                     }
                     output_file.seekp(offset);
-                    output_file.write(data.data(), data.size());
+                    output_file.write(reinterpret_cast<const char *>(data.data()), data.size());
                     output_file.close();
                     
                     std::move(handler)(std::error_code{});
@@ -823,10 +852,10 @@ asio::awaitable<void> PeerLogic::async_write_to_file(std::filesystem::path path,
     );
 }
 
-asio::awaitable<std::vector<char>> PeerLogic::async_read_from_file(std::filesystem::path path, uint64_t offset, uint32_t size) {
+asio::awaitable<std::vector<std::byte>> PeerLogic::async_read_from_file(std::filesystem::path path, uint64_t offset, uint32_t size) {
     auto token = asio::use_awaitable;
     // 1. co_await the operation and capture its result (the tuple)
-    auto [ec, block_data] = co_await asio::async_initiate<void(std::error_code, std::vector<char>)>(
+    auto [ec, block_data] = co_await asio::async_initiate<void(std::error_code, std::vector<std::byte>)>(
         [this, path = std::move(path), offset, size](auto&& completion_handler) {
             file_io_pool_.enqueue([
                 path = std::move(path),
@@ -839,9 +868,9 @@ asio::awaitable<std::vector<char>> PeerLogic::async_read_from_file(std::filesyst
                     if (!data_file) {
                         throw std::runtime_error("Failed to open file for reading: " + path.string());
                     }
-                    std::vector<char> buffer(size);
+                    std::vector<std::byte> buffer(size);
                     data_file.seekg(offset);
-                    data_file.read(buffer.data(), size);
+                    data_file.read(reinterpret_cast<char *>(buffer.data()), size);
                     if (static_cast<std::size_t>(data_file.gcount()) != size) {
                         throw std::runtime_error("Incomplete read from file: " + path.string());
                     }
@@ -849,7 +878,7 @@ asio::awaitable<std::vector<char>> PeerLogic::async_read_from_file(std::filesyst
                     std::move(handler)(std::error_code{}, std::move(buffer));
                 } catch (const std::exception& e) {
                     LOGERR("File read error: {}", e.what());
-                    std::move(handler)(make_error_code(std::errc::io_error), std::vector<char>{});
+                    std::move(handler)(make_error_code(std::errc::io_error), std::vector<std::byte>{});
                 }
             });
         },
@@ -860,14 +889,14 @@ asio::awaitable<std::vector<char>> PeerLogic::async_read_from_file(std::filesyst
         throw boost::system::system_error(ec, "async_read_from_file");
     }
     // 3. On success, co_return ONLY the value part of the tuple.
-    // This correctly satisfies the function's awaitable<std::vector<char>> return type.
+    // This correctly satisfies the function's awaitable<std::vector<std::byte>> return type.
     co_return block_data;
 }
 
 
 asio::awaitable<void> PeerLogic::verify_existing_file() {
     const auto& info = meta_info_.get_torrent_info();
-    const size_t num_pieces = info.pieces.length() / 20;
+    const size_t num_pieces = info.pieces.size() / 20;
 
     LOGINFO("Verifying existing file: {}", data_file_path_.string());
 
@@ -884,7 +913,7 @@ asio::awaitable<void> PeerLogic::verify_existing_file() {
             }
         }
 
-        std::vector<char> piece_data(piece_size_to_read);
+        std::vector<std::byte> piece_data(piece_size_to_read);
         try {
             uint64_t current_file_offset = 0;
             uint32_t read_for_piece = 0;
@@ -917,8 +946,9 @@ asio::awaitable<void> PeerLogic::verify_existing_file() {
                 continue ;
             }
 
-            std::string actual_hash_bytes = Crypto::calculate_sha1_hash_data(piece_data);
-            std::string expected_hash_bytes = info.pieces.substr(i * 20, 20);
+            auto actual_hash_bytes = Crypto::calculate_sha1_hash_data(piece_data);
+            auto start = info.pieces.begin() + i * 20;
+            std::vector<std::byte> expected_hash_bytes(start, start + 20);
 
             if (actual_hash_bytes == expected_hash_bytes) {
                 co_await asio::dispatch(strand_, asio::use_awaitable);
@@ -961,7 +991,7 @@ asio::awaitable<bool> PeerLogic::verify_seed_data() {
         co_return false;
     }
 
-    const size_t num_pieces = info.pieces.length() / 20;
+    const size_t num_pieces = info.pieces.size() / 20;
 
     for (size_t i = 0; i < num_pieces; ++i) {
         uint64_t offset = static_cast<uint64_t>(i) * info.piece_size;
@@ -976,7 +1006,7 @@ asio::awaitable<bool> PeerLogic::verify_seed_data() {
             }
         }
 
-        std::vector<char> piece_data(piece_size_to_read);
+        std::vector<std::byte> piece_data(piece_size_to_read);
         try {
             uint64_t current_file_offset = 0;
             uint32_t read_for_piece = 0;
@@ -1011,8 +1041,9 @@ asio::awaitable<bool> PeerLogic::verify_seed_data() {
                 co_return false;
             }
 
-            std::string actual_hash_bytes = Crypto::calculate_sha1_hash_data(piece_data);
-            std::string expected_hash_bytes = info.pieces.substr(i * 20, 20);
+            auto actual_hash_bytes = Crypto::calculate_sha1_hash_data(piece_data);
+            auto start = info.pieces.begin() + i * 20;
+            std::vector<std::byte> expected_hash_bytes(start, start + 20);
 
             if (actual_hash_bytes != expected_hash_bytes) {
                 LOGCRITICAL("Hash mismatch for piece {}! File is corrupt. Aborting.", i);
@@ -1028,52 +1059,13 @@ asio::awaitable<bool> PeerLogic::verify_seed_data() {
     co_return true;
 }
 
-asio::awaitable<void> PeerLogic::token_refill_loop() {
-    auto self = shared_from_this();
-    asio::steady_timer timer(io_context_);
-    const auto refill_interval = std::chrono::milliseconds(100);
-
-    while (true) {
-        timer.expires_after(refill_interval);
-        co_await timer.async_wait(asio::use_awaitable);
-
-        if (is_download_complete_ && pieces_done_count_ > 0) {
-            if (active_connections_.empty()) {
-                continue ;
-            }
-        }
-
-        int64_t upload_refill = UPLOAD_RATE_BPS_ * refill_interval.count() / 1000;
-        int64_t download_refill = DOWNLOAD_RATE_BPS_ * refill_interval.count() / 1000;
-
-        upload_tokens_.store(std::min(upload_tokens_.load() + upload_refill, UPLOAD_RATE_BPS_ * TOKEN_BUCKET_CAPACITY_FACTOR));
-        download_tokens_.store(std::min(download_tokens_.load() + download_refill, DOWNLOAD_RATE_BPS_ * TOKEN_BUCKET_CAPACITY_FACTOR));
-    }
-}
-
 
 asio::awaitable<void> PeerLogic::await_upload_tokens(size_t amount) {
-    if (UPLOAD_RATE_BPS_ == 0) {
-        co_return ;
-    }
-
-    asio::steady_timer timer(io_context_);
-    while (upload_tokens_.load() < amount) {
-        timer.expires_after(std::chrono::milliseconds(50));
-        co_await timer.async_wait(asio::use_awaitable);
-    }
-
-    upload_tokens_ -= amount;
+    co_await upload_limiter_.await_tokens(amount);
 }
 
 asio::awaitable<void> PeerLogic::await_download_tokens(size_t amount) {
-    if (DOWNLOAD_RATE_BPS_ == 0) co_return; // Unlimited
-    asio::steady_timer timer(io_context_);
-    while (download_tokens_.load() < amount) {
-        timer.expires_after(std::chrono::milliseconds(50));
-        co_await timer.async_wait(asio::use_awaitable);
-    }
-    download_tokens_ -= amount;
+    co_await download_limiter_.await_tokens(amount);
 }
 
 asio::awaitable<void> PeerLogic::check_and_enter_endgame() {
@@ -1100,7 +1092,7 @@ asio::awaitable<void> PeerLogic::broadcast_outstanding_requests() {
     LOGINFO("Endgame: Re-requesting all outstanding blocks from all unchoked peers.");
 
     const auto& info = meta_info_.get_torrent_info();
-    const size_t num_pieces = info.pieces.length() / 20;
+    const size_t num_pieces = info.pieces.size() / 20;
 
     for (auto& [piece_idx, piece_progress] : in_progress_pieces_) {
         for (uint32_t block_idx = 0; block_idx < piece_progress.total_blocks; ++block_idx) {
@@ -1129,7 +1121,7 @@ asio::awaitable<void> PeerLogic::broadcast_outstanding_requests() {
 }
 
 
-asio::awaitable<void> PeerLogic::send_cancel_for_block(uint32_t piece_index, uint32_t block_index, const std::string& exclude_peer_id) {
+asio::awaitable<void> PeerLogic::send_cancel_for_block(uint32_t piece_index, uint32_t block_index, const PeerId& exclude_peer_id) {
     co_await asio::dispatch(strand_, asio::use_awaitable);
 
     auto it = in_progress_pieces_.find(piece_index);
@@ -1138,11 +1130,11 @@ asio::awaitable<void> PeerLogic::send_cancel_for_block(uint32_t piece_index, uin
     }
 
     auto& requests_for_block = it->second.outstanding_requests[block_index];
-    std::vector<std::string> peer_ids_to_cancel = requests_for_block;
+    std::vector<PeerId> peer_ids_to_cancel = requests_for_block;
     requests_for_block.clear();
 
     const auto& info = meta_info_.get_torrent_info();
-    const size_t num_pieces = info.pieces.length() / 20;
+    const size_t num_pieces = info.pieces.size() / 20;
 
     uint32_t offset = block_index * BLOCK_SIZE;
     uint64_t current_piece_size;
@@ -1183,7 +1175,7 @@ asio::awaitable<void> PeerLogic::tracker_announce_loop() {
         }
 
         const auto& info = meta_info_.get_torrent_info();
-        const size_t num_pieces = info.pieces.length() / 20;
+        const size_t num_pieces = info.pieces.size() / 20;
 
         uint64_t downloaded_bytes = pieces_done_count_.load() * info.piece_size;
         uint64_t left = is_seeder_() ? 0 : (num_pieces - pieces_done_count_) * info.piece_size;
@@ -1196,11 +1188,11 @@ asio::awaitable<void> PeerLogic::tracker_announce_loop() {
         AnnounceRequestParams params {
             .info_hash_bytes = info_hash_bytes_,
             .peer_id = my_peer_id_,
+            .event = event,
             .port = static_cast<uint16_t>(peer_port_),
             .uploaded = downloaded_bytes,
             .downloaded = pieces_done_count_ * info.piece_size,
             .left = left,
-            .event = event
         };
 
         int interval = 1800;
@@ -1215,19 +1207,17 @@ asio::awaitable<void> PeerLogic::tracker_announce_loop() {
                     interval = result.interval_seconds;
                     announce_successful = true;
                     
-                    if (!is_download_complete_) {
-                        for (const auto& peer_addr : result.peers) {
-                            bool already_connnected = false;
-                            co_await asio::dispatch(strand_, asio::use_awaitable);
-                            for (const auto& [id, conn] : active_connections_) {
-                                if (conn->peer_addr == peer_addr) {
-                                    already_connnected = true;
-                                    break;
-                                }
+                    for (const auto& peer_addr : result.peers) {
+                        bool already_connnected = false;
+                        co_await asio::dispatch(strand_, asio::use_awaitable);
+                        for (const auto& [id, conn] : active_connections_) {
+                            if (conn->peer_addr == peer_addr) {
+                                already_connnected = true;
+                                break;
                             }
-                            if (!already_connnected) {
-                                asio::co_spawn(io_context_, connect_to_peer(peer_addr), asio::detached);
-                            }
+                        }
+                        if (!already_connnected) {
+                            asio::co_spawn(io_context_, connect_to_peer(peer_addr), asio::detached);
                         }
                     }
 
@@ -1274,8 +1264,19 @@ asio::awaitable<void> PeerLogic::connect_to_peer(std::string peer_addr) {
  
         co_await handle_new_connection(std::move(peer_socket), peer_addr);
         
+    } catch (const boost::system::system_error& e) {
+        // This is a common way clients disconnect. No need to log as an error.
+        if (e.code() == asio::error::eof ||
+            e.code() == asio::error::connection_reset ||
+            e.code() == asio::error::broken_pipe)
+        {
+            // Normal disconnect, do nothing or log at a debug level
+        } else {
+            LOGERR("Failed to connect to peer {}: {}", peer_addr, e.what());
+        }
     } catch (const std::exception& e) {
-        LOGWARN("Failed to connect or lost connection to peer {}: {}", peer_addr, e.what());
+        // Catch other potential standard exceptions
+        LOGERR("Failed to connect to peer {}: {}", peer_addr, e.what());
     }
 }
 
@@ -1295,18 +1296,90 @@ std::filesystem::path PeerLogic::get_full_path_for_file(const FileInfo& file_inf
     return full_path;
 }
 
+void PeerLogic::update_piece_rarity(int piece_index, uint32_t old_rarity, uint32_t new_rarity) {
+    // This function must be called from within the strand_
+    // Remove from the old rarity set
+    if (auto it = pieces_by_rarity_.find(old_rarity); it != pieces_by_rarity_.end()) {
+        it->second.erase(piece_index);
+        // If the set for the old rarity is now empty, remove the map entry
+        if (it->second.empty()) {
+            pieces_by_rarity_.erase(it);
+        }
+    }
+    // Add to the new rarity set
+    pieces_by_rarity_[new_rarity].insert(piece_index);
+}
+
+
+asio::awaitable<void> PeerLogic::save_progress() {
+    const auto &info = meta_info_.get_torrent_info();
+    const size_t num_pieces = info.pieces.size() / 20;
+    
+    std::vector<std::byte> ps;
+    ps.reserve((num_pieces / 8) + 1);
+    
+    co_await asio::dispatch(strand_, asio::use_awaitable);
+    uint8_t status = 0;
+    for (size_t i = 0; i < num_pieces; ++i) {
+        size_t offset = i % 8u;
+        status |= (piece_status_[i] == PieceStatus::Have ? 1 : 0) << (7u - offset);
+        if (i > 0 && i % 8u == 0) {
+            ps.push_back(static_cast<std::byte>(status));
+            status = 0;
+        }
+    }
+        
+    std::filesystem::path p = data_file_path_ / info.name / ".resume";
+    co_await async_write_to_file(p, 0, ps);
+}
+
+
+asio::awaitable<void> PeerLogic::load_progress() {
+    const auto &info = meta_info_.get_torrent_info();
+    const size_t num_pieces = info.pieces.size() / 20;
+    std::filesystem::path p = data_file_path_ / info.name / ".resume";
+    
+    if (!std::filesystem::exists(p)) {
+        LOGINFO("No downloaded data");
+        co_await asio::dispatch(strand_, asio::use_awaitable);
+        piece_status_.assign(num_pieces, PieceStatus::Needed);
+        pieces_done_count_ = 0;
+        co_return ;
+    }
+
+    LOGINFO("Loading history data...");
+
+    auto ps = co_await async_read_from_file(p, 0, (num_pieces / 8) + 1u);
+    
+    co_await asio::dispatch(strand_, asio::use_awaitable);
+    for (size_t i = 0; i < num_pieces; ++i) {
+        size_t offset = i % 8;
+        auto b = static_cast<uint8_t>(ps[offset]);
+        auto status = piece_status_[i] = ((b >> (7u - offset) & 1u)) ? PieceStatus::Have : PieceStatus::Needed;
+        if (status == PieceStatus::Have) {
+            ++pieces_done_count_;
+        }
+    }
+
+    if (pieces_done_count_ > 0) {
+        float progress = (static_cast<float>(pieces_done_count_) / num_pieces) * 100.0f;
+        LOGINFO("Verification complete. Found {}/{} valid pieces ({:.2f}% progress).", 
+                pieces_done_count_.load(), num_pieces, progress);
+    }
+}
+
 /*
 #####################################################
             Seeder implementation
 #####################################################
 */
 
-Seeder::Seeder(asio::io_context& io_context, std::string peer_id, const std::filesystem::path& torrent_path, const std::filesystem::path& content_dir, 
+Seeder::Seeder(private_key, asio::io_context& io_context, PeerId peer_id, const std::filesystem::path& torrent_path, const std::filesystem::path& content_dir, 
                 int peer_port, uint64_t upload_rate_bps)
     : PeerLogic(io_context, std::move(peer_id), torrent_path, peer_port, upload_rate_bps, 0), peer_port_(peer_port) {
 
     const auto& info = meta_info_.get_torrent_info();
-    const size_t num_pieces = info.pieces.length() / 20;
+    const size_t num_pieces = info.pieces.size() / 20;
 
     piece_status_.assign(num_pieces, PieceStatus::Have);
     pieces_done_count_ = num_pieces;
@@ -1326,14 +1399,37 @@ Seeder::Seeder(asio::io_context& io_context, std::string peer_id, const std::fil
     LOGINFO("Seeder initialized for '{}'", info.name);
 }
 
-asio::awaitable<void> Seeder::run() {
-
-    bool is_ok = co_await verify_seed_data();
-    if (!is_ok) {
-        throw std::runtime_error("Seeder data verification failed. File may be corrupt.");
+asio::awaitable<bool> Seeder::async_init() {
+    bool ok = co_await verify_seed_data();
+    if (!ok) {
+        LOGCRITICAL("Seeder data verification failed. File may be corrupt.");
+        co_return false;
     }
 
-    asio::co_spawn(io_context_, token_refill_loop(), asio::detached);
+    co_return true;
+}
+
+asio::awaitable<std::shared_ptr<Seeder>> Seeder::create(
+    asio::io_context& io_context, 
+    PeerId peer_id, 
+    const std::filesystem::path& torrent_path, 
+    const std::filesystem::path& content_dir, 
+    int peer_port, uint64_t upload_rate_bps
+) {
+    auto seeder = std::make_shared<Seeder>(
+        private_key{}, io_context, std::move(peer_id), torrent_path, content_dir, peer_port, upload_rate_bps
+    );
+
+    bool success = co_await seeder->async_init();
+    if (!success) {
+        // Return nullptr or throw to indicate failure
+        co_return nullptr; 
+    }
+
+    co_return seeder;
+}
+
+asio::awaitable<void> Seeder::run() {
     asio::co_spawn(io_context_, tracker_announce_loop(), asio::detached);
 
     try {
@@ -1357,7 +1453,7 @@ asio::awaitable<void> Seeder::run() {
 #####################################################
 */
 
-Leecher::Leecher(private_key, asio::io_context& io_context, std::string peer_id, const std::filesystem::path& torrent_path, const std::filesystem::path& save_path,
+Leecher::Leecher(private_key, asio::io_context& io_context, PeerId peer_id, const std::filesystem::path& torrent_path, const std::filesystem::path& save_path,
                 int peer_port,
                 uint64_t upload_rate_bps, uint64_t download_rate_bps)
     : PeerLogic(io_context, std::move(peer_id), torrent_path, peer_port, upload_rate_bps, download_rate_bps) { 
@@ -1365,7 +1461,7 @@ Leecher::Leecher(private_key, asio::io_context& io_context, std::string peer_id,
     data_file_path_ = save_path;
 
     const auto& info = meta_info_.get_torrent_info();
-    const size_t num_pieces = info.pieces.length() / 20;
+    const size_t num_pieces = info.pieces.size() / 20;
 
     piece_status_.resize(num_pieces, PieceStatus::Needed);
 
@@ -1375,7 +1471,7 @@ Leecher::Leecher(private_key, asio::io_context& io_context, std::string peer_id,
 
 asio::awaitable<bool> Leecher::async_init() {
     const auto& info = meta_info_.get_torrent_info();
-    const size_t num_pieces = info.pieces.length() / 20;
+    const size_t num_pieces = info.pieces.size() / 20;
     try {
         std::filesystem::path base_save_path = data_file_path_;
         
@@ -1405,7 +1501,7 @@ asio::awaitable<bool> Leecher::async_init() {
             }
         }
 
-        co_await verify_existing_file();
+        co_await load_progress();
         if (pieces_done_count_ == num_pieces) {
             is_download_complete_ = true;
             LOGINFO("File is already complete and verified. Nothing to download.");
@@ -1421,7 +1517,7 @@ asio::awaitable<bool> Leecher::async_init() {
 
 asio::awaitable<std::shared_ptr<Leecher>> Leecher::create(
     asio::io_context& io_context, 
-    std::string peer_id, 
+    PeerId peer_id, 
     const std::filesystem::path& torrent_path, 
     const std::filesystem::path& save_path,
     int peer_port,
@@ -1447,10 +1543,26 @@ asio::awaitable<bool> Leecher::run() {
         co_return true;
     }
 
-    asio::co_spawn(io_context_, token_refill_loop(), asio::detached);
+    asio::co_spawn(io_context_, [self = std::static_pointer_cast<Leecher>(shared_from_this())]() -> asio::awaitable<void> {
+        try {
+            AsyncServerSocket peer_server(self->io_context_, self->peer_port_);
+            LOGINFO("Leecher now listening for incoming connections on port {}", self->peer_port_);
+            while (true) {
+                AsyncSocket new_peer_socket = co_await peer_server.accept();
+                auto endpoint = new_peer_socket.get_socket().remote_endpoint();
+                std::string addr = endpoint.address().to_string() + ":" + std::to_string(endpoint.port());
+                // Handle the new connection just like a seeder would
+                asio::co_spawn(self->io_context_, self->handle_new_connection(std::move(new_peer_socket), addr), asio::detached);
+            }
+        } catch (const std::exception& e) {
+            LOGCRITICAL("Leecher listening loop failed: {}", e.what());
+        }
+    }, asio::detached);
+
     asio::co_spawn(io_context_, choke_loop(), asio::detached);
     asio::co_spawn(io_context_, downloader_loop(), asio::detached);
     asio::co_spawn(io_context_, tracker_announce_loop(), asio::detached);
+    asio::co_spawn(io_context_, save(), asio::detached);
 
     try {
         co_await completion_timer_.async_wait(asio::use_awaitable);
@@ -1460,7 +1572,19 @@ asio::awaitable<bool> Leecher::run() {
         }
     }
 
+    co_await save_progress();
+
     co_return is_download_complete_;
 }
 
+asio::awaitable<void> Leecher::save() {
+    using namespace std::chrono_literals;
 
+    asio::steady_timer timer{io_context_};
+
+    while (true) {
+        co_await save_progress();
+        timer.expires_after(1min);
+        co_await timer.async_wait(asio::use_awaitable);
+    }
+}

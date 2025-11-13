@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -42,5 +43,5 @@ private:
 };
 
 
-Value decode(std::span<const char> data);
-std::vector<char> encode(const Value& value);
+Value decode(std::span<const std::byte> data);
+std::vector<std::byte> encode(const Value& value);

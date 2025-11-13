@@ -2,6 +2,8 @@
 
 #include <boost/asio.hpp>
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <format>
 #include <memory>
@@ -10,16 +12,18 @@
 
 namespace asio = boost::asio;
 
+using PeerId = std::array<std::byte, 20>;
+
 class PeerLogic;
 
 struct AnnounceRequestParams {
-    std::string info_hash_bytes;
-    std::string peer_id;
+    std::vector<std::byte> info_hash_bytes;
+    PeerId peer_id;
+    std::string event;
     uint16_t port;
     uint64_t uploaded;
     uint64_t downloaded;
     uint64_t left;
-    std::string event;
 };
 
 struct TrackerAnnounceResult {
@@ -48,9 +52,9 @@ private:
     asio::ip::udp::socket socket_;
     asio::ip::udp::endpoint tracker_endpoint_;
 
-    uint64_t connection_id_{0};
     asio::steady_timer::time_point connection_id_expiry_;
     uint32_t next_transaction_id_{0};
+    uint64_t connection_id_{0};
 
     std::string url_str_;
 };
@@ -64,8 +68,8 @@ public:
 private:
     asio::io_context& io_context_;
     std::string host_;
-    int port_;
     std::string target_;
+    int port_;
 };
 
 std::shared_ptr<ITrackerClient> create_tracker_client(asio::io_context& io_context, const std::string& tracker_url);
