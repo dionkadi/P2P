@@ -20,7 +20,15 @@
 enum class PieceStatus { 
     Needed, 
     InProgress, 
-    Have 
+    Have,
+    Skipped,
+};
+
+struct PieceFileOverlap {
+    size_t file_index;             // Index into meta_info_.get_torrent_info().files
+    uint64_t offset_in_file;    // Where this piece's data starts writing in the file
+    uint32_t offset_in_piece;   // Where in the piece data the file's content starts
+    uint32_t length;            // How many bytes from this piece belong to this file
 };
 
 struct PeerConnection {
@@ -44,6 +52,7 @@ struct PeerConnection {
     PeerId peer_id;
     std::string peer_addr;
     std::vector<uint8_t> bitfield;
+    std::map<uint8_t, ExtendedMessageType> remote_extension_map;
 
     bool am_choking = true;
     bool peer_is_choking = true;
@@ -67,6 +76,26 @@ struct InProgressPiece {
         blocks_received.resize(total_blocks, false);
         outstanding_requests.resize(total_blocks);
     }
+};
+
+class FileLockManager {
+public:
+    std::mutex& get_lock(const std::filesystem::path& path) {
+        std::lock_guard lock(global_mutex_);
+        return file_locks_[path];
+    }
+    
+private:
+    std::mutex global_mutex_;
+    std::map<std::filesystem::path, std::mutex> file_locks_;
+};
+
+class SaveGuard {
+public:
+    SaveGuard(std::atomic<bool>& flag) : flag_(flag) {}
+    ~SaveGuard() { flag_.store(false, std::memory_order_release); }
+private:
+    std::atomic<bool>& flag_;
 };
 
 class PeerLogic: public std::enable_shared_from_this<PeerLogic> {
@@ -103,6 +132,8 @@ protected:
     asio::awaitable<void> handle_completed_piece(int piece_index, const std::vector<std::byte>& piece_data);
     asio::awaitable<void> return_piece_to_queue(int piece_index);
     asio::awaitable<void> handle_request_message(std::shared_ptr<PeerConnection> conn, std::span<const std::byte> payload);
+    asio::awaitable<void> handle_extended_message(std::shared_ptr<PeerConnection> conn, std::span<const std::byte> payload);
+    asio::awaitable<void> resume_piece_download(int piece_index);
     
     asio::awaitable<void> verify_existing_file();
     asio::awaitable<bool> verify_seed_data(); 
@@ -113,6 +144,7 @@ protected:
 
     std::filesystem::path get_full_path_for_file(const FileInfo& file_info) const;
     void update_piece_rarity(int piece_index, uint32_t old_rarity, uint32_t new_rarity);
+    bool try_piece_download(size_t piece_index);
 
     asio::io_context& io_context_;
     MetaInfo meta_info_;
@@ -135,6 +167,9 @@ protected:
     const uint64_t DOWNLOAD_RATE_BPS_;
     const uint64_t TOKEN_BUCKET_CAPACITY_FACTOR = 2;
 
+    std::atomic<uint64_t> total_bytes_uploaded_{0};
+    std::atomic<uint64_t> total_bytes_downloaded_{0};
+
     int choke_loop_counter_{0};
 
     asio::steady_timer completion_timer_;
@@ -145,14 +180,21 @@ protected:
     std::vector<std::vector<std::shared_ptr<ITrackerClient>>> tracker_clients_by_tier_;
     int peer_port_;
 
+    std::vector<std::vector<PieceFileOverlap>> piece_to_files_map_;
+    std::vector<std::vector<size_t>> file_to_pieces_map_;
+
+    std::shared_ptr<FileLockManager> file_lock_manager_;
+    std::atomic<bool> is_saving_{false};
+
 private:
     static ThreadPool& get_file_io_pool();
 
     asio::awaitable<void> async_write_to_file(std::filesystem::path path, uint64_t offset, const std::vector<std::byte>& data);
-    asio::awaitable<std::vector<std::byte>> async_read_from_file(std::filesystem::path path, uint64_t offset, uint32_t size);
+    asio::awaitable<std::vector<std::byte>> async_read_from_file(std::filesystem::path path, uint64_t offset, uint32_t size = 0);
     asio::awaitable<void> connect_to_peer(std::string peer_addr);
 
     bool is_seeder_() const;
+    void build_pieces_files_map();
 
     AsyncRateLimiter upload_limiter_;
     AsyncRateLimiter download_limiter_;
@@ -186,7 +228,8 @@ private:
 class Leecher: public PeerLogic {
     struct private_key {}; 
     asio::awaitable<bool> async_init();
-    asio::awaitable<void> save();
+    asio::awaitable<void> periodically_save();
+    asio::awaitable<int> async_prompt(const std::string& question);
 
 public:
     Leecher(private_key, asio::io_context& io_context, PeerId peer_id, const std::filesystem::path& torrent_path, const std::filesystem::path& save_path,
@@ -205,5 +248,9 @@ public:
     );
 
     asio::awaitable<bool> run();
+    void stop();
+
+private:
+    std::atomic<bool> shutting_down_{false};
 };
 

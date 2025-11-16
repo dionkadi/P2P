@@ -37,11 +37,9 @@ add_library(p2p_common
 
 target_include_directories(p2p_common PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
-    third_party/asio/asio/include
     third_party/picosha2/
     third_party/json/include/nlohmann
     third_party/spdlog/include/spdlog
-    third_party/libtorrent/include/libtorrent
 )
 
 set(INCLUDEDIRS

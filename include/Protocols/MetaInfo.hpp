@@ -26,6 +26,7 @@ public:
     
     const std::vector<std::byte>& get_info_hash() const { return info_hash_bytes_; }
     const TorrentInfo& get_torrent_info() const { return info_; }
+    TorrentInfo& get_torrent_info() { return info_; }
 
 private:
     TorrentInfo info_;

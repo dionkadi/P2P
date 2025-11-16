@@ -98,13 +98,21 @@ int main(int argc, char* argv[]) {
         return 1;
     }
  
-    
     try {
         asio::io_context io_context;
+
+        std::shared_ptr<Leecher> leecher_ptr = nullptr;
+
         asio::signal_set signals(io_context, SIGINT, SIGTERM);
         signals.async_wait([&](auto, auto) {
             LOGINFO("Signal received, initiating shutdown...");
-            io_context.stop(); 
+            
+            if (leecher_ptr) {
+                LOGINFO("Saving progress before shutdown...");
+                leecher_ptr->stop();
+            } else {
+                io_context.stop();
+            }
         });
 
         PeerId my_peer_id = generate_peer_id();
@@ -159,11 +167,13 @@ int main(int argc, char* argv[]) {
             int peer_port = std::stoi(argv[4]);
 
             asio::co_spawn(io_context, 
-                [&io_context, my_peer_id, torrent_path, save_path, peer_port]() mutable -> asio::awaitable<void> 
+                [&io_context, &leecher_ptr, my_peer_id, torrent_path, save_path, peer_port]() mutable -> asio::awaitable<void> 
                 {
                     try {
                         auto leecher = co_await Leecher::create(io_context, my_peer_id, torrent_path, save_path, peer_port);
                         if (leecher) {
+                            leecher_ptr = leecher;
+
                             bool success = co_await leecher->run();
                             if (success) {
                                 LOGINFO("Download process completed successfully.");

@@ -63,6 +63,10 @@ public:
         return result;
     }
 
+    std::span<const std::byte> read_all() {
+        return read_bytes(remaining());
+    }
+
     size_t remaining() const { return view_.size(); }
 
 private:
@@ -83,6 +87,7 @@ using InfoHash = std::vector<std::byte>;
 struct Handshake {
     InfoHash info_hash_bytes;
     std::array<std::byte, 20> peer_id_bytes;
+    bool extended{false};
 
     std::vector<std::byte> serialize() const {
         std::vector<std::byte> buffer;
@@ -93,6 +98,9 @@ struct Handshake {
         writer.write_raw(PROTOCOL_STRING);
 
         std::vector<std::byte> reserved(HANDSHAKE_RESERVED_BYTES, std::byte{0});
+        if (extended) {
+            reserved[5] |= static_cast<std::byte>(0x10);
+        }
         writer.write_bytes(reserved);
         writer.write_bytes(info_hash_bytes);
         writer.write_bytes(peer_id_bytes);
@@ -117,15 +125,17 @@ struct Handshake {
             throw std::runtime_error("Protocol mismatch.");
         }
 
-        reader.read_bytes(HANDSHAKE_RESERVED_BYTES);
-        
         Handshake hs;
+
+        auto reserved = reader.read_bytes(HANDSHAKE_RESERVED_BYTES);
+        hs.extended = (reserved[5] & static_cast<std::byte>(0x10)) != static_cast<std::byte>(0);
+        
         auto info_hash_span = reader.read_bytes(HASH_SIZE);
         hs.info_hash_bytes.assign(info_hash_span.begin(), info_hash_span.end());
 
         auto peer_id_span = reader.read_bytes(PEER_ID_SIZE);
         std::ranges::copy(peer_id_span, hs.peer_id_bytes.begin());
-        
+
         return hs;
     }
 };
@@ -140,6 +150,14 @@ enum class MessageType: uint8_t {
     Request = 6,
     Piece = 7,
     Cancel = 8,
+    Port = 9,
+    ExtendedMessage = 20,
+};
+
+enum class ExtendedMessageType: uint8_t {
+    Handshake = 0,
+    ut_pex = 1,
+    ut_metadata = 3,
 };
 
 struct RequestPayload {
@@ -221,3 +239,14 @@ struct UdpPeerInfo {
 };
 
 #pragma pack(pop)
+
+
+inline ExtendedMessageType to_extended_type(const std::string& s) {
+    if (s == "ut_pex") {
+        return ExtendedMessageType::ut_pex;
+    }
+    if (s == "ut_metadata") {
+        return ExtendedMessageType::ut_metadata;
+    }
+    throw;
+}
