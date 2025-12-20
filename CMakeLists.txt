@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 4.0)
+cmake_minimum_required(VERSION 3.30)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -52,7 +52,7 @@ target_link_libraries(p2p_common PUBLIC
     spdlog
     Threads::Threads
     picosha2
-    -lboost_url
+    Boost::headers
 )
 
 add_executable(tracker src/main_tracker.cpp)
