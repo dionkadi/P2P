@@ -74,5 +74,5 @@ private:
     std::atomic_bool is_download_complete_{false};
     std::atomic_bool is_in_endgame_mode_{false};
     size_t num_pieces_;
-    std::mutex m_;
+    mutable std::mutex m_;
 };

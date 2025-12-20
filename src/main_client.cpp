@@ -102,7 +102,7 @@ int main(int argc, char* argv[]) {
         asio::io_context io_context;
 
         asio::signal_set signals(io_context, SIGINT, SIGTERM);
-        signals.async_wait([&io_context](auto, auto) -> asio::awaitable<void> {
+        signals.async_wait([&io_context](auto, auto) {
             LOGINFO("Signal received, initiating shutdown...");
             io_context.stop();
         });

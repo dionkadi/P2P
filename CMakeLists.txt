@@ -20,7 +20,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 
 find_package(Threads REQUIRED)
-find_package(Boost REQUIRED)
+find_package(Boost REQUIRED COMPONENTS url)
 
 add_subdirectory(third_party/json)
 add_subdirectory(third_party/picosha2)
@@ -44,7 +44,6 @@ target_include_directories(p2p_common PUBLIC
 
 set(INCLUDEDIRS
         src/include
-        third_party/asio/asio/include
         third_party/picosha2
 )
 
@@ -53,11 +52,11 @@ target_link_libraries(p2p_common PUBLIC
     Threads::Threads
     picosha2
     Boost::headers
+    Boost::url
 )
 
 add_executable(tracker src/main_tracker.cpp)
 add_executable(client src/main_client.cpp)
 
 target_link_libraries(tracker PRIVATE p2p_common)
-
 target_link_libraries(client PRIVATE p2p_common)
