@@ -1,24 +1,80 @@
-#include "Peers/TrackerClient.hpp"
-#include "Protocols/Protocol.hpp"
-#include "Utils/Logger.hpp"
-#include "Utils/Bencode.hpp"
-#include "Http/HttpServer.hpp"
+#pragma once
+
+#include <boost/asio.hpp>
+
 #include <array>
-#include <cctype>
-#include <chrono>
 #include <cstddef>
-#include <endian.h>
-#include <exception>
-#include <iomanip>
-#include <random>
-#include <sstream>
-#include <stdexcept>
+#include <cstdint>
+#include <format>
+#include <memory>
 #include <string>
-#include <utility>
+#include <vector>
+#include <random>
 #include <boost/url.hpp>
 #include <boost/asio/experimental/awaitable_operators.hpp>
-#include <vector>
+
+#include "Logger.hpp"
+#include "Bencode.hpp"
+#include "HttpServer.hpp"
+#include "Types.hpp"
+
+namespace asio = boost::asio;
 using namespace boost::asio::experimental::awaitable_operators;
+
+class PeerLogic;
+
+class ITrackerClient {
+public:
+    virtual ~ITrackerClient() = default;
+
+    virtual asio::awaitable<TrackerAnnounceResult> announce(const AnnounceRequestParams& params) = 0;
+    virtual const std::string get_url() const = 0;
+};
+
+class UdpTrackerClient: public ITrackerClient, public std::enable_shared_from_this<UdpTrackerClient> {
+public:
+    UdpTrackerClient(asio::io_context& io_context, std::string host, int port)
+        : io_context_(io_context), socket_(io_context), url_str_(std::format("{}:{}", host, port)) 
+    {
+        asio::ip::udp::resolver resolver(io_context_);
+        tracker_endpoint_ = *resolver.resolve(host, std::to_string(port)).begin();
+        socket_.open(tracker_endpoint_.protocol());
+
+        std::random_device rd;
+        next_transaction_id_ = rd();
+    }
+
+    asio::awaitable<TrackerAnnounceResult> announce(const AnnounceRequestParams& params) override;
+    const std::string get_url() const override { return "udp://" + url_str_; }
+
+private:
+    asio::awaitable<bool> connect_to_tracker();
+
+    asio::io_context& io_context_;
+    asio::ip::udp::socket socket_;
+    asio::ip::udp::endpoint tracker_endpoint_;
+
+    asio::steady_timer::time_point connection_id_expiry_;
+    uint32_t next_transaction_id_{0};
+    uint64_t connection_id_{0};
+
+    std::string url_str_;
+};
+
+class HttpTrackerClient: public ITrackerClient, public std::enable_shared_from_this<HttpTrackerClient> {
+public:
+    HttpTrackerClient(asio::io_context& io_context, std::string host, int port, std::string target)
+        : io_context_(io_context), host_(std::move(host)), target_(std::move(target)), port_(port) {}
+
+    asio::awaitable<TrackerAnnounceResult> announce(const AnnounceRequestParams& params) override;
+    const std::string get_url() const override { return std::format("http://{}:{}", host_, port_); }
+
+private:
+    asio::io_context& io_context_;
+    std::string host_;
+    std::string target_;
+    int port_;
+};
 
 template <typename Cont>
 std::string url_encode(const Cont& value) {
@@ -36,7 +92,7 @@ std::string url_encode(const Cont& value) {
     return escaped.str();
 }
 
-std::shared_ptr<ITrackerClient> create_tracker_client(asio::io_context& io_context, const std::string& tracker_url) {
+inline std::shared_ptr<ITrackerClient> create_tracker_client(asio::io_context& io_context, const std::string& tracker_url) {
     using namespace boost;
     system::result<urls::url_view> r = urls::parse_uri(tracker_url);
     if (!r) {
@@ -79,20 +135,7 @@ std::shared_ptr<ITrackerClient> create_tracker_client(asio::io_context& io_conte
     }
 }
 
-
-UdpTrackerClient::UdpTrackerClient(asio::io_context& io_context, std::string host, int port)
-    : io_context_(io_context), socket_(io_context), url_str_(std::format("{}:{}", host, port)) {
-
-    asio::ip::udp::resolver resolver(io_context_);
-    tracker_endpoint_ = *resolver.resolve(host, std::to_string(port)).begin();
-    socket_.open(tracker_endpoint_.protocol());
-
-    std::random_device rd;
-    next_transaction_id_ = rd();
-}
-
-
-asio::awaitable<bool> UdpTrackerClient::connect_to_tracker() {
+inline asio::awaitable<bool> UdpTrackerClient::connect_to_tracker() {
     auto self = shared_from_this();
 
     int n = 0;
@@ -140,8 +183,7 @@ asio::awaitable<bool> UdpTrackerClient::connect_to_tracker() {
     co_return false;
 }
 
-
-asio::awaitable<TrackerAnnounceResult> UdpTrackerClient::announce(const AnnounceRequestParams& params) {
+inline asio::awaitable<TrackerAnnounceResult> UdpTrackerClient::announce(const AnnounceRequestParams& params) {
     auto self = shared_from_this();
 
     if (connection_id_ == 0 || std::chrono::steady_clock::now() >= connection_id_expiry_) {
@@ -150,13 +192,11 @@ asio::awaitable<TrackerAnnounceResult> UdpTrackerClient::announce(const Announce
             throw std::runtime_error("Failed to get UDP tracker connection ID.");
         }
     }
-
     
     int n = 0;
     const int max_retries = 4;
     
     while (n <= max_retries) {
-        
         UdpAnnounceRequest req;
         req.connection_id = htobe64(connection_id_);
         req.transaction_id = htobe32(next_transaction_id_++);
@@ -169,7 +209,6 @@ asio::awaitable<TrackerAnnounceResult> UdpTrackerClient::announce(const Announce
         if (params.event == "started") req.event = htobe32(2);
         else if (params.event == "completed") req.event = htobe32(1);
         else if (params.event == "stopped") req.event = htobe32(3);
-
 
         try {
             LOGDBG("Sending UDP announce request to tracker (try {})", n);
@@ -219,12 +258,7 @@ asio::awaitable<TrackerAnnounceResult> UdpTrackerClient::announce(const Announce
     throw std::runtime_error("Failed to announce to UDP tracker after " + std::to_string(max_retries) + " retries.");
 }
 
-
-HttpTrackerClient::HttpTrackerClient(asio::io_context& io_context, std::string host, int port, std::string target)
-    : io_context_(io_context), host_(std::move(host)), target_(std::move(target)), port_(port) {}
-
-
-asio::awaitable<TrackerAnnounceResult> HttpTrackerClient::announce(const AnnounceRequestParams& params) {
+inline asio::awaitable<TrackerAnnounceResult> HttpTrackerClient::announce(const AnnounceRequestParams& params) {
     auto self = shared_from_this();
 
     try {
@@ -242,29 +276,25 @@ asio::awaitable<TrackerAnnounceResult> HttpTrackerClient::announce(const Announc
         }
         std::string full_target = target_ + "?" + query_ss.str();
 
-        // These objects perform our I/O
         tcp::resolver resolver(io_context_);
         beast::tcp_stream stream(io_context_);
 
-        // Look up the domain name
         auto const results = co_await resolver.async_resolve(host_, std::to_string(port_), asio::use_awaitable);
-        // Make the connection on the IP address we get from a lookup
+
         stream.expires_after(std::chrono::seconds(30));
         co_await stream.async_connect(results, asio::use_awaitable);
-        // Set up an HTTP GET request message
+
         http::request<http::string_body> req{http::verb::get, full_target, 11};
         req.set(http::field::host, host_);
         req.set(http::field::user_agent, "Cpp-P2P-Client/1.0");
-        // Send the HTTP request to the remote host
+
         co_await http::async_write(stream, req, asio::use_awaitable);
-        // This buffer is used for reading and must be persisted
+
         beast::flat_buffer buffer;
-        // Declare a container to hold the response
         http::response<http::string_body> res;
-        // Receive the HTTP response
+
         co_await http::async_read(stream, buffer, res, asio::use_awaitable);
         
-        // Gracefully close the socket
         beast::error_code ec;
         ec = stream.socket().shutdown(tcp::socket::shutdown_both, ec);
         if(ec && ec != beast::errc::not_connected)
@@ -300,4 +330,3 @@ asio::awaitable<TrackerAnnounceResult> HttpTrackerClient::announce(const Announc
         throw;
     }
 }
- 

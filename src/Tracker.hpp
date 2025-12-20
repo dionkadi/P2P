@@ -1,23 +1,89 @@
-#include "Peers/Tracker.hpp"
-#include "Utils/Logger.hpp"
-#include "Utils/Crypto.hpp"
-#include "Utils/Bencode.hpp"
-#include "Protocols/Protocol.hpp"
+#pragma once
+
 #include <cstddef>
-#include <cstdint>
-#include <endian.h>
-#include <exception>
-#include <map>
 #include <memory>
 #include <span>
-#include <sstream>
 #include <string>
-#include <utility>
+#include <random>
+#include <map>
+#include <boost/asio.hpp>
+#include <boost/container/flat_set.hpp>
 #include <vector>
 
+#include "HttpServer.hpp"
+#include "Bencode.hpp"
+#include "Crypto.hpp"
+#include "Types.hpp"
 
-// Helper to URL-decode a string (essential for info_hash)
-std::string url_decode(std::string_view str) {
+namespace asio = boost::asio;
+
+class Tracker {
+public:
+    Tracker(): strand_(asio::make_strand(io_context_)) {}
+
+    Tracker(const Tracker&) = delete;
+    Tracker& operator= (const Tracker&) = delete;
+
+    void listen_http(int port) {
+        http_router_ = std::make_shared<HttpRouter>();
+        http_router_->add_route("/announce", create_announce_handler());
+        http_router_->add_route("/", create_announce_handler());
+        auto const address = asio::ip::make_address("0.0.0.0");
+        auto endpoint = tcp::endpoint{address, static_cast<unsigned short>(port)};
+        // Spawn the listener coroutine. It will run until the io_context is stopped.
+        asio::co_spawn(
+            io_context_,
+            http_listener(io_context_, endpoint, http_router_),
+            asio::detached
+        );
+    }
+
+    void listen_udp(int port) {
+        asio::co_spawn(
+            io_context_, 
+            udp_listen_loop(port), 
+            [](std::exception_ptr p) {
+                if (p) {
+                    try {
+                        std::rethrow_exception(p);
+                    } catch (const std::exception& e) {
+                        LOGCRITICAL("Tracker UDP listen loop failed: {}", e.what());
+                    }
+                }
+            }
+        );
+    }
+    
+    void run() {
+        LOGINFO("Tracker is running...");
+        io_context_.run();
+        LOGINFO("Tracker stopped");
+    }
+
+    asio::io_context& get_io_context() { return io_context_; }
+
+private:
+    asio::awaitable<void> udp_listen_loop(int port);
+    asio::awaitable<void> handle_udp_request(asio::ip::udp::endpoint remote_endpoint, std::span<const char> request, asio::ip::udp::socket& socket);
+
+    HttpHandler create_announce_handler();
+    
+    asio::io_context io_context_;
+    asio::strand<asio::io_context::executor_type> strand_;
+    std::map<std::vector<std::byte>, boost::container::flat_set<std::string>> peers_;
+
+    std::shared_ptr<HttpRouter> http_router_;
+
+    struct UdpClientInfo {
+        uint64_t connection_id;
+        std::chrono::steady_clock::time_point expiry;
+    };
+    // Use asio::ip::address as the key for protocol independence
+    std::unordered_map<asio::ip::address, UdpClientInfo> udp_clients_;
+    std::mt19937_64 rng_{std::random_device{}()};
+};
+
+inline std::string url_decode(std::string_view str) {
     std::string decoded;
     decoded.reserve(str.length());
     for (size_t i = 0; i < str.length(); ++i) {
@@ -36,8 +102,7 @@ std::string url_decode(std::string_view str) {
     return decoded;
 }
 
-// Helper function to parse URL-encoded query strings
-std::map<std::string, std::string> parse_query_params(std::string_view query) {
+inline std::map<std::string, std::string> parse_query_params(std::string_view query) {
     std::map<std::string, std::string> params;
     std::stringstream query_stream{std::string(query)};
     std::string pair_str;
@@ -57,9 +122,7 @@ std::map<std::string, std::string> parse_query_params(std::string_view query) {
     return params;
 }
 
-
-HttpHandler Tracker::create_announce_handler() {
-    // The handler lambda is now a coroutine itself
+inline HttpHandler Tracker::create_announce_handler() {
     return [this](HttpRequest req) -> asio::awaitable<HttpResponse> {
         HttpResponse res{http::status::ok, req.version()};
         res.set(http::field::server, BOOST_BEAST_VERSION_STRING);
@@ -118,47 +181,7 @@ HttpHandler Tracker::create_announce_handler() {
     };
 }
 
-
-Tracker::Tracker(): strand_(asio::make_strand(io_context_)) {}
-
-void Tracker::listen_http(int port) {
-    http_router_ = std::make_shared<HttpRouter>();
-    http_router_->add_route("/announce", create_announce_handler());
-    http_router_->add_route("/", create_announce_handler());
-    auto const address = asio::ip::make_address("0.0.0.0");
-    auto endpoint = tcp::endpoint{address, static_cast<unsigned short>(port)};
-    // Spawn the listener coroutine. It will run until the io_context is stopped.
-    asio::co_spawn(
-        io_context_,
-        http_listener(io_context_, endpoint, http_router_),
-        asio::detached
-    );
-}
-
-void Tracker::listen_udp(int port) {
-    asio::co_spawn(
-        io_context_, 
-        udp_listen_loop(port), 
-        [](std::exception_ptr p) {
-            if (p) {
-                try {
-                    std::rethrow_exception(p);
-                } catch (const std::exception& e) {
-                    LOGCRITICAL("Tracker UDP listen loop failed: {}", e.what());
-                }
-            }
-        }
-    );
-}
-
-void Tracker::run() {
-    LOGINFO("Tracker is running...");
-    io_context_.run();
-    LOGINFO("Tracker stopped");
-}
-
-
-asio::awaitable<void> Tracker::udp_listen_loop(int port) {
+inline asio::awaitable<void> Tracker::udp_listen_loop(int port) {
     auto executor = co_await asio::this_coro::executor;
     asio::ip::udp::socket udp_socket(executor, asio::ip::udp::endpoint(asio::ip::udp::v4(), port));
     LOGINFO("UDP server listening on port {}", port);
@@ -174,7 +197,7 @@ asio::awaitable<void> Tracker::udp_listen_loop(int port) {
     }
 }
 
-asio::awaitable<void> Tracker::handle_udp_request(asio::ip::udp::endpoint remote_endpoint, std::span<const char> request, asio::ip::udp::socket& socket) {
+inline asio::awaitable<void> Tracker::handle_udp_request(asio::ip::udp::endpoint remote_endpoint, std::span<const char> request, asio::ip::udp::socket& socket) {
     if (request.size() < sizeof(UdpConnectRequest)) {
         LOGWARN("Received too-small UDP packet from {}", remote_endpoint.address().to_string());
         co_return;
@@ -254,8 +277,4 @@ asio::awaitable<void> Tracker::handle_udp_request(asio::ip::udp::endpoint remote
     } catch (const std::exception& e) {
         LOGERR("Error handling UDP request from {}: {}", remote_endpoint.address().to_string(), e.what());
     }
-}
-
-asio::io_context& Tracker::get_io_context() {
-    return io_context_;
 }

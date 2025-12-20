@@ -1,8 +1,6 @@
-#include "Peers/Tracker.hpp"
-#include "Utils/Logger.hpp"
+#include "Tracker.hpp"
+#include "Logger.hpp"
 #include <csignal>
-
-#include <iostream>
 
 
 int main(

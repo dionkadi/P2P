@@ -1,16 +1,25 @@
-#include "Protocols/MetaInfo.hpp"
-#include "Utils/Crypto.hpp"
-#include "Utils/Logger.hpp"
-#include "Utils/Bencode.hpp"
+#pragma once
 
-#include <cstddef>
-#include <fstream>
-#include <memory>
-#include <string>
-#include <variant>
-#include <vector>
+#include "Crypto.hpp"
+#include "Logger.hpp"
+#include "Bencode.hpp"
+#include "Types.hpp"
 
-void gather_files(const std::filesystem::path& base_path, const std::filesystem::path& current_path, std::vector<FileInfo>& files, uint64_t& total_size) {
+class MetaInfo {
+public:
+    bool load_from_file(const std::string& file_path, std::vector<std::vector<std::string>>& out_tracker_tiers);
+    static bool create_from_file(const std::filesystem::path& source_path, const std::filesystem::path& torrent_path, const std::vector<std::string>& tracker_urls, uint32_t piece_size = 262144);
+    
+    const std::vector<std::byte>& get_info_hash() const { return info_hash_bytes_; }
+    const TorrentInfo& get_torrent_info() const { return info_; }
+    TorrentInfo& get_torrent_info() { return info_; }
+
+private:
+    TorrentInfo info_;
+    std::vector<std::byte> info_hash_bytes_;
+};
+
+inline void gather_files(const std::filesystem::path& base_path, const std::filesystem::path& current_path, std::vector<FileInfo>& files, uint64_t& total_size) {
     for (const auto& entry : std::filesystem::directory_iterator(current_path)) {
         auto relative_path = std::filesystem::relative(entry.path(), base_path);
         if (entry.is_directory()) {
@@ -23,7 +32,7 @@ void gather_files(const std::filesystem::path& base_path, const std::filesystem:
     }
 }
 
-bool MetaInfo::load_from_file(const std::string& file_path, std::vector<std::vector<std::string>>& out_tracker_tiers) {
+inline bool MetaInfo::load_from_file(const std::string& file_path, std::vector<std::vector<std::string>>& out_tracker_tiers) {
     std::ifstream f(file_path);
     if (!f) {
         LOGERR("Could not open torrent file: {}", file_path);
@@ -116,8 +125,7 @@ bool MetaInfo::load_from_file(const std::string& file_path, std::vector<std::vec
     }
 }
 
-
-bool MetaInfo::create_from_file(const std::filesystem::path& source_path, const std::filesystem::path& torrent_path, const std::vector<std::string>& tracker_urls, uint32_t piece_size) {
+inline bool MetaInfo::create_from_file(const std::filesystem::path& source_path, const std::filesystem::path& torrent_path, const std::vector<std::string>& tracker_urls, uint32_t piece_size) {
     if (!std::filesystem::exists(source_path)) {
         LOGCRITICAL("Source path for torrent creation does not exist: {}", source_path.string());
         return false;

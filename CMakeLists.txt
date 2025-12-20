@@ -4,7 +4,7 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 project(P2PFileSharing
-        VERSION 1.0
+        VERSION 1.1
         DESCRIPTION "A P2P file sharing"
         LANGUAGES C CXX
 )
@@ -27,12 +27,12 @@ add_subdirectory(third_party/picosha2)
 add_subdirectory(third_party/spdlog)
 
 add_library(p2p_common
-    src/Utils/Bencode.cpp
-    src/Peers/Peer.cpp
-    src/Peers/Tracker.cpp
-    src/Peers/TrackerClient.cpp
-    src/Protocols/MetaInfo.cpp
-    src/Protocols/Protocol.cpp
+    src/Bencode.cpp  
+    src/FileManager.cpp  
+    src/PeerConnection.cpp  
+    src/PeerManager.cpp  
+    src/PieceManager.cpp  
+    src/TorrentSession.cpp
 )
 
 target_include_directories(p2p_common PUBLIC
