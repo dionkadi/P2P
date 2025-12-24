@@ -42,6 +42,7 @@ public:
     std::filesystem::path get_resume_file_path() const;
 
     const std::vector<size_t>& file_to_pieces_map(size_t file_idx) const { return file_to_pieces_map_[file_idx]; }
+    asio::awaitable<std::map<std::string, int64_t>> async_get_file_mtimes();
 
 private:
     static ThreadPool& get_file_io_pool();

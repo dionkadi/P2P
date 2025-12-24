@@ -89,6 +89,7 @@ void FileManager::build_maps() {
     const auto& info = state_->torrent_info();
     const size_t num_pieces = state_->num_pieces();
     const uint32_t piece_size = info.piece_size;
+    const uint64_t total_torrent_size = info.total_size;
 
     piece_to_files_map_.resize(num_pieces);
     file_to_pieces_map_.resize(info.files.size());
@@ -96,16 +97,35 @@ void FileManager::build_maps() {
     uint64_t current_total_offset = 0;
     for (size_t file_idx = 0; file_idx < info.files.size(); ++file_idx) {
         const auto& file = info.files[file_idx];
-        uint64_t file_start_offset = current_total_offset;
-        uint64_t file_end_offset = file_start_offset + file.size;
+        uint64_t file_start_offset = current_total_offset; // Absolute start in total torrent data
+        uint64_t file_end_offset = file_start_offset + file.size; // Absolute end in total torrent data
 
         uint32_t start_piece = file_start_offset / piece_size;
-        uint32_t end_piece = (file_end_offset - 1) / piece_size;
+        uint32_t end_piece = (file.size == 0) ? start_piece : (file_end_offset - 1) / piece_size;
+        // Ensure end_piece_idx doesn't exceed the total number of pieces
+        if (end_piece >= num_pieces) {
+            end_piece = num_pieces - 1;
+        }
         for (uint32_t piece_idx = start_piece; piece_idx <= end_piece; ++piece_idx) {
             uint64_t piece_start_offset = static_cast<uint64_t>(piece_idx) * piece_size;
+            
+            uint64_t actual_piece_size;
+            if (piece_idx == num_pieces - 1) { // Last piece
+                actual_piece_size = total_torrent_size - piece_start_offset;
+                // If total_torrent_size is a perfect multiple of piece_size, 
+                // the last piece will have piece_size.
+                // If total_torrent_size is 0, actual_piece_size should be 0.
+                if (total_torrent_size == 0 && num_pieces == 0) actual_piece_size = 0;
+                else if (actual_piece_size == 0 && total_torrent_size > 0 && num_pieces > 0) { // e.g. 10MB total, 2MB piece, last piece starts at 8MB, actual size 2MB
+                    actual_piece_size = piece_size;
+                }
+            } else {
+                actual_piece_size = piece_size;
+            }
 
+            uint64_t piece_end_offset = piece_start_offset + actual_piece_size;
             uint64_t overlap_start = std::max(file_start_offset, piece_start_offset);
-            uint64_t overlap_end = std::min(file_end_offset, piece_start_offset + piece_size);
+            uint64_t overlap_end = std::min(file_end_offset, piece_end_offset);
 
             if (overlap_end > overlap_start) {
                 PieceFileOverlap overlap;
@@ -151,30 +171,36 @@ asio::awaitable<void> FileManager::async_write_to_file(const std::filesystem::pa
     co_await asio::async_initiate<void(std::error_code)>(
         [this, &path, offset, data] (auto&& completion_handler) {
             file_io_pool_.enqueue(
-                [&path, offset, data, locker = file_locker_, handler = std::move(completion_handler)]
+                [path, offset, data, locker = file_locker_, handler = std::move(completion_handler)]
                 () mutable {
                     try {
                         std::lock_guard lock(locker->get_lock(path));
 
-                        if (!path.has_parent_path()) {
-                            std::filesystem::create_directories(path.parent_path());
-                        }
-
-                        std::fstream output_file(path, std::ios::binary | std::ios::in | std::ios::out);
-                        if (!output_file) {
-                            // File doesn't exist, create it.
-                            output_file.open(path, std::ios::binary | std::ios::out);
-                            if (!output_file) {
-                                throw std::runtime_error("Failed to open file for writing: " + path.string());
+                        std::filesystem::path parent_dir = path.parent_path();
+                        if (!parent_dir.empty()) { // Only try to create if there is a parent directory
+                            std::error_code dir_ec;
+                            std::filesystem::create_directories(parent_dir, dir_ec);
+                            if (dir_ec) {
+                                throw std::runtime_error(std::format("Failed to create parent directories for {}: {}", path.string(), dir_ec.message()));
                             }
                         }
 
-                        output_file.seekp(offset, std::ios::beg);
-                        output_file.write(reinterpret_cast<const char*>(data.data()), data.size());
+                        std::fstream output_file(path, std::ios::binary | std::ios::in | std::ios::out);
+                        if (!output_file.is_open()) {
+                            throw std::runtime_error(std::format("Failed to open preallocated file for writing: {}. Error: {}", path.string(), std::strerror(errno)));
+                        }
+                        output_file.clear();  // Clear any error flags if stream was used before or created with errors
 
+                        output_file.seekp(offset, std::ios::beg);
+                        if (output_file.fail()) {
+                            throw std::runtime_error(std::format("Failed to seek to offset {} in file {}. Error: {}", offset, path.string(), std::strerror(errno)));
+                        }
+
+                        output_file.write(reinterpret_cast<const char*>(data.data()), data.size());
                         if (!output_file) {
                             throw std::runtime_error("Failed to write data to file: " + path.string());
                         }
+                        output_file.flush();
 
                         std::move(handler)(std::error_code{});
                     } catch (const std::exception& e) {
@@ -195,19 +221,43 @@ asio::awaitable<std::vector<std::byte>> FileManager::async_read_from_file(const 
                 [&path, offset, size, handler = std::move(completion_handler)]
                 () mutable {
                     try {
+                        // LOGDBG("FileManager: [FileIO Pool] Attempting to open '{}'", path.string());
                         std::ifstream data_file(path, std::ios::binary);
                         if (!data_file) {
+                            LOGERR("FileManager: [FileIO Pool] Failed to open file for reading: {}", path.string());
                             throw std::runtime_error("Failed to open file for reading: " + path.string());
                         }
+                        
+                        uint64_t actual_file_size = std::filesystem::file_size(path);
+                        // LOGDBG("FileManager: [FileIO Pool] Reading from '{}', requested offset={}, size={}, actual file size={}", 
+                        //     path.string(), offset, size, actual_file_size);
+                        // Validate read range against actual file size
+                        if (offset + size > actual_file_size) {
+                            LOGERR("FileManager: [FileIO Pool] Requested read ({}+{}) exceeds actual file size ({}) for file: {}", 
+                                offset, size, actual_file_size, path.string());
+                            throw std::runtime_error(std::format("Requested read ({}+{}) exceeds actual file size ({}) for file: {}", 
+                                offset, size, actual_file_size, path.string()));
+                        }
 
-                        if (size == 0) {
+                        if (size == 0) {  // read full file if given size is 0
                             size = std::filesystem::file_size(path);
                         }
 
                         std::vector<std::byte> buffer(size);
-                        data_file.seekg(offset);
+                        data_file.seekg(offset, std::ios::beg);
+                        if (data_file.fail()) {
+                            LOGERR("FileManager: [FileIO Pool] Failed to seek to offset {} in file {}. Error: {}", offset, path.string(), std::strerror(errno));
+                            throw std::runtime_error("Failed to seek in file: " + path.string());
+                        }
                         data_file.read(reinterpret_cast<char *>(buffer.data()), size);
                         if (static_cast<std::size_t>(data_file.gcount()) != size) {
+                            throw std::runtime_error("Incomplete read from file: " + path.string());
+                        }
+                        std::streamsize bytes_read_actual = data_file.gcount();
+                        // LOGDBG("FileManager: [FileIO Pool] Read {} bytes, requested {}. EOF={}, Fail={}", bytes_read_actual, size, data_file.eof(), data_file.fail());
+                        if (static_cast<uint32_t>(bytes_read_actual) != size) {
+                            LOGERR("FileManager: [FileIO Pool] Incomplete read from file '{}'. Read {} bytes, requested {}. EOF={}, Fail={}", 
+                                path.string(), bytes_read_actual, size, data_file.eof(), data_file.fail());
                             throw std::runtime_error("Incomplete read from file: " + path.string());
                         }
                         
@@ -318,18 +368,41 @@ asio::awaitable<void> FileManager::save_resume_data(std::span<const std::byte> d
     temp_path += ".tmp";
 
     try {
-        std::filesystem::create_directories(p.parent_path());
+        std::filesystem::path parent_dir = p.parent_path();
+        if (!parent_dir.empty()) {
+            std::error_code ec;
+            std::filesystem::create_directories(parent_dir, ec);
+            if (ec) {
+                throw std::runtime_error(std::format("Failed to create parent directories for resume file {}: {}", parent_dir.string(), ec.message()));
+            }
+        }
+
+        if (!std::filesystem::exists(temp_path)) {
+            std::ofstream temp_file(temp_path, std::ios::binary | std::ios::in | std::ios::out | std::ios::trunc);
+            if (!temp_file) {
+                throw std::runtime_error(std::format("Failed to create/open file: {}. Error: {}", temp_path.string(), std::strerror(errno)));
+            }
+            temp_file.close();
+        }
+
         co_await async_write_to_file(temp_path, 0, data);
-        std::filesystem::rename(temp_path, p);
-        LOGDBG("Progress saved successfully");
+
+        std::error_code ec;
+        std::filesystem::rename(temp_path, p, ec);
+        if (ec) {
+            throw std::runtime_error(std::format("filesystem error: cannot rename: {} [{}] [{}]", ec.message(), temp_path.string(), p.string()));
+        }
+        
+        LOGDBG("Progress saved successfully to {}", p.string());
     } catch(const std::exception& e) {
         LOGERR("Failed to save resume file: {}", e.what());
         
         std::error_code ec;
         std::filesystem::remove(temp_path, ec);
         if (ec) {
-            LOGDBG("Could not remove temporary file: {}", ec.message());
+            LOGDBG("Could not remove temporary resume file {}: {}", temp_path.string(), ec.message());
         }
+        throw;
     }
     
 }
@@ -353,65 +426,82 @@ asio::awaitable<bool> FileManager::preallocate_files() {
         // For a multi-file torrent, base_save_path is the parent directory.
         // We create a subdirectory named after the torrent.
         if (info.files.size() > 1) {
-            // Check if the user gave a file path instead of a directory
-            if (base_save_path.has_extension() || !std::filesystem::is_directory(base_save_path.parent_path())) {
-                base_save_path = base_save_path.parent_path();
-            }
+            base_save_path /= info.name;
+        }
+
+        std::error_code ec;
+        std::filesystem::create_directories(base_save_path, ec);
+        if (ec) {
+            LOGCRITICAL("Failed to create base torrent directory {}: {}", base_save_path.string(), ec.message());
+            co_return false;
         }
 
         // selective downloading
-        bool skip_all = false;
+        std::optional<bool> download_all_decision;
         for (size_t i = 0; i < info.files.size(); ++i) {
             auto& file = info.files[i];
             std::filesystem::path full_path = get_full_path_for_file(file);
-
-            bool skip_this_file = false;
-            int ans = co_await async_prompt(
-                std::format("Download file {}?\n    1 - Yes\n    2 - No\n    3 - Yes for all\n    4 - No for all\n:", 
-                full_path.filename().string())
-            );
-
-            if (ans == 1) {
-                
-            } else if (ans == 2) {
-                skip_this_file = true;
-            } else if (ans == 3) {
-                skip_all = true;
-            } else if (ans == 4) {
-                skip_this_file = true;
-                skip_all = true;
+            if (download_all_decision.has_value()) {
+                file.download = download_all_decision.value();
             } else {
-                LOGWARN("Unknown input '{}', defaulting to Yes", ans);
-            }
+                bool skip_this_file = false;
+                int ans = co_await async_prompt(
+                    std::format("Download file {}?\n    1 - Yes\n    2 - No\n    3 - Yes for all\n    4 - No for all\n:", 
+                    full_path.filename().string())
+                );
+                if (ans == 1) { // Yes
+                    file.download = true;
+                } else if (ans == 2) { // No
+                    skip_this_file = true;
+                } else if (ans == 3) { // Yes for all
+                    file.download = true; // Current file is downloaded
+                    download_all_decision = true; // Set global decision for subsequent files
+                } else if (ans == 4) { // No for all
+                    skip_this_file = true; // Current file is skipped
+                    download_all_decision = false; // Set global decision for subsequent files
+                } else {
+                    LOGWARN("Unknown input '{}', defaulting to Yes", ans);
+                    file.download = true; // Default to download
+                }
 
-            if (skip_this_file) {
-                file.download = false;
+                if (skip_this_file) {
+                    file.download = false;
+                }
+            }
+            
+            if (!file.download) {
                 continue;
             }
 
-            if (skip_this_file && skip_all) {
-                for (size_t j = i; j < info.files.size(); ++j) {
-                    info.files[j].download = false;
-                }
-                break;
-            }
-
             // Only create/truncate the file if it DOES NOT exist
-            if (!std::filesystem::exists(full_path) && file.download) {
+            if (!std::filesystem::exists(full_path)) {
                 LOGINFO("File {} does not exist. Pre-allocating...", full_path.string());
-                if (full_path.has_parent_path()) {
-                    std::filesystem::create_directories(full_path.parent_path());
+                std::filesystem::path parent_dir = full_path.parent_path();
+                if (!parent_dir.empty()) {
+                    std::error_code ec;
+                    std::filesystem::create_directories(parent_dir, ec);
+                    if (ec) {
+                        LOGCRITICAL("Failed to create parent directories for file {}: {}", full_path.string(), ec.message());
+                        co_return false; // Critical failure, abort preallocation
+                    }
                 }
                 // Now, truncating is safe because the file is new
-                std::ofstream output_file(full_path, std::ios::binary | std::ios::trunc);
+                std::ofstream output_file(full_path, std::ios::binary | std::ios::in | std::ios::out | std::ios::trunc);
+                if (!output_file.is_open()) {
+                    throw std::runtime_error(std::format("Failed to create/open file for preallocation: {}. Error: {}", full_path.string(), std::strerror(errno)));
+                }
                 if (file.size > 0) {
                     output_file.seekp(file.size - 1);
                     output_file.write("", 1);
+                    if (output_file.fail()) {
+                        throw std::runtime_error(std::format("Failed to preallocate file size for {}. Error: {}", full_path.string(), std::strerror(errno)));
+                    }
                 }
-            }
-
-            if (skip_all) {
-                break;
+                output_file.close();
+                
+                if (!std::filesystem::exists(full_path)) {
+                    throw std::runtime_error(std::format("File {} was not found on disk after successful preallocation attempt.", full_path.string()));
+                }
             }
         }
 
@@ -426,12 +516,11 @@ asio::awaitable<bool> FileManager::preallocate_files() {
             PieceStatus status = is_needed ? PieceStatus::Needed : PieceStatus::Skipped;
             state_->piece_status(piece_idx, status);
         }
+        co_return true;
     } catch (const std::exception& e) {
         LOGCRITICAL("Failed to preallocate files: {}", e.what());
         co_return false;
     }
-
-    co_return true;
 }
 
 asio::awaitable<int> FileManager::async_prompt(const std::string& question) {
@@ -472,4 +561,34 @@ asio::awaitable<int> FileManager::async_prompt(const std::string& question) {
             throw std::runtime_error("Input timeout");
         // }
     }
+}
+
+asio::awaitable<std::map<std::string, int64_t>> FileManager::async_get_file_mtimes() {
+    const auto& files_to_check = state_->torrent_info().files; 
+    auto [ec, mtimes_map] = co_await asio::async_initiate<void(std::error_code, std::map<std::string, int64_t>)>(
+        [this, files_to_check](auto&& completion_handler) {
+            file_io_pool_.enqueue(
+                [this, files_to_check, h = std::move(completion_handler)]() mutable {
+                    std::map<std::string, int64_t> mtimes;
+                    for (const auto& file_info : files_to_check) {
+                        auto full_path = get_full_path_for_file(file_info);
+                        try {
+                            if (std::filesystem::exists(full_path)) {
+                                mtimes[full_path.string()] = std::filesystem::last_write_time(full_path).time_since_epoch().count();
+                            }
+                        } catch (const std::exception& e) {
+                            LOGWARN("Could not get mtime for {}: {}", full_path.string(), e.what());
+                            // Decide how to handle this error. For now, log and skip.
+                        }
+                    }
+                    std::move(h)(boost::system::error_code{}, std::move(mtimes));
+                }
+            );
+        },
+        asio::as_tuple(asio::use_awaitable)
+    );
+    if (ec) {
+        throw boost::system::system_error(ec, "async_get_file_mtimes");
+    }
+    co_return mtimes_map;
 }
