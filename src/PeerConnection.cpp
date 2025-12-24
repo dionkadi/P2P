@@ -28,14 +28,17 @@ PeerConnection::create(
         std::move(state), std::move(events)
     );
 
+    LOGDBG("PeerConnection object created for {}. About to call perform_handshake.", conn->peer_addr());
     bool success = co_await conn->perform_handshake(my_id);
     if (!success) {
+        LOGERR("Failed to handshake for peer {}", conn->peer_addr());
         co_return nullptr;
     }
 
-    co_await conn->send_simple_message(MessageType::Unchoke);
-    conn->am_choking(false);
+    LOGINFO("Handshake successful with peer ID: {} (for address {})", conn->peer_id(), conn->peer_addr());
+
     conn->start_loops();
+    LOGDBG("Message and keep-alive loops started for {}", conn->peer_id());
 
     co_return conn;
 }
@@ -51,6 +54,7 @@ PeerConnection::PeerConnection(
 {}
 
 asio::awaitable<bool> PeerConnection::perform_handshake(const PeerId& my_id) {
+    LOGDBG("Entered perform_handshake for peer {}", peer_addr_);
     try {
         LOGDBG("Starting handshake with peer {}", peer_addr_);
         Handshake my_handshake {
@@ -58,26 +62,30 @@ asio::awaitable<bool> PeerConnection::perform_handshake(const PeerId& my_id) {
             .peer_id_bytes = my_id,
             .extended = true
         };
+        LOGDBG("Sending handshake message ({} bytes) to {}", HANDSHAKE_BASE_LEN, peer_addr_);
         co_await socket_.send_raw(my_handshake.serialize());
-
+        LOGDBG("Handshake message sent to {}. Awaiting peer's handshake.", peer_addr_);
         std::vector<std::byte> handshake_buffer = co_await socket_.receive_raw(HANDSHAKE_BASE_LEN);
+        LOGDBG("Received handshake message ({} bytes) from {}. Deserializing.", HANDSHAKE_BASE_LEN, peer_addr_);
         Handshake peer_handshake = Handshake::deserialize(handshake_buffer);
+        LOGDBG("Deserialized handshake from {}. Checking info hash.", peer_addr_);
 
         if (peer_handshake.info_hash_bytes != state_->info_hash()) {
+            LOGERR("Info hash mismatch with {}. Expected {}, got {}.",
+                   peer_addr_, Crypto::bytes_to_hex(state_->info_hash()), Crypto::bytes_to_hex(peer_handshake.info_hash_bytes));
             throw std::runtime_error("Info hash mismatch");
         }
 
         peer_id_ = peer_handshake.peer_id_bytes;
         
         if (peer_id_ == my_id) {
-            LOGWARN("Connected to self. Dropping connection.");
-            co_return nullptr;
+            LOGWARN("Connected to self ({}:{}). Dropping connection.", peer_addr_, Crypto::bytes_to_hex(my_id));
+            co_return false;
         }
         
-        LOGINFO("Handshake successful with peer ID: {}", peer_id_);
-
+        LOGDBG("Peer {} handshake successful. Peer ID: {}. Checking for extended handshake support.", peer_addr_, peer_id_);
         if (peer_handshake.extended) {
-            LOGINFO("Peer {} supports extended plugins", peer_id_);
+            LOGINFO("Peer {} supports extended plugins. Sending extended handshake.", peer_id_);
 
             std::vector<std::byte> message;
             message.push_back(static_cast<std::byte>(MessageType::ExtendedMessage));
@@ -94,12 +102,15 @@ asio::awaitable<bool> PeerConnection::perform_handshake(const PeerId& my_id) {
             message.insert(message.end(), encoded_payload.begin(), encoded_payload.end());
             
             co_await socket_.send_message(message);
+            LOGDBG("Extended handshake sent to {}", peer_id_);
         }
 
         co_return true;
     } catch (const boost::system::system_error& e) {
-        if (e.code() != asio::error::eof && e.code() != asio::error::connection_reset) {
+        if (e.code() != asio::error::eof && e.code() != asio::error::connection_reset && e.code() != asio::error::operation_aborted) {
             LOGERR("Network error with {}: {}", peer_addr_, e.what());
+        } else {
+            LOGDBG("Connection to {} closed gracefully during handshake: {}", peer_addr_, e.what());
         }
     } catch (const std::exception& e) {
         LOGERR("Exception with {}: {}", peer_addr_, e.what());
@@ -108,13 +119,25 @@ asio::awaitable<bool> PeerConnection::perform_handshake(const PeerId& my_id) {
 }
 
 void PeerConnection::start_loops() {
-    asio::co_spawn(io_context_, message_loop(), asio::detached);
-    asio::co_spawn(io_context_, keep_alive_loop(), asio::detached);
+    auto self = shared_from_this();
+    asio::co_spawn(
+        io_context_, 
+        [self] () -> asio::awaitable<void> {
+            co_await self->message_loop();
+        }, 
+        asio::detached
+    );
+    asio::co_spawn(
+        io_context_, 
+        [self] () -> asio::awaitable<void> {
+            co_await self->keep_alive_loop();
+        }, 
+        asio::detached
+    );
 }
 
 asio::awaitable<void> PeerConnection::message_loop() {
     auto self = shared_from_this();
-
     try {
         while (true) {
             std::vector<std::byte> msg = co_await socket_.receive_message();
@@ -133,11 +156,11 @@ asio::awaitable<void> PeerConnection::message_loop() {
                 case MessageType::Choke:
                     // LOGDBG("Received CHOKE from {}", conn->peer_id);
                     peer_is_choking_ = true;
-                    co_await events_->on_choke_status_changed(shared_from_this(), true);
+                    co_await events_->on_choke_status_changed(self, true);
                     break;
                 case MessageType::Unchoke: {
                     peer_is_choking_ = false;
-                    co_await events_->on_choke_status_changed(shared_from_this(), false);
+                    co_await events_->on_choke_status_changed(self, false);
                     break;
                 }
                 case MessageType::Interested:
@@ -149,7 +172,7 @@ asio::awaitable<void> PeerConnection::message_loop() {
                     peer_is_interested_ = false;
                     break;
                 case MessageType::Bitfield: {
-                    co_await events_->on_peer_bitfield(shared_from_this(), payload);
+                    co_await events_->on_peer_bitfield(self, payload);
                     break;
                 }
                 case MessageType::Have: {
@@ -158,7 +181,7 @@ asio::awaitable<void> PeerConnection::message_loop() {
                     }
                     BufferReader reader(payload);
                     uint32_t index = asio::detail::socket_ops::network_to_host_long(reader.read<uint32_t>());
-                    co_await events_->on_peer_has_piece(shared_from_this(), index);
+                    co_await events_->on_peer_has_piece(self, index);
                     break;
                 }
                 case MessageType::Piece: {
@@ -168,8 +191,14 @@ asio::awaitable<void> PeerConnection::message_loop() {
                     BufferReader piece_reader(payload);
                     uint32_t piece_index = asio::detail::socket_ops::network_to_host_long(piece_reader.read<uint32_t>());
                     uint32_t piece_begin = asio::detail::socket_ops::network_to_host_long(piece_reader.read<uint32_t>());
-                    std::span<const std::byte> block_data = payload.subspan(8);
-                    co_await events_->on_piece_block(shared_from_this(), piece_index, piece_begin, block_data);
+                    uint32_t block_length = asio::detail::socket_ops::network_to_host_long(piece_reader.read<uint32_t>());
+                    std::span<const std::byte> block_data = piece_reader.read_all();                 
+                    if (block_data.size() != block_length) {
+                        LOGERR("Received Piece message block data size mismatch. Expected {}, got {} for piece {} offset {}.",
+                               block_length, block_data.size(), piece_index, piece_begin);
+                        break;
+                    }
+                    co_await events_->on_piece_block(self, piece_index, piece_begin, block_data);
                     break;
                 }
                 case MessageType::Cancel: {
@@ -179,7 +208,7 @@ asio::awaitable<void> PeerConnection::message_loop() {
                 }
                 case MessageType::ExtendedMessage: {
                     // LOGDBG("Received ExtendedMessage from {}", conn->peer_id);
-                    co_await events_->on_extended_message(shared_from_this(), payload);
+                    co_await events_->on_extended_message(self, payload);
                     break;
                 }
                 case MessageType::Request: {
@@ -187,7 +216,7 @@ asio::awaitable<void> PeerConnection::message_loop() {
                         break;
                     }
                     RequestPayload req = RequestPayload::deserialize(payload);
-                    co_await events_->on_block_request(shared_from_this(), req.index, req.begin, req.length);
+                    co_await events_->on_block_request(self, req.index, req.begin, req.length);
                     break;
                 }
                 default:
@@ -198,17 +227,24 @@ asio::awaitable<void> PeerConnection::message_loop() {
         LOGINFO("Connection to {} lost or closed: {}", peer_id_, e.what());
     }
 
-    co_await events_->on_disconnect(shared_from_this());
+    co_await events_->on_disconnect(self);
+    co_return ;
 }
 
 asio::awaitable<void> PeerConnection::keep_alive_loop() {
+    auto self = shared_from_this();
     asio::steady_timer timer(io_context_);
 
     while (true) {
         timer.expires_after(std::chrono::minutes(2));
         auto [ec] = co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
+        if (ec == asio::error::operation_aborted) {
+            LOGDBG("Keep-alive timer for {} aborted. Exiting loop.", peer_id_);
+            co_return;
+        }
         if (ec) {
-            co_return ;
+            LOGWARN("Keep-alive timer for {} failed: {}", peer_id_, ec.message());
+            break;
         }
 
         // check if has active connections to *this?
@@ -218,20 +254,26 @@ asio::awaitable<void> PeerConnection::keep_alive_loop() {
         } catch (const boost::system::system_error& e) { // Be more specific
             if (e.code() == asio::error::eof ||
                 e.code() == asio::error::connection_reset ||
-                e.code() == asio::error::broken_pipe)
+                e.code() == asio::error::broken_pipe ||
+                e.code() == asio::error::operation_aborted)
             {
                 LOGDBG("Failed to send keep-alive to peer {}, it has disconnected.", peer_id_);
             } else {
                 LOGWARN("Failed to send keep-alive to peer {}, closing connection: {}", peer_id_, e.what());
             }
-            socket_.close();
-            co_return;
-        } catch (...) { // Fallback
-            LOGWARN("Failed to send keep-alive to peer {}, closing connection.", peer_id_);
-            socket_.close();
-            co_return;
+            break;
+        } catch (const std::exception& e) { // Catch other standard exceptions
+            LOGWARN("Failed to send keep-alive to peer {}, closing connection (exception: {}).", peer_id_, e.what());
+            break;
+        } catch (...) { // Fallback for any other exception
+            LOGWARN("Failed to send keep-alive to peer {}, closing connection (unknown exception).", peer_id_);
+            break;
         }
     }
+
+    socket_.close();
+    co_await events_->on_disconnect(self);
+    co_return ;
 }
 
 void PeerConnection::set_has_piece(size_t index) {
@@ -259,7 +301,6 @@ asio::awaitable<void> PeerConnection::send_simple_message(MessageType type) {
 
 asio::awaitable<void> PeerConnection::send_request(size_t index, uint32_t begin, uint32_t length) {
     std::vector<std::byte> msg_body(1, static_cast<std::byte>(MessageType::Request));
-    msg_body.push_back(static_cast<std::byte>(MessageType::Request));
     auto payload = RequestPayload::serialize(index, begin, length);
     msg_body.insert(msg_body.end(), payload.begin(), payload.end());
 
