@@ -3,10 +3,13 @@
 #include "TorrentSession.hpp"
 
 #include <boost/asio/awaitable.hpp>
+#include <boost/asio/co_spawn.hpp>
+#include <boost/asio/detached.hpp>
 #include <csignal>
 #include <exception>
 #include <filesystem>
 #include <iostream>
+#include <memory>
 #include <random>
 #include <string>
 
@@ -100,11 +103,15 @@ int main(int argc, char* argv[]) {
  
     try {
         asio::io_context io_context;
-
+        std::shared_ptr<TorrentSession> session_ptr{nullptr};
         asio::signal_set signals(io_context, SIGINT, SIGTERM);
-        signals.async_wait([&io_context](auto, auto) {
+        signals.async_wait([&io_context, session_ptr] (auto, auto) {
             LOGINFO("Signal received, initiating shutdown...");
-            io_context.stop();
+            if (session_ptr) {
+                asio::co_spawn(io_context, session_ptr->stop(), asio::detached);
+            } else {
+                io_context.stop();
+            }
         });
 
         PeerId my_peer_id = generate_peer_id();
@@ -137,11 +144,15 @@ int main(int argc, char* argv[]) {
             
             LOGINFO("Seeding from torrent '{}', content in '{}'. Listening on port {}", file_path.string(), content_dir.string(), peer_port);
 
+            session_ptr = std::make_shared<TorrentSession>(io_context, my_peer_id, file_path, content_dir, peer_port, Mode::Seed);
+            if (!session_ptr) {
+                LOGERR("Failed to create seeder");
+                return 1;
+            }
             asio::co_spawn(io_context, 
-                [&io_context, peer_id = std::move(my_peer_id), file_path, content_dir, peer_port]() -> asio::awaitable<void> {
+                [session_ptr] () -> asio::awaitable<void> {
                     try {
-                        auto seeder = TorrentSession(io_context, peer_id, file_path, content_dir, peer_port, Mode::Seed);
-                        co_await seeder.run();
+                        co_await session_ptr->run();
                     } catch (const std::exception& e) {
                         LOGCRITICAL("Seed coroutine threw an exception: {}", e.what());
                     }
@@ -154,19 +165,23 @@ int main(int argc, char* argv[]) {
             std::filesystem::path save_path = argv[3];
             int peer_port = std::stoi(argv[4]);
 
+            session_ptr = std::make_shared<TorrentSession>(io_context, my_peer_id, torrent_path, save_path, peer_port, Mode::Leech);
+            if (!session_ptr) {
+                LOGERR("Failed to create leecher");
+                return 1;
+            }
             asio::co_spawn(io_context, 
-                [&io_context, my_peer_id, torrent_path, save_path, peer_port]() mutable -> asio::awaitable<void> 
+                [&io_context, session_ptr]() mutable -> asio::awaitable<void> 
                 {
                     try {
-                        auto leecher = TorrentSession(io_context, my_peer_id, torrent_path, save_path, peer_port, Mode::Leech);
-                        co_await leecher.run();
+                        co_await session_ptr->run();
                     } catch (const std::exception& ex) {
                         LOGCRITICAL("Download coroutine threw an exception: {}", ex.what());
                     }
                     
                     if (!io_context.stopped()) {
                         LOGINFO("Download finished, stopping application.");
-                        io_context.stop();
+                        co_await session_ptr->stop();
                     }
                 },
                 asio::detached
