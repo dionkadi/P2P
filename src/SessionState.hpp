@@ -31,7 +31,7 @@ public:
     TorrentInfo& torrent_info() { return meta_info_.get_torrent_info(); }
     const std::vector<std::byte>& info_hash() const { return meta_info_.get_info_hash(); }
     const std::vector<PieceStatus>& piece_status() const { return piece_status_; }
-    std::vector<PieceStatus>& piece_status() { return piece_status_; }
+    // std::vector<PieceStatus>& piece_status() { return piece_status_; }
     PieceStatus piece_status(size_t piece_index) const { return piece_status_[piece_index]; }
     const std::vector<std::vector<std::string>>& tracker_tiers() const { return tracker_tiers_; }
     uint64_t total_bytes_downloaded() const { return total_bytes_downloaded_.load(); }
@@ -42,15 +42,21 @@ public:
     bool is_in_endgame_mode() const { return is_in_endgame_mode_.load(); }
     const std::filesystem::path& save_path() const { return data_file_path_; }
 
-    void piece_status(size_t piece_index, PieceStatus status) { piece_status_[piece_index] = status; }
+    void piece_status(size_t piece_index, PieceStatus status) { 
+        std::lock_guard lock(m_);
+        piece_status_[piece_index] = status; 
+    }
     void add_total_bytes_downloaded(uint64_t val) { total_bytes_downloaded_ += val; }
     void add_total_bytes_uploaded(uint64_t val) { total_bytes_uploaded_ += val; }
-    void completed_pieces(size_t val) { completed_pieces_ = val; }
+    void completed_pieces(size_t val) { completed_pieces_.store(val); }
     void add_completed_pieces(size_t val) { completed_pieces_ += val; }
     void is_download_complete(bool val) { is_download_complete_.store(val); }
     void is_in_endgame_mode(bool val) { is_in_endgame_mode_.store(val); }
 
-    std::string progress() const { return std::format("{:.2f}% ({}/{})", (static_cast<float>(completed_pieces_) / num_pieces_) * 100.0f, completed_pieces_.load(), num_pieces_); }
+    std::string progress() const {
+        auto completed = completed_pieces_.load();
+        return std::format("{:.2f}% ({}/{})", (static_cast<float>(completed) / num_pieces_) * 100.0f, completed, num_pieces_); 
+    }
 
     std::string get_have_bitfield_str() const {
         std::lock_guard lock(m_);
