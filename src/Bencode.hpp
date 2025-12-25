@@ -20,22 +20,22 @@ class Value {
 public:
     using BencodeVariant = std::variant<Integer, String, std::unique_ptr<List>, std::unique_ptr<Dict>>;
 
-    Value() = default;
+    Value() noexcept = default;
     Value(const Value& other);
     Value& operator=(const Value& other);
 
-    Value(Value&& other) = default;
-    Value& operator=(Value&& other) = default;
+    Value(Value&& other) noexcept = default;
+    Value& operator=(Value&& other) noexcept = default;
 
-    Value(Integer i);
-    Value(const String& s);
-    Value(String&& s);
-    Value(const List& l);
-    Value(List&& l);
-    Value(const Dict& d);
-    Value(Dict&& d);
+    Value(Integer i) noexcept : data_(i) {}
+    Value(const String& s) noexcept : data_(s) {}
+    Value(String&& s) noexcept : data_(std::move(s)) {}
+    Value(const List& l) : data_(std::make_unique<List>(l)) {}
+    Value(List&& l) noexcept : data_(std::make_unique<List>(std::move(l))) {}
+    Value(const Dict& d) : data_(std::make_unique<Dict>(d)) {}
+    Value(Dict&& d) noexcept : data_(std::make_unique<Dict>(std::move(d))) {}
 
-    const BencodeVariant& get_variant() const { return data_; }
+    const BencodeVariant& get_variant() const noexcept { return data_; }
 
 private:
     BencodeVariant data_;

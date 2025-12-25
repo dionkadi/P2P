@@ -11,10 +11,10 @@
 
 class PeerManager{
 public:
-    PeerManager(asio::io_context& io_context, std::shared_ptr<SessionState> state);
+    PeerManager(asio::io_context& io_context, std::shared_ptr<SessionState> state) noexcept;
 
-    std::map<PeerId, std::shared_ptr<PeerConnection>>& active_connections() { return active_connections_; }
-    const std::map<PeerId, std::shared_ptr<PeerConnection>>& active_connections() const { return active_connections_; }
+    std::map<PeerId, std::shared_ptr<PeerConnection>>& active_connections() noexcept { return active_connections_; }
+    const std::map<PeerId, std::shared_ptr<PeerConnection>>& active_connections() const noexcept { return active_connections_; }
     std::shared_ptr<PeerConnection> connection(const PeerId& peer_id) { return active_connections_.at(peer_id); }
 
     asio::awaitable<std::optional<AsyncSocket>> connect_to_peer(const std::string& peer_addr);

@@ -20,7 +20,7 @@ public:
     
 private:
     std::mutex global_mutex_;
-    std::map<std::filesystem::path, std::mutex> file_locks_;
+    std::map<std::string, std::mutex> file_locks_;
 };
 
 class FileManager {
@@ -28,7 +28,7 @@ public:
     explicit FileManager(std::shared_ptr<SessionState> state);
 
     asio::awaitable<std::vector<std::byte>> read_block(size_t piece_index, uint32_t begin, uint32_t length);
-    asio::awaitable<void> write_piece(size_t piece_index, const std::vector<std::byte>& piece_data);
+    asio::awaitable<void> write_piece(size_t piece_index, std::span<const std::byte> piece_data);
 
     asio::awaitable<bool> verify_piece(size_t piece_index);
     asio::awaitable<void> verify_pieces();
@@ -41,7 +41,8 @@ public:
     std::filesystem::path get_full_path_for_file(const FileInfo& file_info) const;
     std::filesystem::path get_resume_file_path() const;
 
-    const std::vector<size_t>& file_to_pieces_map(size_t file_idx) const { return file_to_pieces_map_[file_idx]; }
+    const std::vector<size_t>& file_to_pieces_map(size_t file_idx) const noexcept { return file_to_pieces_map_[file_idx]; }
+    const std::vector<PieceFileOverlap>& piece_to_files_map(size_t piece_idx) const noexcept { return piece_to_files_map_[piece_idx]; }
     asio::awaitable<std::map<std::string, int64_t>> async_get_file_mtimes();
 
 private:

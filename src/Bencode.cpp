@@ -51,14 +51,6 @@ Value& Value::operator=(const Value& other) {
     return *this;
 }
 
-Value::Value(Integer i) : data_(i) {}
-Value::Value(const String& s) : data_(s) {}
-Value::Value(String&& s) : data_(std::move(s)) {}
-Value::Value(const List& l) : data_(std::make_unique<List>(l)) {}
-Value::Value(List&& l) : data_(std::make_unique<List>(std::move(l))) {}
-Value::Value(const Dict& d) : data_(std::make_unique<Dict>(d)) {}
-Value::Value(Dict&& d) : data_(std::make_unique<Dict>(std::move(d))) {}
-
 Value decode_value(std::span<const std::byte>& data);
 
 String decode_string(std::span<const std::byte>& data) {

@@ -3,10 +3,11 @@
 #include <cstddef>
 #include <optional>
 #include <random>
+#include <ranges>
 #include "Logger.hpp"
 #include "PeerConnection.hpp"
 
-PeerManager::PeerManager(asio::io_context& io_context, std::shared_ptr<SessionState> state)
+PeerManager::PeerManager(asio::io_context& io_context, std::shared_ptr<SessionState> state) noexcept
     : io_context_(io_context), state_(state) 
 {}
 
@@ -53,11 +54,14 @@ asio::awaitable<void> PeerManager::choke_loop() {
         ++choke_loop_counter_;
 
         std::vector<std::shared_ptr<PeerConnection>> interested_peers;
-        for (auto const& [id, conn] : active_connections_) {
-            if (conn->peer_is_interested()) {
-                interested_peers.push_back(conn);
-            }
-        }
+        std::ranges::copy(
+            active_connections_
+                | std::views::values // Get a view of shared_ptr<PeerConnection>
+                | std::views::filter([](const std::shared_ptr<PeerConnection>& conn) {
+                    return conn->peer_is_interested();
+                }),
+            std::back_inserter(interested_peers)
+        );
 
         std::sort(interested_peers.begin(), interested_peers.end(), 
             [] (const auto& a, const auto& b) {
@@ -80,13 +84,11 @@ asio::awaitable<void> PeerManager::choke_loop() {
 
         if (choke_loop_counter_ % 3 == 0) {
             if (optimistically_unchoked_peer && optimistically_unchoked_peer->am_choking() == false) {
-                bool is_top_peer = false;
-                for (const auto& top_peer : unchoked_this_round) {
-                    if (top_peer->peer_id() == optimistically_unchoked_peer->peer_id()) {
-                        is_top_peer = true;
-                        break ;
-                    }
-                }
+                bool is_top_peer = std::ranges::any_of(unchoked_this_round, 
+                                                       [&optimistically_unchoked_peer](const std::shared_ptr<PeerConnection>& top_peer) {
+                                                           return top_peer->peer_id() == optimistically_unchoked_peer->peer_id();
+                                                       });
+
                 if (!is_top_peer) {
                     LOGINFO("Re-choking previous optimistic peer {}", optimistically_unchoked_peer->peer_id());
                     co_await optimistically_unchoked_peer->send_simple_message(MessageType::Choke);
@@ -95,11 +97,13 @@ asio::awaitable<void> PeerManager::choke_loop() {
             }
 
             std::vector<std::shared_ptr<PeerConnection>> candidates;
-            for (const auto& peer: interested_peers) {
-                if (peer->am_choking()) {
-                    candidates.push_back(peer);
-                }
-            }
+            std::ranges::copy(
+                interested_peers
+                    | std::views::filter([](const std::shared_ptr<PeerConnection>& peer) {
+                        return peer->am_choking();
+                    }),
+                std::back_inserter(candidates)
+            );
 
             if (!candidates.empty()) {
                 std::uniform_int_distribution<size_t> dist(0, candidates.size() - 1);
@@ -117,13 +121,11 @@ asio::awaitable<void> PeerManager::choke_loop() {
         }
 
         for (const auto& peer : interested_peers) {
-            bool should_be_unchoked = false;
-            for (const auto& unchoked_peer : unchoked_this_round) {
-                if (unchoked_peer->peer_id() == peer->peer_id()) {
-                    should_be_unchoked = true;
-                    break ;
-                }
-            }
+            bool should_be_unchoked = std::ranges::any_of(unchoked_this_round, 
+                                                         [&peer](const std::shared_ptr<PeerConnection>& unchoked_peer) {
+                                                             return unchoked_peer->peer_id() == peer->peer_id();
+                                                         });
+
             if (!should_be_unchoked && !peer->am_choking()) {
                 LOGDBG("Choking slow/non-optimistic peer {}", peer->peer_id());
                 co_await peer->send_simple_message(MessageType::Choke);
@@ -145,20 +147,24 @@ asio::awaitable<void> PeerManager::send_have_message_to_all(size_t piece_index) 
 
 std::vector<std::shared_ptr<PeerConnection>> PeerManager::available_peers(size_t piece_index) {
     std::vector<std::shared_ptr<PeerConnection>> available_peers;
-    for (const auto& [id, conn] : active_connections_) {
-        if (!conn->peer_is_choking() && conn->has_piece(piece_index)) {
-            available_peers.push_back(conn);
-
-            if (!conn->am_interested()) {
-                conn->am_interested(true);
-                // Send INTERESTED message asynchronously
-                asio::co_spawn(io_context_, 
-                    [conn]() -> asio::awaitable<void> {
-                        co_await conn->send_simple_message(MessageType::Interested);
-                    }, 
-                    asio::detached
-                );
-            }
+    std::ranges::copy(
+        active_connections_
+            | std::views::values
+            | std::views::filter([&](const std::shared_ptr<PeerConnection>& conn) {
+                return !conn->peer_is_choking() && conn->has_piece(piece_index);
+            }),
+        std::back_inserter(available_peers)
+    );
+    
+    for (const auto& conn : available_peers) {
+        if (!conn->am_interested()) {
+            conn->am_interested(true);
+            asio::co_spawn(io_context_, 
+                [conn]() -> asio::awaitable<void> {
+                    co_await conn->send_simple_message(MessageType::Interested);
+                }, 
+                asio::detached
+            );
         }
     }
     return available_peers;

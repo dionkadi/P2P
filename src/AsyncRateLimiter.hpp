@@ -4,10 +4,15 @@
 #include <boost/asio.hpp>
 #include <deque>
 
+#include "Logger.hpp"
+
 namespace asio = boost::asio;
 
+template<typename TokenCountType = uint64_t>
 class AsyncRateLimiter {
 public:
+    static constexpr std::chrono::milliseconds refill_interval = std::chrono::milliseconds(100);
+
     AsyncRateLimiter(asio::io_context& io_context, uint64_t rate_bps, uint64_t capacity_factor = 2)
         : strand_(asio::make_strand(io_context)),
           timer_(strand_), // Bind the timer to the strand
@@ -49,19 +54,27 @@ public:
 
 private:
     void refill_tokens() {
-        timer_.expires_after(std::chrono::milliseconds(100));
+        timer_.expires_after(refill_interval);
         timer_.async_wait([this](const boost::system::error_code& ec) {
-            if (ec) return; // Timer was cancelled
+            if (ec == boost::asio::error::operation_aborted) {
+                return;
+            }
+            if (ec) {
+                LOGERR("Error when refilling tokens: {}", ec.message());
+                return;
+            }
 
-            uint64_t refill_amount = (rate_bytes_per_second_ * 100) / 1000;
+            TokenCountType refill_amount = static_cast<TokenCountType>(
+                (static_cast<long double>(rate_bytes_per_second_) * refill_interval.count()) / 1000.0
+            );
             tokens_ = std::min(tokens_ + refill_amount, capacity_);
 
             // Resume any waiters that can now be satisfied
-            while (!waiters_.empty() && tokens_ >= waiters_.front().first) {
+            while (!waiters_.empty() && tokens_ >= static_cast<TokenCountType>(waiters_.front().first)) {
                 auto [amount, handler] = std::move(waiters_.front());
                 waiters_.pop_front();
                 
-                tokens_ -= amount;
+                tokens_ -= static_cast<TokenCountType>(amount);
                 
                 // The handler is already bound to the correct executor, so we can just post it.
                 asio::post(strand_, [h = std::move(handler)]() mutable {
@@ -75,9 +88,9 @@ private:
 
     asio::strand<asio::io_context::executor_type> strand_;
     asio::steady_timer timer_;
-    const uint64_t rate_bytes_per_second_;
-    const uint64_t capacity_;
-    uint64_t tokens_;
+    const TokenCountType rate_bytes_per_second_;
+    const TokenCountType capacity_;
+    TokenCountType tokens_;
 
     // The queue stores {amount_needed, completion_handler}
     using Waiter = std::pair<size_t, asio::any_completion_handler<void(boost::system::error_code)>>;

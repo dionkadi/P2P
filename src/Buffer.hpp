@@ -10,7 +10,8 @@ concept POD = std::is_standard_layout_v<T> && std::is_trivial_v<T>;
 
 class BufferWriter {
 public:
-    explicit BufferWriter(std::vector<std::byte>& buffer): buffer_(buffer) {}
+    explicit BufferWriter(std::vector<std::byte>& buffer) noexcept
+        : buffer_(buffer) {}
 
     template<POD T>
     void write(const T& value) {
@@ -32,7 +33,8 @@ private:
 
 class BufferReader {
 public:
-    explicit BufferReader(std::span<const std::byte> buffer): view_(buffer) {}
+    explicit BufferReader(std::span<const std::byte> buffer) noexcept
+        : view_(buffer) {}
 
     template<POD T>
     T read() {
@@ -60,7 +62,8 @@ public:
         return read_bytes(remaining());
     }
 
-    size_t remaining() const { return view_.size(); }
+    size_t remaining() const noexcept { return view_.size(); }
+    bool empty() const noexcept { return view_.empty(); }
 
 private:
     std::span<const std::byte> view_;

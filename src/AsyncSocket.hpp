@@ -2,15 +2,20 @@
 
 #include "Logger.hpp"
 #include <cstddef>
+#include <cstdint>
 #include <string_view>
 #include <vector>
+#include <span>
 #include <boost/asio.hpp>
 
 namespace asio = boost::asio;
 
+static constexpr uint32_t MAX_MESSAGE_SIZE = 10 * 1024 * 1024;
+
 class AsyncSocket {
     public:
-    explicit AsyncSocket(asio::ip::tcp::socket socket): socket_(std::move(socket)) {}
+    explicit AsyncSocket(asio::ip::tcp::socket socket) noexcept
+        : socket_(std::move(socket)) {}
 
     asio::awaitable<void> connect(std::string_view host, int port) {
         asio::ip::tcp::resolver resolver(socket_.get_executor());
@@ -19,7 +24,7 @@ class AsyncSocket {
         LOGINFO("Successfully connected to {}:{}", host, port);
     }
 
-    asio::awaitable<void> send_raw(const std::vector<std::byte>& data) {
+    asio::awaitable<void> send_raw(std::span<const std::byte> data) {
         co_await asio::async_write(socket_, asio::buffer(data), asio::use_awaitable);
     }
 
@@ -29,7 +34,7 @@ class AsyncSocket {
         co_return buffer;
     }
 
-    asio::awaitable<void> send_message(std::vector<std::byte> message) {
+    asio::awaitable<void> send_message(std::span<const std::byte> message) {
         // keep-alive message
         if (message.empty()) {
             uint32_t zero_len = 0; // Already in host order, will be converted by buffer.
@@ -37,16 +42,11 @@ class AsyncSocket {
             co_return;
         }
 
-        auto shared_message = std::make_shared<std::vector<std::byte>>(std::move(message));
-        auto shared_length = std::make_shared<uint32_t>(
-            asio::detail::socket_ops::host_to_network_long(
-                static_cast<uint32_t>(shared_message->size())
-            )
-        );
+        uint32_t length = asio::detail::socket_ops::host_to_network_long(static_cast<uint32_t>(message.size()));
 
         std::array<asio::const_buffer, 2> buffer_sequence = {
-            asio::buffer(shared_length.get(), sizeof(uint32_t)),
-            asio::buffer(*shared_message)
+            asio::buffer(&length, sizeof(uint32_t)),
+            asio::buffer(message)
         };
         co_await asio::async_write(socket_, buffer_sequence, asio::use_awaitable);
     }
@@ -55,7 +55,7 @@ class AsyncSocket {
         uint32_t net_length;
         co_await asio::async_read(socket_, asio::buffer(&net_length, sizeof(net_length)), asio::use_awaitable);
         uint32_t length = asio::detail::socket_ops::network_to_host_long(net_length);
-        if (length > 10 * 1024 * 1024) {
+        if (length > MAX_MESSAGE_SIZE) {
             throw std::runtime_error("Message size limit exceeded: " + std::to_string(length));
         }
         if (length == 0) {
@@ -68,12 +68,19 @@ class AsyncSocket {
         co_return buffer;
     }
 
-    const asio::ip::tcp::socket& get_socket() const { return socket_; }
+    const asio::ip::tcp::socket& get_socket() const noexcept { return socket_; }
 
-    void close() {
+    void close() noexcept {
+        boost::system::error_code ec;
         if(socket_.is_open()) {
-            socket_.shutdown(asio::ip::tcp::socket::shutdown_both);
-            socket_.close();
+            socket_.shutdown(asio::ip::tcp::socket::shutdown_both, ec);
+            if (ec && ec != asio::error::not_connected) { // Ignore 'not_connected' during shutdown
+                LOGWARN("Socket shutdown error: {}", ec.message());
+            }
+            socket_.close(ec);
+            if (ec) {
+                LOGWARN("Socket close error: {}", ec.message());
+            }
         }
     }
 

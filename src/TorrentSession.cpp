@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <exception>
 #include <random>
+#include <ranges>
 
 TorrentSession::TorrentSession(
     asio::io_context& io_context, 
@@ -29,14 +30,19 @@ TorrentSession::TorrentSession(
     completion_timer_(io_context) 
 {
     for (const auto& tier : state_->tracker_tiers()) {
-        std::vector<std::shared_ptr<ITrackerClient>> client_tier;
-        for (const auto& url : tier) {
-            try {
-                client_tier.push_back(create_tracker_client(io_context, url));
-            } catch (const std::exception& e) {
-                LOGWARN("Failed to create tracker client for URL '{}': {}", url, e.what());
-            }
-        }
+        auto client_tier_view = tier
+                                | std::views::transform([&](const std::string& url) -> std::shared_ptr<ITrackerClient> {
+                                    try {
+                                        return create_tracker_client(io_context, url);
+                                    } catch (const std::exception& e) {
+                                        LOGWARN("Failed to create tracker client for URL '{}': {}", url, e.what());
+                                        return nullptr; // Return nullptr on failure
+                                    }
+                                })
+                                | std::views::filter([](const std::shared_ptr<ITrackerClient>& client) {
+                                    return client != nullptr; // Filter out failed clients
+                                });
+        std::vector<std::shared_ptr<ITrackerClient>> client_tier(client_tier_view.begin(), client_tier_view.end());
         if (!client_tier.empty()) {
             tracker_clients_by_tier_.push_back(std::move(client_tier));
         }
@@ -55,9 +61,8 @@ asio::awaitable<bool> TorrentSession::init() {
         if (!success) {
             co_return false;
         }
-        for (size_t i = 0; i < state_->num_pieces(); ++i) {
-            state_->piece_status(i, PieceStatus::Have);
-        }
+        std::ranges::for_each(std::views::iota(0UL, state_->num_pieces()), 
+                              [this](size_t i) { state_->piece_status(i, PieceStatus::Have); });
         state_->completed_pieces(state_->num_pieces());
         state_->is_download_complete(true);
     } else {
@@ -189,7 +194,11 @@ asio::awaitable<void> TorrentSession::handle_new_connection(AsyncSocket socket, 
 
     co_await asio::dispatch(strand_, asio::use_awaitable);
     auto& active_connections = peer_manager_->active_connections();
-    if (active_connections.count(conn->peer_id())) {
+    if (std::ranges::any_of(active_connections | std::views::values, 
+                            [&conn](const std::shared_ptr<PeerConnection>& existing_conn) {
+                                return existing_conn->peer_id() == conn->peer_id();
+                            }))
+    {
         if (my_peer_id_ < conn->peer_id()) {
             LOGWARN("Duplicate connection to {}. Dropping this one.", conn->peer_id());
             co_return;
@@ -202,11 +211,11 @@ asio::awaitable<void> TorrentSession::handle_new_connection(AsyncSocket socket, 
     active_connections[conn->peer_id()] = conn;
 
     std::vector<uint8_t> bitfield((state_->num_pieces() + 7) / 8, 0);
-    for (size_t i = 0; i < state_->num_pieces(); ++i) {
-        if (state_->piece_status(i) == PieceStatus::Have) {
-            bitfield[i / 8] |= (1 << (7 - (i % 8)));
-        }
-    }
+    std::ranges::for_each(std::views::iota(0UL, state_->num_pieces())
+                            | std::views::filter([this](size_t i) { return state_->piece_status(i) == PieceStatus::Have; }),
+                            [&](size_t i) {
+                                bitfield[i / 8] |= (1 << (7 - (i % 8)));
+                            });
     co_await conn->send_bitfield(bitfield);
 
     LOGDBG("PeerConnection created and handshake finished for {}", conn->peer_addr());
@@ -253,15 +262,12 @@ asio::awaitable<void> TorrentSession::tracker_announce_loop() {
                     announce_successful = true;
                     
                     for (const auto& peer_addr : result.peers) {
-                        bool already_connnected = false;
                         co_await asio::dispatch(strand_, asio::use_awaitable);
-                        for (const auto& [id, conn] : peer_manager_->active_connections()) {
-                            if (conn->peer_addr() == peer_addr) {
-                                already_connnected = true;
-                                break;
-                            }
-                        }
-                        if (!already_connnected) {
+                        bool already_connected = std::ranges::any_of(peer_manager_->active_connections() | std::views::values, 
+                                                                     [&](const std::shared_ptr<PeerConnection>& conn) {
+                                                                         return conn->peer_addr() == peer_addr;
+                                                                     });
+                        if (!already_connected) {
                             asio::co_spawn(io_context_, 
                                 [peer_addr, this] () -> asio::awaitable<void> {
                                     auto socket = co_await peer_manager_->connect_to_peer(peer_addr);
@@ -478,15 +484,11 @@ asio::awaitable<void> TorrentSession::on_peer_bitfield(std::shared_ptr<PeerConne
 asio::awaitable<void> TorrentSession::on_choke_status_changed(std::shared_ptr<PeerConnection> conn, bool is_choking) {
     if (!is_choking) {
         if (!conn->am_interested()) {
-            bool has_needed_pieces = false;
-            for (size_t i = 0; i < state_->num_pieces(); ++i) {
-                if ((state_->piece_status(i) == PieceStatus::Needed || state_->piece_status(i) == PieceStatus::InProgress) &&
-                    conn->has_piece(i)) 
-                {
-                    has_needed_pieces = true;
-                    break;
-                }
-            }
+            bool has_needed_pieces = std::ranges::any_of(std::views::iota(0UL, state_->num_pieces()), 
+                                                         [&conn, this](size_t i) {
+                                                             return (state_->piece_status(i) == PieceStatus::Needed || state_->piece_status(i) == PieceStatus::InProgress) &&
+                                                                    conn->has_piece(i);
+                                                         });
             
             if (has_needed_pieces) {
                 conn->am_interested(true);
@@ -738,13 +740,8 @@ asio::awaitable<void> TorrentSession::load_session_state(const ResumeData& data)
 
         co_await asio::dispatch(strand_, asio::use_awaitable);
         // Check if we should be in endgame mode (all pieces are either Have or InProgress)
-        bool all_pieces_accounted_for = true;
-        for (size_t i = 0; i < state_->piece_status().size(); ++i) {
-            if (state_->piece_status(i) == PieceStatus::Needed) {
-                all_pieces_accounted_for = false;
-                break;
-            }
-        }
+        bool all_pieces_accounted_for = !std::ranges::any_of(state_->piece_status(), 
+                                                              [](PieceStatus status) { return status == PieceStatus::Needed; });
 
         if (all_pieces_accounted_for && !piece_manager_->in_progress_pieces().empty()) {
             LOGINFO("Resuming in ENDGAME MODE");
@@ -778,10 +775,9 @@ asio::awaitable<void> TorrentSession::load_session_state(const ResumeData& data)
     }
 }
 
-void TorrentSession::reset() {
-    for (size_t i = 0; i < state_->num_pieces(); ++i) {
-        state_->piece_status(i, PieceStatus::Needed);
-    }
+void TorrentSession::reset() noexcept {
+    std::ranges::for_each(std::views::iota(0UL, state_->num_pieces()), 
+                          [this](size_t i) { state_->piece_status(i, PieceStatus::Needed); });
     state_->completed_pieces(0);
     piece_manager_->in_progress_pieces().clear();
 }
@@ -814,12 +810,12 @@ asio::awaitable<void> TorrentSession::send_cancel_for_block(uint32_t piece_index
                     ? (current_piece_size - offset)
                     : BLOCK_SIZE;
     
-    for (const auto& peer_id : peer_ids_to_cancel) {
-        if (peer_id != exclude_peer_id) {
-            auto conn_it = active_connections.find(peer_id);
-            if (conn_it != active_connections.end()) {
-                co_await conn_it->second->send_cancel(piece_index, offset, length);
-            }
-        }
-    }
+    std::ranges::for_each(peer_ids_to_cancel 
+                            | std::views::filter([&](const PeerId& peer_id) { return peer_id != exclude_peer_id; }),
+                            [&](const PeerId& peer_id) -> asio::awaitable<void> {
+                                auto conn_it = active_connections.find(peer_id);
+                                if (conn_it != active_connections.end()) {
+                                    co_await conn_it->second->send_cancel(piece_index, offset, length);
+                                }
+                            });
 }

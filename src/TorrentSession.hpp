@@ -54,7 +54,7 @@ private:
 
     asio::awaitable<void> send_cancel_for_block(uint32_t piece_index, uint32_t block_index, const PeerId& exclude_peer_id);
 
-    void reset();
+    void reset() noexcept;
 
     asio::io_context& io_context_;
     asio::strand<asio::any_io_executor> strand_;
@@ -67,8 +67,8 @@ private:
     std::unique_ptr<PieceManager> piece_manager_;
     std::unique_ptr<PeerManager> peer_manager_;
     std::unique_ptr<FileManager> file_manager_;
-    AsyncRateLimiter upload_limiter_;
-    AsyncRateLimiter download_limiter_;
+    AsyncRateLimiter<> upload_limiter_;
+    AsyncRateLimiter<> download_limiter_;
     std::atomic<bool> shutting_down_{false};
     asio::steady_timer completion_timer_;
 };

@@ -5,14 +5,16 @@
 #include "Bencode.hpp"
 #include "Types.hpp"
 
+#include <ranges>
+
 class MetaInfo {
 public:
     bool load_from_file(const std::string& file_path, std::vector<std::vector<std::string>>& out_tracker_tiers);
     static bool create_from_file(const std::filesystem::path& source_path, const std::filesystem::path& torrent_path, const std::vector<std::string>& tracker_urls, uint32_t piece_size = 262144);
     
-    const std::vector<std::byte>& get_info_hash() const { return info_hash_bytes_; }
-    const TorrentInfo& get_torrent_info() const { return info_; }
-    TorrentInfo& get_torrent_info() { return info_; }
+    const std::vector<std::byte>& get_info_hash() const noexcept { return info_hash_bytes_; }
+    const TorrentInfo& get_torrent_info() const noexcept { return info_; }
+    TorrentInfo& get_torrent_info() noexcept { return info_; }
 
 private:
     TorrentInfo info_;
@@ -57,10 +59,11 @@ inline bool MetaInfo::load_from_file(const std::string& file_path, std::vector<s
             const List& announce_list = *std::get<std::unique_ptr<List>>(metainfo_dict.at("announce-list").get_variant());
             for (const auto& tier_val : announce_list) {
                 const List& tier_list = *std::get<std::unique_ptr<List>>(tier_val.get_variant());
-                std::vector<std::string> current_tier;
-                for (const auto& url_val : tier_list) {
-                    current_tier.push_back(std::get<String>(url_val.get_variant()));
-                }
+                auto current_tier_view = tier_list
+                                            | std::views::transform([](const Value& url_val) {
+                                                return std::get<String>(url_val.get_variant());
+                                            });
+                std::vector<std::string> current_tier(current_tier_view.begin(), current_tier_view.end());
                 if (!current_tier.empty()) {
                     out_tracker_tiers.push_back(std::move(current_tier));
                 }
@@ -108,8 +111,8 @@ inline bool MetaInfo::load_from_file(const std::string& file_path, std::vector<s
                 const List* path_list = std::get_if<std::unique_ptr<List>>(&file_dict->at("path").get_variant())->get();
 
                 std::filesystem::path file_path;
-                for (const auto& part_val : *path_list) {
-                    file_path /= std::get<String>(part_val.get_variant());
+                for (const std::string& part : *path_list | std::views::transform([](const Value& part_val){ return std::get<String>(part_val.get_variant()); })) {
+                    file_path /= part;
                 }
 
                 info_.files.push_back({file_path, length, true});
@@ -151,9 +154,8 @@ inline bool MetaInfo::create_from_file(const std::filesystem::path& source_path,
 
         for (const auto& file_info : temp_info.files) {
             List path_list;
-            for (const auto& part : file_info.path) {
-                path_list.push_back(Value(part.string()));
-            }
+            std::ranges::transform(file_info.path, std::back_inserter(path_list),
+                                   [](const std::filesystem::path& p) { return Value(p.string()); });
             file_list.push_back(Value(Dict{
                 {"length", Value(static_cast<Integer>(file_info.size))},
                 {"path", Value(path_list)}

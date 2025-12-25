@@ -19,7 +19,7 @@ namespace asio = boost::asio;
 
 class Tracker {
 public:
-    Tracker(): strand_(asio::make_strand(io_context_)) {}
+    Tracker() noexcept : strand_(asio::make_strand(io_context_)) {}
 
     Tracker(const Tracker&) = delete;
     Tracker& operator= (const Tracker&) = delete;
@@ -60,7 +60,7 @@ public:
         LOGINFO("Tracker stopped");
     }
 
-    asio::io_context& get_io_context() { return io_context_; }
+    asio::io_context& get_io_context() noexcept { return io_context_; }
 
 private:
     asio::awaitable<void> udp_listen_loop(int port);

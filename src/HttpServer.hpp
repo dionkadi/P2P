@@ -22,6 +22,8 @@ using HttpRequest = http::request<http::string_body>;
 using HttpResponse = http::response<http::string_body>;
 using HttpHandler = std::function<asio::awaitable<HttpResponse>(HttpRequest)>;
 
+static constexpr std::chrono::seconds HTTP_SESSION_TIMEOUT = std::chrono::seconds(30);
+
 class HttpRouter {
 public:
     void add_route(std::string_view path, HttpHandler handler) {
@@ -52,7 +54,7 @@ inline asio::awaitable<void> http_session(tcp::socket socket, std::shared_ptr<Ht
     beast::error_code ec;
     beast::tcp_stream stream(std::move(socket));
     beast::flat_buffer buffer;
-    stream.expires_after(std::chrono::seconds(30));
+    stream.expires_after(HTTP_SESSION_TIMEOUT);
     try {
         while (true) {
             HttpRequest req;
@@ -69,7 +71,7 @@ inline asio::awaitable<void> http_session(tcp::socket socket, std::shared_ptr<Ht
                 break;
             }
 
-            stream.expires_after(std::chrono::seconds(30));
+            stream.expires_after(HTTP_SESSION_TIMEOUT);
         }
     } catch (const boost::system::system_error& e) {
         if (e.code() == http::error::end_of_stream || 
@@ -85,6 +87,9 @@ inline asio::awaitable<void> http_session(tcp::socket socket, std::shared_ptr<Ht
     }
 
     ec = stream.socket().shutdown(tcp::socket::shutdown_send, ec);
+    if (ec && ec != asio::error::not_connected) { // Ignore 'not_connected' during shutdown
+        LOGWARN("HTTP Session socket shutdown error: {}", ec.message()); // String formatting
+    }
 }
 
 inline asio::awaitable<void> http_listener(asio::io_context& ioc, tcp::endpoint endpoint, std::shared_ptr<HttpRouter> router) {

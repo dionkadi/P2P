@@ -3,6 +3,7 @@
 #include "Protocol.hpp"
 
 #include <boost/asio/awaitable.hpp>
+#include <cstdint>
 #include <exception>
 #include <memory>
 
@@ -46,7 +47,7 @@ PeerConnection::create(
 PeerConnection::PeerConnection(
     asio::io_context& io_context, AsyncSocket socket, std::string peer_addr,
     std::shared_ptr<SessionState> state, std::shared_ptr<IPeerConnectionEvents> events
-) : io_context_(io_context),
+) noexcept : io_context_(io_context),
     socket_(std::move(socket)),
     peer_addr_(std::move(peer_addr)),
     state_(std::move(state)),
@@ -176,7 +177,7 @@ asio::awaitable<void> PeerConnection::message_loop() {
                     break;
                 }
                 case MessageType::Have: {
-                    if (payload.size() < 4) {
+                    if (payload.size() < sizeof(uint32_t)) {
                         break;
                     }
                     BufferReader reader(payload);
@@ -276,14 +277,15 @@ asio::awaitable<void> PeerConnection::keep_alive_loop() {
     co_return ;
 }
 
-void PeerConnection::set_has_piece(size_t index) {
+void PeerConnection::set_has_piece(size_t index) noexcept {
     if (bitfield_.empty() || index / 8 >= bitfield_.size()) {
+        LOGWARN("Attempted to set piece {} out of bitfield bounds (size: {}) for peer {}", index, bitfield_.size(), peer_id_);
         return ;
     }
     bitfield_[index / 8] |= (1 << (7 - (index % 8)));
 }
 
-bool PeerConnection::has_piece(size_t index) const {
+bool PeerConnection::has_piece(size_t index) const noexcept {
     if (bitfield_.empty() || index / 8 >= bitfield_.size()) {
         return false;
     }

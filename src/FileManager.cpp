@@ -68,13 +68,13 @@ asio::awaitable<std::vector<std::byte>> FileManager::read_block(size_t piece_ind
     co_return block_data;
 }
 
-asio::awaitable<void> FileManager::write_piece(size_t piece_index, const std::vector<std::byte>& piece_data) {
+asio::awaitable<void> FileManager::write_piece(size_t piece_index, std::span<const std::byte> piece_data) {
     const auto& overlaps = piece_to_files_map_.at(piece_index);
     for (const auto& overlap : overlaps) {
         const auto& file_info = state_->torrent_info().files.at(overlap.file_index);
         if (file_info.download) {
             auto full_path = get_full_path_for_file(file_info);
-            std::span<const std::byte> data_to_write(piece_data.data() + overlap.offset_in_piece, overlap.length);
+            auto data_to_write = piece_data.subspan(overlap.offset_in_piece, overlap.length);
             co_await async_write_to_file(full_path, overlap.offset_in_file, data_to_write);
         }
     }
@@ -295,9 +295,11 @@ asio::awaitable<bool> FileManager::verify_piece(size_t piece_index) {
 asio::awaitable<void> FileManager::verify_pieces() {
     const size_t num_pieces = state_->num_pieces();
 
-    for (size_t i = 0; i < num_pieces; ++i) {
-        if (state_->piece_status(i) != PieceStatus::Have) continue;
-
+    for (size_t i : std::views::iota(0UL, num_pieces) 
+                       | std::views::filter([&](size_t idx) { 
+                            return state_->piece_status(idx) == PieceStatus::Have; 
+                        })
+    )  {
         if (!co_await verify_piece(i)) {
             LOGCRITICAL("Hash mismatch for piece {} during verification. Marking as Needed.", i);
             state_->piece_status(i, PieceStatus::Needed);
@@ -351,7 +353,7 @@ asio::awaitable<bool> FileManager::verify_seed_data() {
         co_return false;
     }
 
-    for (size_t i = 0; i < num_pieces; ++i) {
+    for (size_t i : std::views::iota(0UL, num_pieces)) {
         if (!co_await verify_piece(i)) {
             LOGCRITICAL("Hash mismatch for piece {}! File is corrupt. Aborting.", i);
             co_return false;
@@ -505,14 +507,11 @@ asio::awaitable<bool> FileManager::preallocate_files() {
             }
         }
 
-        for (size_t piece_idx = 0; piece_idx < num_pieces; ++piece_idx) {
-            bool is_needed = false;
-            for (const auto& overlap : piece_to_files_map_[piece_idx]) {
-                if (state_->torrent_info().files[overlap.file_index].download) {
-                    is_needed = true;
-                    break;
-                }
-            }
+        for (size_t piece_idx : std::views::iota(0UL, num_pieces)) {
+            bool is_needed = std::ranges::any_of(piece_to_files_map_[piece_idx], 
+                                                 [this](const auto& overlap) {
+                                                     return state_->torrent_info().files[overlap.file_index].download;
+                                                 });
             PieceStatus status = is_needed ? PieceStatus::Needed : PieceStatus::Skipped;
             state_->piece_status(piece_idx, status);
         }

@@ -20,18 +20,18 @@ inline std::string calculate_file_hash(const std::string& file_path) {
     }
 
     picosha2::hash256_one_by_one hasher;
-    std::vector<char> buffer(4096);
+    std::vector<std::byte> buffer(4096);
 
     while (file) {
-        file.read(buffer.data(), buffer.size());
+        file.read(reinterpret_cast<char*>(buffer.data()), buffer.size());
         std::streamsize bytes_read = file.gcount();
         if (bytes_read > 0) {
-            hasher.process(buffer.begin(), buffer.begin() + bytes_read);
+            hasher.process(reinterpret_cast<const unsigned char*>(buffer.data()), 
+                            reinterpret_cast<const unsigned char*>(buffer.data()) + bytes_read);
         }
     }
 
     hasher.finish();
-
     return picosha2::get_hash_hex_string(hasher);
 }
 
@@ -53,12 +53,14 @@ inline std::vector<std::byte> hex_to_bytes(const std::string &hex) {
     std::vector<std::byte> bytes;
     bytes.reserve(hex.length() / 2);
     for (size_t i = 0; i < hex.length(); i += 2) {
-        try {
-            std::string byteString = hex.substr(i, 2);
-            bytes.push_back(static_cast<std::byte>(std::stoi(byteString, nullptr, 16)));
-        } catch (const std::exception&) {
-            throw std::invalid_argument("Invalid hex character sequence");
+        std::string_view byte_string_view(hex.data() + i, 2);
+        int value;
+        auto [ptr, ec] = std::from_chars(byte_string_view.data(), byte_string_view.data() + byte_string_view.size(), value, 16);
+        
+        if (ec != std::errc() || ptr != byte_string_view.data() + byte_string_view.size()) {
+            throw std::invalid_argument("Invalid hex character sequence.");
         }
+        bytes.push_back(static_cast<std::byte>(value));
     }
     return bytes;
 }
@@ -67,7 +69,7 @@ inline std::string bytes_to_hex(std::span<const std::byte> data) {
     std::stringstream ss;
     ss << std::hex << std::setfill('0');
     for (const auto& byte : data) {
-        ss << std::setw(2) << static_cast<unsigned>(byte);
+        ss << std::setw(2) << static_cast<unsigned int>(byte);
     }
     return ss.str();
 }
@@ -85,10 +87,10 @@ inline std::vector<std::byte> calculate_sha1_hash_file(const std::string& file_p
     }
     
     SHA1 checksum;
-    std::array<std::byte, 4096> buffer;
+    std::array<char, 4096> buffer;
     while (file) {
-        file.read(reinterpret_cast<char*>(buffer.data()), buffer.size());
-        checksum.update(std::string(reinterpret_cast<const char*>(buffer.data()), file.gcount()));
+        file.read(buffer.data(), buffer.size());
+        checksum.update(std::string(buffer.data(), file.gcount()));
     }
  
     return hex_to_bytes(checksum.final());

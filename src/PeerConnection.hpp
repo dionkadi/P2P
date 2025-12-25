@@ -29,34 +29,34 @@ public:
         std::shared_ptr<IPeerConnectionEvents> events
     );
 
-    bool has_piece(size_t index) const;
-    void set_has_piece(size_t index);
+    bool has_piece(size_t index) const noexcept;
+    void set_has_piece(size_t index) noexcept;
 
-    bool am_choking() const { return am_choking_; }
-    bool peer_is_choking() const { return peer_is_choking_; };
-    bool am_interested() const { return am_interested_; }
-    bool peer_is_interested() const { return peer_is_interested_; }
-    size_t bitfield_size() const { return bitfield_.size(); }
-    uint64_t bytes_downloaded() const { return bytes_downloaded_.load(); } 
-    uint64_t bytes_uploaded() const { return bytes_uploaded_.load(); }
-    const PeerId& peer_id() const { return peer_id_; }
-    const std::string& peer_addr() const { return peer_addr_; }
+    bool am_choking() const noexcept { return am_choking_; }
+    bool peer_is_choking() const noexcept { return peer_is_choking_; };
+    bool am_interested() const noexcept { return am_interested_; }
+    bool peer_is_interested() const noexcept { return peer_is_interested_; }
+    size_t bitfield_size() const noexcept { return bitfield_.size(); }
+    uint64_t bytes_downloaded() const noexcept { return bytes_downloaded_.load(std::memory_order_relaxed); } 
+    uint64_t bytes_uploaded() const noexcept { return bytes_uploaded_.load(std::memory_order_relaxed); }
+    const PeerId& peer_id() const noexcept { return peer_id_; }
+    const std::string& peer_addr() const noexcept { return peer_addr_; }
     ExtendedMessageType extension_type(uint8_t index) const { return remote_extension_map_.at(index); }
 
-    void am_choking(bool val) { am_choking_ = val; }
-    void peer_is_choking(bool val) { peer_is_choking_ = val; }
-    void am_interested(bool val) { am_interested_ = val; }
-    void peer_is_interested(bool val) { peer_is_interested_ = val; }
-    void bytes_downloaded(uint64_t val) { bytes_downloaded_.store(val); } 
-    void bytes_uploaded(uint64_t val) { bytes_uploaded_.store(val); }
-    void add_bytes_downloaded(uint64_t val) { bytes_downloaded_ += val; } 
-    void add_bytes_uploaded(uint64_t val) { bytes_uploaded_ += val; }
+    void am_choking(bool val) noexcept { am_choking_ = val; }
+    void peer_is_choking(bool val) noexcept { peer_is_choking_ = val; }
+    void am_interested(bool val) noexcept { am_interested_ = val; }
+    void peer_is_interested(bool val) noexcept { peer_is_interested_ = val; }
+    void bytes_downloaded(uint64_t val) noexcept { bytes_downloaded_.store(val, std::memory_order_relaxed); } 
+    void bytes_uploaded(uint64_t val) noexcept { bytes_uploaded_.store(val, std::memory_order_relaxed); }
+    void add_bytes_downloaded(uint64_t val) noexcept { bytes_downloaded_.fetch_add(val, std::memory_order_relaxed); } 
+    void add_bytes_uploaded(uint64_t val) noexcept { bytes_uploaded_.fetch_add(val, std::memory_order_relaxed); }
     void update_extension_type(uint8_t index, ExtendedMessageType type) { remote_extension_map_[index] = type; }
 
     template<typename T>
-    void bitfield(T&& other) { bitfield_ = std::forward<T>(other); } 
+    void bitfield(T&& other) noexcept { bitfield_ = std::forward<T>(other); } 
 
-    void close() { socket_.close(); }
+    void close() noexcept { socket_.close(); }
     
     asio::awaitable<void> send_simple_message(MessageType type);
     asio::awaitable<void> send_request(size_t index, uint32_t begin, uint32_t length);
@@ -69,7 +69,7 @@ private:
     PeerConnection(
         asio::io_context& io_context, AsyncSocket socket, std::string peer_addr, 
         std::shared_ptr<SessionState> state, std::shared_ptr<IPeerConnectionEvents> events
-    );
+    ) noexcept;
 
     asio::awaitable<bool> perform_handshake(const PeerId& my_peer_id);
     asio::awaitable<void> message_loop();

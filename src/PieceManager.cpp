@@ -4,8 +4,9 @@
 #include <boost/asio/use_awaitable.hpp>
 #include <cstddef>
 #include <random>
+#include <ranges>
 
-PieceManager::PieceManager(asio::io_context& io_context, std::shared_ptr<SessionState> state)
+PieceManager::PieceManager(asio::io_context& io_context, std::shared_ptr<SessionState> state) noexcept
     : io_context_(io_context), strand_(asio::make_strand(io_context)),
       piece_request_trigger_(io_context), state_(state) 
 {
@@ -13,9 +14,9 @@ PieceManager::PieceManager(asio::io_context& io_context, std::shared_ptr<Session
     piece_availability_.resize(num_pieces, 0);
 
     std::unordered_set<int> zero_rarity_pieces;
-    for (size_t i = 0; i < num_pieces; ++i) {
-        zero_rarity_pieces.insert(static_cast<int>(i));
-    }
+    std::ranges::for_each(std::views::iota(0UL, num_pieces), 
+                          [&](size_t i){ zero_rarity_pieces.insert(static_cast<int>(i)); });
+    
     if (!zero_rarity_pieces.empty()) {
         pieces_by_rarity_[0] = std::move(zero_rarity_pieces);
     }
@@ -43,14 +44,12 @@ asio::awaitable<void> PieceManager::downloader() {
 
     while (!state_->is_download_complete()) {
         int slots_to_fill = 0;
-        int needed_pieces_count = 0;
 
         co_await asio::dispatch(strand_, asio::use_awaitable);
-        for (const auto& status : state_->piece_status()) {
-            if (status == PieceStatus::Needed) {
-                needed_pieces_count++;
-            }
-        }
+        int needed_pieces_count = std::ranges::count_if(state_->piece_status(), 
+                                                        [](PieceStatus status) { 
+                                                            return status == PieceStatus::Needed; 
+                                                        });
 
         int current_in_progress = in_progress_pieces_.size();
         if (current_in_progress < max_in_progress_pieces) {
@@ -77,24 +76,6 @@ asio::awaitable<void> PieceManager::downloader() {
 
 asio::awaitable<void> PieceManager::request_one_piece() {
     co_await asio::dispatch(strand_, asio::use_awaitable);
-
-    // LOGDBG("Rarity map state:");
-    // for (const auto& [rarity, piece_set] : pieces_by_rarity_) {
-    //     LOGDBG("  Rarity {}: {} pieces", rarity, piece_set.size());
-    // }
-
-    // LOGDBG("Active connections: {}", active_connections_.size());
-    // for (const auto& [id, conn] : active_connections_) {
-    //     LOGDBG("  Peer {}: choking={}, interested={}, has_bitfield={}", 
-    //            conn->peer_id, conn->peer_is_choking, conn->peer_is_interested, 
-    //            !conn->bitfield.empty());
-    // }
-
-    // int needed_count = 0;
-    // for (const auto& status : piece_status_) {
-    //     if (status == PieceStatus::Needed) needed_count++;
-    // }
-    // LOGDBG("Total needed pieces: {}", needed_count);
     
     for (const auto& [rarity, piece_set] : pieces_by_rarity_) {
         if (rarity == 0) continue;  // We only care about pieces that are actually available (rarity > 0)
@@ -118,11 +99,13 @@ asio::awaitable<void> PieceManager::request_one_piece() {
 
     std::vector<size_t> all_needed_pieces;
     const auto& piece_status = state_->piece_status();
-    for (size_t i = 0; i < piece_status.size(); ++i) {
-        if (piece_status[i] == PieceStatus::Needed) {
-            all_needed_pieces.push_back(i);
-        }
-    }
+    std::ranges::copy(
+        std::views::iota(0UL, piece_status.size()) 
+            | std::views::filter([&piece_status](size_t i) {
+                return piece_status[i] == PieceStatus::Needed;
+            }),
+        std::back_inserter(all_needed_pieces)
+    );
     
     if (!all_needed_pieces.empty()) {
         std::shuffle(
@@ -149,20 +132,14 @@ asio::awaitable<bool> PieceManager::try_piece_download(size_t piece_index) {
     // Find an unchoked peer that has this piece
     const auto& active_connections = get_connections_();
     std::vector<std::shared_ptr<PeerConnection>> available_peers;
-    for (const auto& [id, conn] : active_connections) {
-        if (!conn->peer_is_choking() && conn->has_piece(piece_index)) {
-            available_peers.push_back(conn);
-        }
-        // if (!conn->peer_is_choking) {
-        //     if (conn->has_piece(piece_index)) {
-        //         available_peers.push_back(conn);
-        //     } else {
-        //         LOGDBG("Peer {} is unchoked but doesn't have piece {}", conn->peer_id, piece_index);
-        //     }
-        // } else {
-        //     LOGDBG("Peer {} is choking us", conn->peer_id);
-        // }
-    }
+    std::ranges::copy(
+        active_connections
+            | std::views::values
+            | std::views::filter([&](const std::shared_ptr<PeerConnection>& conn) {
+                return !conn->peer_is_choking() && conn->has_piece(piece_index);
+            }),
+        std::back_inserter(available_peers)
+    );
     
     if (available_peers.empty()) {
         // LOGDBG("No available peers for piece {}. Total connections: {}", piece_index, active_connections_.size());
@@ -214,10 +191,10 @@ asio::awaitable<void> PieceManager::check_and_enter_endgame() {
         co_return ;
     }
 
-    size_t needed_count = 0;
-    for (const auto& status : state_->piece_status()) {
-        if (status == PieceStatus::Needed || status == PieceStatus::InProgress) needed_count++;
-    }
+    size_t needed_count = std::ranges::count_if(state_->piece_status(), 
+                                                [](PieceStatus status) {
+                                                    return status == PieceStatus::Needed || status == PieceStatus::InProgress;
+                                                });
 
     if (needed_count > 0 && needed_count < state_->num_pieces() * 0.1) {
         LOGINFO("🎉 All pieces requested. Entering ENDGAME MODE. 🎉");
@@ -250,11 +227,18 @@ asio::awaitable<void> PieceManager::broadcast_outstanding_requests() {
                                 : BLOCK_SIZE;
                 
                 const auto& active_connections = get_connections_();
-                for (const auto& [peer_id, conn] : active_connections) {
-                    if (!conn->peer_is_choking() && conn->has_piece(piece_idx)) {
-                        co_await conn->send_request(piece_idx, offset, length);
-                        piece_progress.outstanding_requests[block_idx].push_back(conn->peer_id());
-                    }
+                std::vector<std::shared_ptr<PeerConnection>> unchoked_peers_with_piece;
+                std::ranges::copy(
+                    active_connections
+                        | std::views::values
+                        | std::views::filter([&](const std::shared_ptr<PeerConnection>& conn) {
+                            return !conn->peer_is_choking() && conn->has_piece(piece_idx);
+                        }),
+                    std::back_inserter(unchoked_peers_with_piece)
+                );
+                for (const auto& peer_conn : unchoked_peers_with_piece) {
+                    co_await peer_conn->send_request(piece_idx, offset, length);
+                    piece_progress.outstanding_requests[block_idx].push_back(peer_conn->peer_id());
                 }
             }
         }
@@ -298,19 +282,21 @@ asio::awaitable<void> PieceManager::remove_piece_rarity(size_t piece_index, uint
 }
 
 asio::awaitable<void> PieceManager::build_piece_rarity() {
+    const auto& piece_status = state_->piece_status();
     co_await asio::dispatch(strand_, asio::use_awaitable);
     pieces_by_rarity_.clear();
-    for (size_t i = 0; i < state_->num_pieces(); ++i) {
-        if (state_->piece_status(i) == PieceStatus::Needed) {
-            // For needed pieces, use their current availability
-            // If we don't know the availability yet, assume 0 (will be updated when we receive peer bitfields)
-            uint32_t rarity = piece_availability_[i];
-            pieces_by_rarity_[rarity].insert(i);
-        } else if (state_->piece_status(i) == PieceStatus::Have) {
-            // Have pieces go to rarity 0 (we have them)
-            pieces_by_rarity_[0].insert(i);
-        }
-    }
+    std::ranges::for_each(std::views::iota(0UL, state_->num_pieces())
+                            | std::views::filter([&piece_status](size_t idx) { return piece_status[idx] == PieceStatus::Needed; }),
+                            [&](size_t i) {
+                                uint32_t rarity = piece_availability_[i];
+                                pieces_by_rarity_[rarity].insert(static_cast<int>(i));
+                            });
+
+    std::ranges::for_each(std::views::iota(0UL, state_->num_pieces())
+                            | std::views::filter([&piece_status](size_t idx) { return piece_status[idx] == PieceStatus::Have; }),
+                            [&](size_t i) {
+                                pieces_by_rarity_[0].insert(static_cast<int>(i));
+                            });
 }
 
 asio::awaitable<void> PieceManager::resume_piece_download(size_t piece_index) {
@@ -334,22 +320,15 @@ asio::awaitable<void> PieceManager::resume_piece_download(size_t piece_index) {
         // Find peers that have this piece and are not choking us
         const auto& active_connections = get_connections_();
         std::vector<std::shared_ptr<PeerConnection>> available_peers;
-        for (const auto& [id, conn] : active_connections) {
-            if (!conn->peer_is_choking() && conn->has_piece(piece_index)) {
-                available_peers.push_back(conn);
+        std::ranges::copy(
+            active_connections
+                | std::views::values
+                | std::views::filter([&](const std::shared_ptr<PeerConnection>& conn) {
+                    return !conn->peer_is_choking() && conn->has_piece(piece_index);
+                }),
+            std::back_inserter(available_peers)
+        );
 
-                if (!conn->am_interested()) {
-                    conn->am_interested(true);
-                    // Send INTERESTED message asynchronously
-                    asio::co_spawn(io_context_, 
-                        [conn]() -> asio::awaitable<void> {
-                            co_await conn->send_simple_message(MessageType::Interested);
-                        }, 
-                        asio::detached
-                    );
-                }
-            }
-        }
         if (available_peers.empty()) {
             LOGDBG("Resumer for piece {}: No available peers yet, will retry...", piece_index);
             continue; // Go back to the start of the loop and wait again
@@ -367,16 +346,22 @@ asio::awaitable<void> PieceManager::resume_piece_download(size_t piece_index) {
                         : BLOCK_SIZE;
                     
                     // Request from all available peers for this block
-                    for (const auto& peer_conn : available_peers) {
-                        if (!peer_conn->peer_is_choking()) {
-                            asio::co_spawn(io_context_,
-                                [peer_conn, piece_index, offset, length]() -> asio::awaitable<void> {
-                                    co_await peer_conn->send_request(piece_index, offset, length);
-                                },
-                                asio::detached
-                            );
-                            piece_progress.outstanding_requests[block_idx].push_back(peer_conn->peer_id());
-                        }
+                    std::vector<std::shared_ptr<PeerConnection>> unchoked_peers;
+                    std::ranges::copy(
+                        available_peers
+                            | std::views::filter([](const std::shared_ptr<PeerConnection>& peer_conn){ 
+                                return !peer_conn->peer_is_choking(); 
+                            }),
+                        std::back_inserter(unchoked_peers)
+                    );
+                    for (const auto& peer_conn : unchoked_peers) {
+                        asio::co_spawn(io_context_,
+                            [peer_conn, piece_index, offset, length]() -> asio::awaitable<void> {
+                                co_await peer_conn->send_request(piece_index, offset, length);
+                            },
+                            asio::detached
+                        );
+                        piece_progress.outstanding_requests[block_idx].push_back(peer_conn->peer_id());
                     }
                 }
             }

@@ -19,19 +19,18 @@ class PieceManager {
 public:
     using GetActiveConnectionsCallback = std::function<const std::map<PeerId, std::shared_ptr<PeerConnection>>&()>;
 
-    PieceManager(asio::io_context& io_context, std::shared_ptr<SessionState> state);
+    PieceManager(asio::io_context& io_context, std::shared_ptr<SessionState> state) noexcept;
 
-    const std::map<size_t, InProgressPiece>& in_progress_pieces() const { return in_progress_pieces_; }
-    std::map<size_t, InProgressPiece>& in_progress_pieces() { return in_progress_pieces_; }
+    const std::map<size_t, InProgressPiece>& in_progress_pieces() const noexcept { return in_progress_pieces_; }
+    std::map<size_t, InProgressPiece>& in_progress_pieces() noexcept { return in_progress_pieces_; }
     const InProgressPiece& in_progress_piece(size_t piece_index) const { return in_progress_pieces_.at(piece_index); }
     InProgressPiece& in_progress_piece(size_t piece_index) { return in_progress_pieces_.at(piece_index); }
-    const std::vector<size_t>& piece_availability() const { return piece_availability_; }
-    std::vector<size_t>& piece_availability() { return piece_availability_; }
-    size_t piece_availability(size_t piece_index) const { return piece_availability_[piece_index]; }
-    const std::map<size_t, std::unordered_set<int>>& pieces_by_rarity() const { return pieces_by_rarity_; };
-    std::map<size_t, std::unordered_set<int>>& pieces_by_rarity() { return pieces_by_rarity_; };
-
-    void add_piece_availability(size_t piece_index, int32_t val) { piece_availability_[piece_index] += val; }
+    const std::vector<size_t>& piece_availability() const noexcept { return piece_availability_; }
+    std::vector<size_t>& piece_availability() noexcept { return piece_availability_; }
+    size_t piece_availability(size_t piece_index) const noexcept { return piece_availability_[piece_index]; }
+    const std::map<size_t, std::unordered_set<int>>& pieces_by_rarity() const noexcept { return pieces_by_rarity_; };
+    std::map<size_t, std::unordered_set<int>>& pieces_by_rarity() noexcept { return pieces_by_rarity_; };
+    void add_piece_availability(size_t piece_index, int32_t val) noexcept { piece_availability_[piece_index] += val; }
 
     asio::awaitable<void> update_piece_rarity(size_t piece_index, uint32_t old_rarity, uint32_t new_rarity);
     asio::awaitable<void> remove_piece_rarity(size_t piece_index, uint32_t rarity);
@@ -50,7 +49,7 @@ public:
 
     asio::awaitable<std::map<std::string, std::string>> get_in_progress_for_resume() const;
 
-    void notify_one() { piece_request_trigger_.cancel_one(); }
+    void notify_one() noexcept { piece_request_trigger_.cancel_one(); }
 
     void set_callback(GetActiveConnectionsCallback cb) { get_connections_ = std::move(cb); }
 

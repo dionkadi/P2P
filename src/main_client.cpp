@@ -6,6 +6,7 @@
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/detached.hpp>
 #include <csignal>
+#include <cstddef>
 #include <exception>
 #include <filesystem>
 #include <iostream>
@@ -13,23 +14,23 @@
 #include <random>
 #include <string>
 
-PeerId generate_peer_id() {
-    const std::string prefix = "-MI0001-"; // 8 bytes
-    static constexpr char alphanum[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+static constexpr std::string_view PEER_ID_PREFIX = "-MI0001-"; // 8 bytes
+static constexpr std::string_view ALPHANUM = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
+PeerId generate_peer_id() {
     static std::mt19937 rng = []{
         std::random_device rd;
         return std::mt19937(rd());
     }();
 
-    std::uniform_int_distribution<int> distrib(0, sizeof(alphanum) - 2);
+    std::uniform_int_distribution<size_t> distrib(0, ALPHANUM.size() - 1);
 
     PeerId peer_id{};
-    std::transform(prefix.begin(), prefix.end(), peer_id.begin(), 
+    std::transform(PEER_ID_PREFIX.begin(), PEER_ID_PREFIX.end(), peer_id.begin(), 
         [](char c) { return static_cast<std::byte>(c); });
     // Fill the remaining 12 bytes with random characters
-    for (size_t i = 0; i < 12; ++i) {
-        peer_id[prefix.size() + i] = static_cast<std::byte>(alphanum[distrib(rng)]);
+    for (size_t i = PEER_ID_PREFIX.size(); i < peer_id.size(); ++i) {
+        peer_id[i] = static_cast<std::byte>(ALPHANUM[distrib(rng)]);
     }
     return peer_id;
 }
