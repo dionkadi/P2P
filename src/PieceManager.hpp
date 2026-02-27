@@ -1,13 +1,17 @@
 #pragma once
 
 #include <boost/asio/awaitable.hpp>
+#include <boost/asio/dispatch.hpp>
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/strand.hpp>
+#include <boost/asio/use_awaitable.hpp>
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <unordered_set>
 #include <utility>
 
@@ -15,22 +19,59 @@
 #include "SessionState.hpp"
 #include "PeerConnection.hpp"
 
+static constexpr uint32_t IN_PROGRESS_RARITY_GROUP_ID = std::numeric_limits<uint32_t>::max();
+
 class PieceManager {
 public:
-    using GetActiveConnectionsCallback = std::function<const std::map<PeerId, std::shared_ptr<PeerConnection>>&()>;
+    using GetAvailableCallback = std::function<asio::awaitable<std::vector<std::shared_ptr<PeerConnection>>>(size_t)>;
+    using InProgressType = std::shared_ptr<const std::map<size_t, std::shared_ptr<InProgressPiece>>>;
+    using AvailType = std::shared_ptr<const std::vector<size_t>>;
+    using RarityType = std::shared_ptr<const std::map<size_t, std::shared_ptr<std::unordered_set<int>>>>;
 
-    PieceManager(asio::io_context& io_context, std::shared_ptr<SessionState> state) noexcept;
+    PieceManager(asio::io_context& io_context, std::shared_ptr<SessionState> state);
 
-    const std::map<size_t, InProgressPiece>& in_progress_pieces() const noexcept { return in_progress_pieces_; }
-    std::map<size_t, InProgressPiece>& in_progress_pieces() noexcept { return in_progress_pieces_; }
-    const InProgressPiece& in_progress_piece(size_t piece_index) const { return in_progress_pieces_.at(piece_index); }
-    InProgressPiece& in_progress_piece(size_t piece_index) { return in_progress_pieces_.at(piece_index); }
-    const std::vector<size_t>& piece_availability() const noexcept { return piece_availability_; }
-    std::vector<size_t>& piece_availability() noexcept { return piece_availability_; }
-    size_t piece_availability(size_t piece_index) const noexcept { return piece_availability_[piece_index]; }
-    const std::map<size_t, std::unordered_set<int>>& pieces_by_rarity() const noexcept { return pieces_by_rarity_; };
-    std::map<size_t, std::unordered_set<int>>& pieces_by_rarity() noexcept { return pieces_by_rarity_; };
-    void add_piece_availability(size_t piece_index, int32_t val) noexcept { piece_availability_[piece_index] += val; }
+    InProgressType in_progress_pieces() const noexcept { 
+        std::lock_guard lock(mutex_);
+        return in_progress_pieces_;
+    }
+    std::shared_ptr<const InProgressPiece> in_progress_piece(size_t piece_index) const noexcept { 
+        assert(piece_index < state_->num_pieces());
+        std::lock_guard lock(mutex_);
+        if (in_progress_pieces_->count(piece_index)) {
+            return in_progress_pieces_->at(piece_index); 
+        }
+        return nullptr;
+    }
+    std::shared_ptr<InProgressPiece> in_progress_piece(size_t piece_index) noexcept { 
+        assert(piece_index < state_->num_pieces());
+        std::lock_guard lock(mutex_);
+        if (in_progress_pieces_->count(piece_index)) {
+            return in_progress_pieces_->at(piece_index); 
+        }
+        return nullptr;
+    }
+    AvailType piece_availability() const noexcept { 
+        std::lock_guard lock(mutex_);
+        return piece_availability_; 
+    }
+    size_t piece_availability(size_t piece_index) const noexcept { 
+        assert(piece_index < state_->num_pieces());
+        std::lock_guard lock(mutex_);
+        return piece_availability_->at(piece_index); 
+    }
+    RarityType pieces_by_rarity() const { 
+        std::lock_guard lock(mutex_);
+        return pieces_by_rarity_; 
+    };
+    RarityType pieces_by_rarity() { 
+        std::lock_guard lock(mutex_);
+        return pieces_by_rarity_; 
+    };
+    void add_piece_availability(size_t piece_index, int32_t val) { 
+        assert(piece_index < state_->num_pieces());
+        std::lock_guard lock(mutex_);
+        (*piece_availability_)[piece_index] += val; 
+    }
 
     asio::awaitable<void> update_piece_rarity(size_t piece_index, uint32_t old_rarity, uint32_t new_rarity);
     asio::awaitable<void> remove_piece_rarity(size_t piece_index, uint32_t rarity);
@@ -45,13 +86,26 @@ public:
     asio::awaitable<void> return_piece_to_queue(size_t piece_index);
 
     template<typename... Args>
-    void emplace_in_progress_pieces(Args... args) { in_progress_pieces_.emplace(std::forward<Args>(args)...); }
+    void emplace_in_progress_pieces(Args... args) { 
+        std::lock_guard lock(mutex_);
+        in_progress_pieces_->emplace(std::forward<Args>(args)...); 
+    }
+    void remove_in_progress_piece(size_t piece_index) {
+        assert(piece_index < state_->num_pieces());
+        std::lock_guard lock(mutex_);
+        in_progress_pieces_->erase(piece_index);
+    }
+    void remove_all_in_progress_pieces() {
+        std::lock_guard lock(mutex_);
+        in_progress_pieces_->clear();
+    }
 
-    asio::awaitable<std::map<std::string, std::string>> get_in_progress_for_resume() const;
-
+    std::map<std::string, std::string> get_in_progress_for_resume() const;
     void notify_one() noexcept { piece_request_trigger_.cancel_one(); }
-
-    void set_callback(GetActiveConnectionsCallback cb) { get_connections_ = std::move(cb); }
+    void set_callback(GetAvailableCallback cb) { 
+        std::lock_guard lock(mutex_);
+        get_available_peers_ = std::move(cb); 
+    }
 
 private:
 
@@ -60,11 +114,10 @@ private:
     asio::io_context& io_context_;
     asio::strand<asio::io_context::executor_type> strand_;
     asio::steady_timer piece_request_trigger_;
-
-    std::map<size_t, InProgressPiece> in_progress_pieces_;
-    std::vector<size_t> piece_availability_;
-    std::map<size_t, std::unordered_set<int>> pieces_by_rarity_;
+    std::shared_ptr<std::map<size_t, std::shared_ptr<InProgressPiece>>> in_progress_pieces_;
+    std::shared_ptr<std::vector<size_t>> piece_availability_;
+    std::shared_ptr<std::map<size_t, std::shared_ptr<std::unordered_set<int>>>> pieces_by_rarity_;
     std::shared_ptr<SessionState> state_;
-
-    GetActiveConnectionsCallback get_connections_;
+    mutable std::mutex mutex_;
+    GetAvailableCallback get_available_peers_;
 };

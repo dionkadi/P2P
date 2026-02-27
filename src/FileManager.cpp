@@ -6,6 +6,7 @@
 #include <boost/asio/use_awaitable.hpp>
 #include <boost/system/detail/error_code.hpp>
 #include <boost/asio/experimental/awaitable_operators.hpp>
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -24,6 +25,18 @@ FileManager::FileManager(std::shared_ptr<SessionState> state)
       file_io_pool_(get_file_io_pool()),
       file_locker_(std::make_shared<FileLocker>())
 {
+    const auto& info = state_->torrent_info();
+    const size_t num_pieces = state_->num_pieces();
+
+    piece_to_files_map_.reserve(num_pieces);
+    for (size_t i = 0; i < num_pieces; ++i) {
+        piece_to_files_map_.push_back(std::make_shared<std::vector<PieceFileOverlap>>());
+    }
+    file_to_pieces_map_.reserve(info.files.size());
+    for (size_t i = 0; i < info.files.size(); ++i) {
+        file_to_pieces_map_.push_back(std::make_shared<std::vector<size_t>>());
+    }
+
     build_maps();
 }
 
@@ -69,7 +82,7 @@ asio::awaitable<std::vector<std::byte>> FileManager::read_block(size_t piece_ind
 }
 
 asio::awaitable<void> FileManager::write_piece(size_t piece_index, std::span<const std::byte> piece_data) {
-    const auto& overlaps = piece_to_files_map_.at(piece_index);
+    const auto& overlaps = *get_piece_to_files_map(piece_index);
     for (const auto& overlap : overlaps) {
         const auto& file_info = state_->torrent_info().files.at(overlap.file_index);
         if (file_info.download) {
@@ -133,8 +146,8 @@ void FileManager::build_maps() {
                 overlap.offset_in_file = overlap_start - file_start_offset;
                 overlap.offset_in_piece = overlap_start - piece_start_offset;
                 overlap.length = overlap_end - overlap_start;
-                piece_to_files_map_[piece_idx].push_back(std::move(overlap));
-                file_to_pieces_map_[file_idx].push_back(piece_idx);
+                piece_to_files_map_[piece_idx]->push_back(std::move(overlap));
+                file_to_pieces_map_[file_idx]->push_back(piece_idx);
             }
         }
 
@@ -419,7 +432,7 @@ asio::awaitable<std::optional<std::vector<std::byte>>> FileManager::load_resume_
 }
 
 asio::awaitable<bool> FileManager::preallocate_files() {
-    auto& info = state_->torrent_info();
+    const auto& info = state_->torrent_info();
     const size_t num_pieces = state_->num_pieces();
 
     try {
@@ -427,7 +440,7 @@ asio::awaitable<bool> FileManager::preallocate_files() {
 
         // For a multi-file torrent, base_save_path is the parent directory.
         // We create a subdirectory named after the torrent.
-        if (info.files.size() > 1) {
+        if (state_->is_multi_file()) {
             base_save_path /= info.name;
         }
 
@@ -441,10 +454,10 @@ asio::awaitable<bool> FileManager::preallocate_files() {
         // selective downloading
         std::optional<bool> download_all_decision;
         for (size_t i = 0; i < info.files.size(); ++i) {
-            auto& file = info.files[i];
+            const auto& file = info.files[i];
             std::filesystem::path full_path = get_full_path_for_file(file);
             if (download_all_decision.has_value()) {
-                file.download = download_all_decision.value();
+                state_->update_file_stat(i, download_all_decision.value());
             } else {
                 bool skip_this_file = false;
                 int ans = co_await async_prompt(
@@ -452,22 +465,22 @@ asio::awaitable<bool> FileManager::preallocate_files() {
                     full_path.filename().string())
                 );
                 if (ans == 1) { // Yes
-                    file.download = true;
+                    state_->update_file_stat(i, true);
                 } else if (ans == 2) { // No
                     skip_this_file = true;
                 } else if (ans == 3) { // Yes for all
-                    file.download = true; // Current file is downloaded
+                    state_->update_file_stat(i, true); // Current file is downloaded
                     download_all_decision = true; // Set global decision for subsequent files
                 } else if (ans == 4) { // No for all
                     skip_this_file = true; // Current file is skipped
                     download_all_decision = false; // Set global decision for subsequent files
                 } else {
                     LOGWARN("Unknown input '{}', defaulting to Yes", ans);
-                    file.download = true; // Default to download
+                    state_->update_file_stat(i, true); // Default to download
                 }
 
                 if (skip_this_file) {
-                    file.download = false;
+                    state_->update_file_stat(i, false);
                 }
             }
             
@@ -508,9 +521,9 @@ asio::awaitable<bool> FileManager::preallocate_files() {
         }
 
         for (size_t piece_idx : std::views::iota(0UL, num_pieces)) {
-            bool is_needed = std::ranges::any_of(piece_to_files_map_[piece_idx], 
+            bool is_needed = std::ranges::any_of(*get_piece_to_files_map(piece_idx), 
                                                  [this](const auto& overlap) {
-                                                     return state_->torrent_info().files[overlap.file_index].download;
+                                                    return state_->torrent_info().files[overlap.file_index].download;
                                                  });
             PieceStatus status = is_needed ? PieceStatus::Needed : PieceStatus::Skipped;
             state_->piece_status(piece_idx, status);

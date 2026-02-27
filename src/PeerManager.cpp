@@ -1,6 +1,12 @@
 #include "PeerManager.hpp"
 
+#include <algorithm>
+#include <boost/asio/awaitable.hpp>
+#include <boost/asio/dispatch.hpp>
+#include <boost/asio/strand.hpp>
+#include <boost/asio/use_awaitable.hpp>
 #include <cstddef>
+#include <iterator>
 #include <optional>
 #include <random>
 #include <ranges>
@@ -8,7 +14,7 @@
 #include "PeerConnection.hpp"
 
 PeerManager::PeerManager(asio::io_context& io_context, std::shared_ptr<SessionState> state) noexcept
-    : io_context_(io_context), state_(state) 
+    : io_context_(io_context), strand_(asio::make_strand(io_context)), state_(state) 
 {}
 
 asio::awaitable<std::optional<AsyncSocket>> PeerManager::connect_to_peer(const std::string& peer_addr) {
@@ -45,24 +51,22 @@ asio::awaitable<void> PeerManager::choke_loop() {
     std::mt19937 rng(std::chrono::high_resolution_clock::now().time_since_epoch().count());
 
     std::shared_ptr<PeerConnection> optimistically_unchoked_peer = nullptr;
-
     while (!state_->is_download_complete()) {
         timer.expires_after(std::chrono::seconds(10));
         co_await timer.async_wait(asio::use_awaitable);
 
-        // co_await asio::dispatch(strand_, asio::use_awaitable);
+        co_await asio::dispatch(strand_, asio::use_awaitable);
         ++choke_loop_counter_;
 
         std::vector<std::shared_ptr<PeerConnection>> interested_peers;
         std::ranges::copy(
-            active_connections_
-                | std::views::values // Get a view of shared_ptr<PeerConnection>
+            get_all_connections()
                 | std::views::filter([](const std::shared_ptr<PeerConnection>& conn) {
                     return conn->peer_is_interested();
                 }),
             std::back_inserter(interested_peers)
         );
-
+        
         std::sort(interested_peers.begin(), interested_peers.end(), 
             [] (const auto& a, const auto& b) {
                 return a->bytes_uploaded() > b->bytes_uploaded();
@@ -71,12 +75,11 @@ asio::awaitable<void> PeerManager::choke_loop() {
 
         const int unchoke_slots = 4;
         std::vector<std::shared_ptr<PeerConnection>> unchoked_this_round;
-
         for (size_t i = 0; i < interested_peers.size() && unchoked_this_round.size() < unchoke_slots - 1; ++i) {
             auto& conn = interested_peers[i];
             if (conn->am_choking()) {
                 LOGDBG("Unchoking fast peer {} (uploaded {} bytes)", conn->peer_id(), conn->bytes_uploaded());
-                co_await conn->send_simple_message(MessageType::Unchoke);
+                asio::co_spawn(io_context_, conn->send_simple_message(MessageType::Unchoke), asio::detached);
                 conn->am_choking(false);
             }
             unchoked_this_round.push_back(conn);
@@ -91,7 +94,7 @@ asio::awaitable<void> PeerManager::choke_loop() {
 
                 if (!is_top_peer) {
                     LOGINFO("Re-choking previous optimistic peer {}", optimistically_unchoked_peer->peer_id());
-                    co_await optimistically_unchoked_peer->send_simple_message(MessageType::Choke);
+                    asio::co_spawn(io_context_, optimistically_unchoked_peer->send_simple_message(MessageType::Choke), asio::detached);
                     optimistically_unchoked_peer->am_choking(true);
                 }
             }
@@ -110,7 +113,7 @@ asio::awaitable<void> PeerManager::choke_loop() {
                 auto& new_optimistic_peer = candidates[dist(rng)];
 
                 LOGINFO("Optimistically unchoking peer {}", new_optimistic_peer->peer_id());
-                co_await new_optimistic_peer->send_simple_message(MessageType::Unchoke);
+                asio::co_spawn(io_context_, new_optimistic_peer->send_simple_message(MessageType::Unchoke), asio::detached);
                 new_optimistic_peer->am_choking(false);
 
                 optimistically_unchoked_peer = new_optimistic_peer;
@@ -128,44 +131,43 @@ asio::awaitable<void> PeerManager::choke_loop() {
 
             if (!should_be_unchoked && !peer->am_choking()) {
                 LOGDBG("Choking slow/non-optimistic peer {}", peer->peer_id());
-                co_await peer->send_simple_message(MessageType::Choke);
+                asio::co_spawn(io_context_, peer->send_simple_message(MessageType::Choke), asio::detached);
                 peer->am_choking(true);
             }
         }
 
-        for (auto const& [id, conn] : active_connections_) {
-            conn->bytes_uploaded(0);
-        }
+        std::ranges::for_each(get_all_connections(), 
+            [] (const auto& conn) {
+                conn->bytes_uploaded(0);
+        });
     }
 }
 
 asio::awaitable<void> PeerManager::send_have_message_to_all(size_t piece_index) {
-    for (const auto& [id, conn] : active_connections_) {
-        co_await conn->send_have(piece_index);
-    }
+    std::ranges::for_each(get_all_connections(), [this, piece_index] (const auto& conn) {
+        asio::co_spawn(io_context_, conn->send_have(piece_index), asio::detached);
+    });
+    co_return ;
 }
 
-std::vector<std::shared_ptr<PeerConnection>> PeerManager::available_peers(size_t piece_index) {
+asio::awaitable<std::vector<std::shared_ptr<PeerConnection>>> PeerManager::available_peers(size_t piece_index) const {
     std::vector<std::shared_ptr<PeerConnection>> available_peers;
     std::ranges::copy(
-        active_connections_
-            | std::views::values
-            | std::views::filter([&](const std::shared_ptr<PeerConnection>& conn) {
-                return !conn->peer_is_choking() && conn->has_piece(piece_index);
-            }),
+        std::views::filter(get_all_connections(), 
+                        [piece_index] (const auto& conn) {
+                            return !conn->peer_is_choking() && conn->has_piece(piece_index);
+                        }),
         std::back_inserter(available_peers)
     );
     
-    for (const auto& conn : available_peers) {
-        if (!conn->am_interested()) {
-            conn->am_interested(true);
-            asio::co_spawn(io_context_, 
-                [conn]() -> asio::awaitable<void> {
-                    co_await conn->send_simple_message(MessageType::Interested);
-                }, 
-                asio::detached
-            );
-        }
-    }
-    return available_peers;
+    // for (const auto& conn : available_peers) {
+    //     if (!conn->am_interested()) {
+    //         conn->am_interested(true);
+    //         asio::co_spawn(io_context_, 
+    //             conn->send_simple_message(MessageType::Interested),
+    //             asio::detached
+    //         );
+    //     }
+    // }
+    co_return available_peers;
 }

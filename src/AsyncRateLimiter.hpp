@@ -2,6 +2,7 @@
 #pragma once
 
 #include <boost/asio.hpp>
+#include <boost/asio/bind_executor.hpp>
 #include <deque>
 
 #include "Logger.hpp"
@@ -10,6 +11,7 @@ namespace asio = boost::asio;
 
 template<typename TokenCountType = uint64_t>
 class AsyncRateLimiter {
+    static_assert(std::is_unsigned_v<TokenCountType>, "TokenCountType must be an unsigned integer type.");
 public:
     static constexpr std::chrono::milliseconds refill_interval = std::chrono::milliseconds(100);
 
@@ -26,28 +28,20 @@ public:
     }
 
     asio::awaitable<void> await_tokens(size_t amount) {
-        // If rate limiting is disabled, complete immediately.
         if (rate_bytes_per_second_ == 0) {
-            co_return;
+            co_return;  // If rate limiting is disabled, complete immediately.
         }
 
         co_await asio::async_initiate<void(boost::system::error_code)>(
-            [this, amount](auto&& completion_handler) {
-                // Dispatch the logic onto strand to ensure thread safety.
-                asio::dispatch(strand_, [this, amount, h = std::move(completion_handler)]() mutable {
-                    if (tokens_ >= amount) {
-                        // We have enough tokens, complete the operation now.
-                        tokens_ -= amount;
-                        // Post the handler to avoid calling it from within the initiation function.
-                        asio::post(strand_, [handler = std::move(h)]() mutable {
-                            handler(boost::system::error_code{});
-                        });
-                    } else {
-                        // Not enough tokens, suspend the operation by enqueuing the handler.
-                        waiters_.emplace_back(amount, std::move(h));
-                    }
-                });
-            },
+            asio::bind_executor(strand_, // Ensure the logic runs on the strand
+            [this, amount](auto&& completion_handler) mutable {
+                if (tokens_ >= amount) {
+                    tokens_ -= amount;
+                    std::move(completion_handler)(boost::system::error_code{});
+                } else {
+                    waiters_.emplace_back(amount, std::move(completion_handler));
+                }
+            }),
             asio::use_awaitable
         );
     }
@@ -55,7 +49,8 @@ public:
 private:
     void refill_tokens() {
         timer_.expires_after(refill_interval);
-        timer_.async_wait([this](const boost::system::error_code& ec) {
+        timer_.async_wait(asio::bind_executor(strand_, 
+        [this](const boost::system::error_code& ec) {
             if (ec == boost::asio::error::operation_aborted) {
                 return;
             }
@@ -70,7 +65,7 @@ private:
             tokens_ = std::min(tokens_ + refill_amount, capacity_);
 
             // Resume any waiters that can now be satisfied
-            while (!waiters_.empty() && tokens_ >= static_cast<TokenCountType>(waiters_.front().first)) {
+            while (!waiters_.empty() && tokens_ >= waiters_.front().first) {
                 auto [amount, handler] = std::move(waiters_.front());
                 waiters_.pop_front();
                 
@@ -83,7 +78,7 @@ private:
             }
 
             refill_tokens(); // Schedule the next refill
-        });
+        }));
     }
 
     asio::strand<asio::io_context::executor_type> strand_;

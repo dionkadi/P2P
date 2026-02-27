@@ -1,0 +1,6 @@
+build
+test
+logs
+data
+.cache
+.vscode

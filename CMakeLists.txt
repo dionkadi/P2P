@@ -1,7 +1,8 @@
-cmake_minimum_required(VERSION 3.30)
+cmake_minimum_required(VERSION 4.0)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
 
 project(P2PFileSharing
         VERSION 1.1
@@ -21,6 +22,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 find_package(Threads REQUIRED)
 find_package(Boost REQUIRED COMPONENTS url)
+find_package(GTest REQUIRED)
 
 add_subdirectory(third_party/json)
 add_subdirectory(third_party/picosha2)
@@ -36,15 +38,9 @@ add_library(p2p_common
 )
 
 target_include_directories(p2p_common PUBLIC
-    "${CMAKE_CURRENT_SOURCE_DIR}/include"
     third_party/picosha2/
     third_party/json/include/nlohmann
     third_party/spdlog/include/spdlog
-)
-
-set(INCLUDEDIRS
-        src/include
-        third_party/picosha2
 )
 
 target_link_libraries(p2p_common PUBLIC
@@ -60,3 +56,28 @@ add_executable(client src/main_client.cpp)
 
 target_link_libraries(tracker PRIVATE p2p_common)
 target_link_libraries(client PRIVATE p2p_common)
+
+# add_executable(p2p_test
+#     test/bencode_test.cpp
+#     test/buffer_test.cpp
+#     test/crypto_test.cpp
+#     test/protocol_test.cpp
+#     test/torrentfile_test.cpp
+#     test/sessionstate_test.cpp
+#     test/asyncratelimiter_test.cpp
+#     test/filemanager_test.cpp
+#     # Add other test files as you write them
+# )
+
+# target_include_directories(p2p_test
+#   PUBLIC
+#     src
+# )
+
+# target_link_libraries(p2p_test
+#   PRIVATE
+#     p2p_common
+#     GTest::gtest
+#     GTest::gtest_main
+#     Boost::headers    
+# )

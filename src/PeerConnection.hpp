@@ -7,8 +7,8 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <span>
-#include <utility>
 #include <vector>
 
 #include "Types.hpp"
@@ -29,32 +29,67 @@ public:
         std::shared_ptr<IPeerConnectionEvents> events
     );
 
-    bool has_piece(size_t index) const noexcept;
-    void set_has_piece(size_t index) noexcept;
+    PeerConnection(const PeerConnection&) = delete;
+    PeerConnection& operator=(const PeerConnection&) = delete;
+    PeerConnection(PeerConnection&&) noexcept = delete;
+    PeerConnection& operator=(PeerConnection&&) noexcept = delete;
 
-    bool am_choking() const noexcept { return am_choking_; }
-    bool peer_is_choking() const noexcept { return peer_is_choking_; };
-    bool am_interested() const noexcept { return am_interested_; }
-    bool peer_is_interested() const noexcept { return peer_is_interested_; }
-    size_t bitfield_size() const noexcept { return bitfield_.size(); }
+    bool has_piece(size_t index) const noexcept {
+        std::lock_guard lock(mutex_);
+        if (bitfield_.empty() || index / 8 >= bitfield_.size()) {
+            return false;
+        }
+        return (bitfield_[index / 8] >> (7 - (index % 8))) & 1;
+    }
+    void set_has_piece(size_t index) noexcept {
+        std::lock_guard lock(mutex_);
+        if (bitfield_.empty() || index / 8 >= bitfield_.size()) {
+            LOGWARN("Attempted to set piece {} out of bitfield bounds (size: {}) for peer {}", index, bitfield_.size(), peer_id_);
+            return ;
+        }
+        bitfield_[index / 8] |= (1 << (7 - (index % 8)));
+    }
+
+    bool am_choking() const noexcept { return am_choking_.load(std::memory_order_relaxed); }
+    bool peer_is_choking() const noexcept { return peer_is_choking_.load(std::memory_order_relaxed); };
+    bool am_interested() const noexcept { return am_interested_.load(std::memory_order_relaxed); }
+    bool peer_is_interested() const noexcept { return peer_is_interested_.load(std::memory_order_relaxed); }
+
+    size_t bitfield_size() const noexcept {
+        std::lock_guard lock(mutex_);
+        return bitfield_.size();
+    }
+
     uint64_t bytes_downloaded() const noexcept { return bytes_downloaded_.load(std::memory_order_relaxed); } 
     uint64_t bytes_uploaded() const noexcept { return bytes_uploaded_.load(std::memory_order_relaxed); }
     const PeerId& peer_id() const noexcept { return peer_id_; }
     const std::string& peer_addr() const noexcept { return peer_addr_; }
-    ExtendedMessageType extension_type(uint8_t index) const { return remote_extension_map_.at(index); }
 
-    void am_choking(bool val) noexcept { am_choking_ = val; }
-    void peer_is_choking(bool val) noexcept { peer_is_choking_ = val; }
-    void am_interested(bool val) noexcept { am_interested_ = val; }
-    void peer_is_interested(bool val) noexcept { peer_is_interested_ = val; }
+    void am_choking(bool val) noexcept { am_choking_.store(val, std::memory_order_relaxed); }
+    void peer_is_choking(bool val) noexcept { peer_is_choking_.store(val, std::memory_order_relaxed); }
+    void am_interested(bool val) noexcept { am_interested_.store(val, std::memory_order_relaxed); }
+    void peer_is_interested(bool val) noexcept { peer_is_interested_.store(val, std::memory_order_relaxed); }
     void bytes_downloaded(uint64_t val) noexcept { bytes_downloaded_.store(val, std::memory_order_relaxed); } 
     void bytes_uploaded(uint64_t val) noexcept { bytes_uploaded_.store(val, std::memory_order_relaxed); }
     void add_bytes_downloaded(uint64_t val) noexcept { bytes_downloaded_.fetch_add(val, std::memory_order_relaxed); } 
     void add_bytes_uploaded(uint64_t val) noexcept { bytes_uploaded_.fetch_add(val, std::memory_order_relaxed); }
-    void update_extension_type(uint8_t index, ExtendedMessageType type) { remote_extension_map_[index] = type; }
-
+    
+    ExtendedMessageType extension_type(uint8_t index) const noexcept {
+        std::lock_guard lock(mutex_);
+        if (!remote_extension_map_.count(index)) {
+            return ExtendedMessageType::UNKNOWN;
+        }
+        return remote_extension_map_.at(index);
+    }
+    void update_extension_type(uint8_t index, ExtendedMessageType type) noexcept {
+        std::lock_guard lock(mutex_);
+        remote_extension_map_[index] = type;
+    }
     template<typename T>
-    void bitfield(T&& other) noexcept { bitfield_ = std::forward<T>(other); } 
+    void bitfield(T&& other) {
+        std::lock_guard lock(mutex_);
+        bitfield_ = std::forward<T>(other);
+    }
 
     void close() noexcept { socket_.close(); }
     
@@ -78,6 +113,7 @@ private:
     void start_loops();
 
     asio::io_context& io_context_;
+    asio::strand<asio::io_context::executor_type> strand_;
     AsyncSocket socket_;
     std::string peer_addr_;
     PeerId peer_id_{};
@@ -87,11 +123,13 @@ private:
     std::vector<uint8_t> bitfield_;
     std::map<uint8_t, ExtendedMessageType> remote_extension_map_;
 
-    bool am_choking_{true};
-    bool peer_is_choking_{true};
-    bool am_interested_{false};
-    bool peer_is_interested_{false};
+    std::atomic_bool am_choking_{true};
+    std::atomic_bool peer_is_choking_{true};
+    std::atomic_bool am_interested_{false};
+    std::atomic_bool peer_is_interested_{false};
 
     std::atomic_uint64_t bytes_downloaded_{0};
     std::atomic_uint64_t bytes_uploaded_{0};
+
+    mutable std::mutex mutex_;
 };

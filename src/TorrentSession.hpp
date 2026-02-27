@@ -27,6 +27,9 @@ public:
         uint64_t download_rate_bps = 2048 * 1024
     );
 
+    TorrentSession(const TorrentSession&) = delete;
+    TorrentSession& operator=(const TorrentSession&) = delete;
+
     asio::awaitable<void> run();
     asio::awaitable<void> stop();
 

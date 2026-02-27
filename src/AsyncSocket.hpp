@@ -17,6 +17,11 @@ class AsyncSocket {
     explicit AsyncSocket(asio::ip::tcp::socket socket) noexcept
         : socket_(std::move(socket)) {}
 
+    AsyncSocket(const AsyncSocket&) = delete;
+    AsyncSocket& operator=(const AsyncSocket&) = delete;
+    AsyncSocket(AsyncSocket&&) noexcept = default;
+    AsyncSocket& operator=(AsyncSocket&&) noexcept = default;
+
     asio::awaitable<void> connect(std::string_view host, int port) {
         asio::ip::tcp::resolver resolver(socket_.get_executor());
         auto endpoints = co_await resolver.async_resolve(host, std::to_string(port), asio::use_awaitable);
@@ -68,7 +73,25 @@ class AsyncSocket {
         co_return buffer;
     }
 
-    const asio::ip::tcp::socket& get_socket() const noexcept { return socket_; }
+    asio::ip::tcp::endpoint remote_endpoint() const noexcept {
+        boost::system::error_code ec;
+        auto ep = socket_.remote_endpoint(ec);
+        if (ec) {
+            LOGWARN("Error getting remote_endpoint: {}", ec.message());
+            return {};
+        }
+        return ep;
+    }
+
+    asio::ip::tcp::endpoint local_endpoint() const noexcept {
+        boost::system::error_code ec;
+        auto ep = socket_.local_endpoint(ec);
+        if (ec) {
+            LOGWARN("Error getting local_endpoint: {}", ec.message());
+            return {};
+        }
+        return ep;
+    }
 
     void close() noexcept {
         boost::system::error_code ec;
@@ -84,17 +107,26 @@ class AsyncSocket {
         }
     }
 
+    bool is_open() const noexcept {
+        return socket_.is_open();
+    }
+
 private:
     asio::ip::tcp::socket socket_;
 };
 
 class AsyncServerSocket {
 public:
-    explicit AsyncServerSocket(asio::io_context& io_context, int port)
+    explicit AsyncServerSocket(asio::io_context& io_context, int port) noexcept
         : acceptor_(io_context, {asio::ip::tcp::v4(), static_cast<asio::ip::port_type>(port)}) 
     {    
         LOGINFO("Server listening on port {}", port);
     }
+
+    AsyncServerSocket(const AsyncServerSocket&) = delete;
+    AsyncServerSocket& operator=(const AsyncServerSocket&) = delete;
+    AsyncServerSocket(AsyncServerSocket&&) noexcept = default;
+    AsyncServerSocket& operator=(AsyncServerSocket&&) noexcept = default;
 
     asio::awaitable<AsyncSocket> accept() {
         asio::ip::tcp::socket socket = co_await acceptor_.async_accept(asio::use_awaitable);

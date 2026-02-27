@@ -3,6 +3,9 @@
 #include "Protocol.hpp"
 
 #include <boost/asio/awaitable.hpp>
+#include <boost/asio/dispatch.hpp>
+#include <boost/asio/strand.hpp>
+#include <boost/asio/use_awaitable.hpp>
 #include <cstdint>
 #include <exception>
 #include <memory>
@@ -48,6 +51,7 @@ PeerConnection::PeerConnection(
     asio::io_context& io_context, AsyncSocket socket, std::string peer_addr,
     std::shared_ptr<SessionState> state, std::shared_ptr<IPeerConnectionEvents> events
 ) noexcept : io_context_(io_context),
+    strand_(asio::make_strand(io_context_)),
     socket_(std::move(socket)),
     peer_addr_(std::move(peer_addr)),
     state_(std::move(state)),
@@ -55,25 +59,23 @@ PeerConnection::PeerConnection(
 {}
 
 asio::awaitable<bool> PeerConnection::perform_handshake(const PeerId& my_id) {
-    LOGDBG("Entered perform_handshake for peer {}", peer_addr_);
     try {
         LOGDBG("Starting handshake with peer {}", peer_addr_);
+        const auto& info_hash_bytes = state_->info_hash();
         Handshake my_handshake {
-            .info_hash_bytes = state_->info_hash(), 
+            .info_hash_bytes = info_hash_bytes, 
             .peer_id_bytes = my_id,
             .extended = true
         };
-        LOGDBG("Sending handshake message ({} bytes) to {}", HANDSHAKE_BASE_LEN, peer_addr_);
-        co_await socket_.send_raw(my_handshake.serialize());
-        LOGDBG("Handshake message sent to {}. Awaiting peer's handshake.", peer_addr_);
-        std::vector<std::byte> handshake_buffer = co_await socket_.receive_raw(HANDSHAKE_BASE_LEN);
-        LOGDBG("Received handshake message ({} bytes) from {}. Deserializing.", HANDSHAKE_BASE_LEN, peer_addr_);
-        Handshake peer_handshake = Handshake::deserialize(handshake_buffer);
-        LOGDBG("Deserialized handshake from {}. Checking info hash.", peer_addr_);
 
-        if (peer_handshake.info_hash_bytes != state_->info_hash()) {
+        co_await socket_.send_raw(my_handshake.serialize());
+
+        std::vector<std::byte> handshake_buffer = co_await socket_.receive_raw(HANDSHAKE_BASE_LEN);
+        Handshake peer_handshake = Handshake::deserialize(handshake_buffer);
+
+        if (peer_handshake.info_hash_bytes != info_hash_bytes) {
             LOGERR("Info hash mismatch with {}. Expected {}, got {}.",
-                   peer_addr_, Crypto::bytes_to_hex(state_->info_hash()), Crypto::bytes_to_hex(peer_handshake.info_hash_bytes));
+                   peer_addr_, Crypto::bytes_to_hex(info_hash_bytes), Crypto::bytes_to_hex(peer_handshake.info_hash_bytes));
             throw std::runtime_error("Info hash mismatch");
         }
 
@@ -122,14 +124,14 @@ asio::awaitable<bool> PeerConnection::perform_handshake(const PeerId& my_id) {
 void PeerConnection::start_loops() {
     auto self = shared_from_this();
     asio::co_spawn(
-        io_context_, 
+        strand_, 
         [self] () -> asio::awaitable<void> {
             co_await self->message_loop();
         }, 
         asio::detached
     );
     asio::co_spawn(
-        io_context_, 
+        strand_, 
         [self] () -> asio::awaitable<void> {
             co_await self->keep_alive_loop();
         }, 
@@ -143,34 +145,27 @@ asio::awaitable<void> PeerConnection::message_loop() {
         while (true) {
             std::vector<std::byte> msg = co_await socket_.receive_message();
             if (msg.empty()) {
-                // LOGDBG("Received keep-alive from {}", conn->peer_id);
-                continue ;
+                continue ;  // keep-alive
             }
-
-            // LOGDBG("Received raw message of size {} from {}. First byte is: {:#04x}",
-            //          msg.size(), conn->peer_id, static_cast<uint8_t>(msg[0]));
 
             MessageType type = static_cast<MessageType>(msg[0]);
             std::span<const std::byte> payload(msg.data() + 1, msg.size() - 1);
 
             switch (type) {
                 case MessageType::Choke:
-                    // LOGDBG("Received CHOKE from {}", conn->peer_id);
-                    peer_is_choking_ = true;
+                    peer_is_choking_.store(true, std::memory_order_relaxed);
                     co_await events_->on_choke_status_changed(self, true);
                     break;
                 case MessageType::Unchoke: {
-                    peer_is_choking_ = false;
+                    peer_is_choking_.store(false, std::memory_order_relaxed);
                     co_await events_->on_choke_status_changed(self, false);
                     break;
                 }
                 case MessageType::Interested:
-                    // LOGDBG("Received INTERESTED from {}", conn->peer_id);    
-                    peer_is_interested_ = true;
+                    peer_is_interested_.store(true, std::memory_order_relaxed);
                     break;
-                case MessageType::NotInterested:
-                    // LOGDBG("Received NOT INTERESTED from {}", conn->peer_id);    
-                    peer_is_interested_ = false;
+                case MessageType::NotInterested:  
+                    peer_is_interested_.store(false, std::memory_order_relaxed);
                     break;
                 case MessageType::Bitfield: {
                     co_await events_->on_peer_bitfield(self, payload);
@@ -203,12 +198,10 @@ asio::awaitable<void> PeerConnection::message_loop() {
                     break;
                 }
                 case MessageType::Cancel: {
-                    // LOGDBG("Received CANCEL from {}", conn->peer_id);
                     // Handle cancel if needed (e.g., remove from upload queue, but for now ignore)
                     break;
                 }
                 case MessageType::ExtendedMessage: {
-                    // LOGDBG("Received ExtendedMessage from {}", conn->peer_id);
                     co_await events_->on_extended_message(self, payload);
                     break;
                 }
@@ -234,7 +227,7 @@ asio::awaitable<void> PeerConnection::message_loop() {
 
 asio::awaitable<void> PeerConnection::keep_alive_loop() {
     auto self = shared_from_this();
-    asio::steady_timer timer(io_context_);
+    asio::steady_timer timer(strand_);
 
     while (true) {
         timer.expires_after(std::chrono::minutes(2));
@@ -248,11 +241,9 @@ asio::awaitable<void> PeerConnection::keep_alive_loop() {
             break;
         }
 
-        // check if has active connections to *this?
-
         try {
             co_await socket_.send_message({});
-        } catch (const boost::system::system_error& e) { // Be more specific
+        } catch (const boost::system::system_error& e) {
             if (e.code() == asio::error::eof ||
                 e.code() == asio::error::connection_reset ||
                 e.code() == asio::error::broken_pipe ||
@@ -277,27 +268,8 @@ asio::awaitable<void> PeerConnection::keep_alive_loop() {
     co_return ;
 }
 
-void PeerConnection::set_has_piece(size_t index) noexcept {
-    if (bitfield_.empty() || index / 8 >= bitfield_.size()) {
-        LOGWARN("Attempted to set piece {} out of bitfield bounds (size: {}) for peer {}", index, bitfield_.size(), peer_id_);
-        return ;
-    }
-    bitfield_[index / 8] |= (1 << (7 - (index % 8)));
-}
-
-bool PeerConnection::has_piece(size_t index) const noexcept {
-    if (bitfield_.empty() || index / 8 >= bitfield_.size()) {
-        return false;
-    }
-    return (bitfield_[index / 8] >> (7 - (index % 8))) & 1;
-}
-
 asio::awaitable<void> PeerConnection::send_simple_message(MessageType type) {
     std::vector<std::byte> msg_body(1, static_cast<std::byte>(type));
-
-    // LOGDBG("Sending simple message of type {}. Raw byte value: {:#04x}", 
-    //          static_cast<int>(type), static_cast<uint8_t>(msg_body[0]));
-
     co_await socket_.send_message(msg_body);
 }
 
@@ -305,9 +277,6 @@ asio::awaitable<void> PeerConnection::send_request(size_t index, uint32_t begin,
     std::vector<std::byte> msg_body(1, static_cast<std::byte>(MessageType::Request));
     auto payload = RequestPayload::serialize(index, begin, length);
     msg_body.insert(msg_body.end(), payload.begin(), payload.end());
-
-    // LOGDBG("REQUEST msg[0] raw byte value: {:#04x}", static_cast<uint8_t>(msg_body[0]));
-
     co_await socket_.send_message(msg_body);
 }
 

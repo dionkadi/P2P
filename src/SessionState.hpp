@@ -3,12 +3,14 @@
 #include "TorrentFile.hpp"
 
 #include <atomic>
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <format>
 #include <mutex>
 #include <ranges>
+#include <vector>
 
 class SessionState {
 public:
@@ -29,12 +31,15 @@ public:
 
     const MetaInfo& info() const noexcept { return meta_info_; }
     const TorrentInfo& torrent_info() const noexcept { return meta_info_.get_torrent_info(); }
-    TorrentInfo& torrent_info() noexcept { return meta_info_.get_torrent_info(); }
     const std::vector<std::byte>& info_hash() const noexcept { return meta_info_.get_info_hash(); }
-    const std::vector<PieceStatus>& piece_status() const noexcept { return piece_status_; }
-    // std::vector<PieceStatus>& piece_status() { return piece_status_; }
-    PieceStatus piece_status(size_t piece_index) const noexcept { return piece_status_[piece_index]; }
     const std::vector<std::vector<std::string>>& tracker_tiers() const noexcept { return tracker_tiers_; }
+
+    PieceStatus piece_status(size_t piece_index) const noexcept { 
+        assert(piece_index < num_pieces_);
+        std::lock_guard lock(m_);
+        return piece_status_[piece_index]; 
+    }
+
     uint64_t total_bytes_downloaded() const noexcept { return total_bytes_downloaded_.load(std::memory_order_relaxed); }
     uint64_t total_bytes_uploaded() const noexcept { return total_bytes_uploaded_.load(std::memory_order_relaxed); }
     size_t completed_pieces() const noexcept { return completed_pieces_.load(std::memory_order_relaxed); }
@@ -70,6 +75,26 @@ public:
                                     bitfield[i / 8] |= (1 << (7 - (i % 8)));
                                 });
         return bitfield;
+    }
+
+    bool is_multi_file() const { return torrent_info().files.size() > 1;}
+    void update_file_stat(size_t file_idx, bool val) {
+        std::lock_guard lock(m_);
+        auto& file = meta_info_.get_torrent_info().files.at(file_idx);
+        file.download = val;
+    }
+
+    size_t needed_pieces() const noexcept {
+        std::lock_guard lock(m_);
+        return std::ranges::count_if(piece_status_, 
+                                    [](PieceStatus status) { 
+                                        return status == PieceStatus::Needed; 
+                                    });
+    }
+    template<typename Func>
+    size_t status_count(Func f) const {
+        std::lock_guard lock(m_);
+        return std::ranges::count_if(piece_status_, f);
     }
 
 private:

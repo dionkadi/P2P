@@ -35,34 +35,6 @@ PeerId generate_peer_id() {
     return peer_id;
 }
 
-// PeerId get_or_create_peer_id() {
-//     const std::filesystem::path id_path = "peer.id";
-    
-//     if (std::filesystem::exists(id_path)) {
-//         std::ifstream id_file(id_path, std::ios::binary);
-//         if (id_file.is_open()) {
-//             PeerId peer_id{};
-//             // fstream functions work with char*, so we must reinterpret_cast
-//             id_file.read(reinterpret_cast<char*>(peer_id.data()), peer_id.size());
-//             if (id_file.gcount() == peer_id.size()) {
-//                 LOGINFO("Loaded existing peer ID from {}", id_path.string());
-//                 return peer_id;
-//             }
-//         }
-//         LOGWARN("Could not read existing peer.id file. A new one will be generated.");
-//     }
-//     // If file doesn't exist or was invalid, generate a new one and save it.
-//     PeerId new_peer_id = generate_peer_id();
-//     LOGINFO("Generated new peer ID. Saving to {}", id_path.string());
-//     std::ofstream id_file(id_path, std::ios::binary);
-//     if (id_file.is_open()) {
-//         id_file.write(reinterpret_cast<const char*>(new_peer_id.data()), new_peer_id.size());
-//     } else {
-//         LOGERR("Failed to save new peer ID to file!");
-//     }
-//     return new_peer_id;
-// }
-
 std::vector<std::string> split(const std::string& s, char delimiter) {
     std::vector<std::string> tokens;
     std::string token;
@@ -104,22 +76,8 @@ int main(int argc, char* argv[]) {
  
     try {
         asio::io_context io_context;
-        std::shared_ptr<TorrentSession> session_ptr{nullptr};
-        asio::signal_set signals(io_context, SIGINT, SIGTERM);
-        signals.async_wait([&io_context, session_ptr] (auto, auto) {
-            LOGINFO("Signal received, initiating shutdown...");
-            if (session_ptr) {
-                asio::co_spawn(io_context, session_ptr->stop(), asio::detached);
-            } else {
-                io_context.stop();
-            }
-        });
-
-        PeerId my_peer_id = generate_peer_id();
-        LOGINFO("Client starting with Peer ID: {}", my_peer_id);
 
         std::string command = argv[1];
-
         if (command == "create" && argc == 5) {
             std::string source_path = argv[2];
             std::string torrent_path = argv[3];
@@ -134,66 +92,74 @@ int main(int argc, char* argv[]) {
             return 0;
         }
 
-        if (command == "seed") {
+        if (command == "seed" || command == "download") {
             if (argc != 5) { 
                 print_usage(); 
                 return 1; 
             }
-            std::filesystem::path file_path = argv[2];
+            std::filesystem::path torrent_path = argv[2];
             std::filesystem::path content_dir = argv[3];
             int peer_port = std::stoi(argv[4]);
-            
-            LOGINFO("Seeding from torrent '{}', content in '{}'. Listening on port {}", file_path.string(), content_dir.string(), peer_port);
-
-            session_ptr = std::make_shared<TorrentSession>(io_context, my_peer_id, file_path, content_dir, peer_port, Mode::Seed);
-            if (!session_ptr) {
-                LOGERR("Failed to create seeder");
-                return 1;
-            }
-            asio::co_spawn(io_context, 
-                [session_ptr] () -> asio::awaitable<void> {
-                    try {
-                        co_await session_ptr->run();
-                    } catch (const std::exception& e) {
-                        LOGCRITICAL("Seed coroutine threw an exception: {}", e.what());
-                    }
-                }, 
-                asio::detached
+            PeerId my_peer_id = generate_peer_id();
+            LOGINFO("Client starting with Peer ID: {}", my_peer_id);
+            std::shared_ptr<TorrentSession> session_ptr = std::make_shared<TorrentSession>(
+                io_context, my_peer_id, torrent_path, content_dir, peer_port, 
+                (command == "seed" ? Mode::Seed : Mode::Leech)
             );
-        }
-        else if (command == "download") {
-            std::filesystem::path torrent_path = argv[2];
-            std::filesystem::path save_path = argv[3];
-            int peer_port = std::stoi(argv[4]);
-
-            session_ptr = std::make_shared<TorrentSession>(io_context, my_peer_id, torrent_path, save_path, peer_port, Mode::Leech);
             if (!session_ptr) {
-                LOGERR("Failed to create leecher");
+                LOGERR("Failed to create torrent session.");
                 return 1;
             }
+
+            asio::signal_set signals(io_context, SIGINT, SIGTERM);
+            signals.async_wait([&io_context, session_ptr] (auto, auto signal_number) mutable {
+                LOGINFO("Signal {} received, initiating shutdown...", signal_number);
+                if (session_ptr) {
+                    asio::co_spawn(io_context, session_ptr->stop(), asio::detached);
+                } else {
+                    io_context.stop();
+                }
+            });
+
             asio::co_spawn(io_context, 
                 [&io_context, session_ptr]() mutable -> asio::awaitable<void> 
                 {
                     try {
                         co_await session_ptr->run();
+                    } catch (const boost::system::system_error& ex) {
+                        if (ex.code() != asio::error::operation_aborted) {
+                            LOGCRITICAL("TorrentSession run() coroutine threw an unexpected exception: {}", ex.what());
+                        } else {
+                            LOGDBG("TorrentSession run() coroutine aborted gracefully.");
+                        }
                     } catch (const std::exception& ex) {
-                        LOGCRITICAL("Download coroutine threw an exception: {}", ex.what());
+                        LOGCRITICAL("TorrentSession run() coroutine threw a general exception: {}", ex.what());
                     }
                     
+                    // If the run() coroutine completes without the io_context being stopped (e.g., download finished naturally),
+                    // ensure proper shutdown is initiated.
                     if (!io_context.stopped()) {
-                        LOGINFO("Download finished, stopping application.");
+                        LOGINFO("TorrentSession run() finished, stopping application.");
                         co_await session_ptr->stop();
                     }
                 },
                 asio::detached
             );
+
+            session_ptr.reset(); 
+            const int num_io_threads = std::thread::hardware_concurrency(); 
+            std::vector<std::jthread> io_threads;
+            LOGINFO("Running io_context on {} threads...", num_io_threads);
+            for (int i = 0; i < num_io_threads; ++i) {
+                io_threads.emplace_back([&io_context] {
+                    io_context.run();
+                });
+            }
         }
         else {
             print_usage();
             return 1;
         }
-
-        io_context.run();
     
     } catch (const std::exception& e) {
         LOGCRITICAL("Error: {}", e.what());
