@@ -123,3 +123,20 @@ e
 ```
 
 This is sent as the payload of an extended message with ID corresponding to ut_pex.
+
+---
+
+### Implementation Details
+
+In `PeerManager`, member `known_pex_peers_` is maintained for purposes:
+- It holds endpoints of **currently connected peers** (updated on connect/disconnect)
+- It holds endpoints **learned from incoming PEX message** (when parsing `added`)
+
+According to BEP 11, the `added` field of a PEX message must contains **peers that sender is currently connected to**. It should not be mixed with discovered peers, which may be offline or not connected. Such mixing violates protocol and misleads other peers, having conseqences:
+- Advertise peers that may be offline or unreachable, wasting others' connection attempts.
+- Over time `known_pex_peers_` grows with stale entries. Proper cleanup is necessary.
+
+When an endpoint is regarded as dropped (i.e. pushed into `dropped_peers_`), the corresponding entry in `known_pex_peers_` should be removed. 
+
+Peers listed in `added` field should be handled actively. That is, after they are parsed and added into `knwon_pex_peers_`, connection attempts to thoes peers should be made. A typical solution is to store them in a candidate list and periodically connect to them.
+
