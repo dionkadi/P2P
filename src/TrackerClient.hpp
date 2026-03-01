@@ -13,7 +13,7 @@
 #include <boost/url.hpp>
 #include <boost/asio/experimental/awaitable_operators.hpp>
 
-#include "Logger.hpp"
+#include "Utils.hpp"
 #include "Bencode.hpp"
 #include "HttpServer.hpp"
 #include "Types.hpp"

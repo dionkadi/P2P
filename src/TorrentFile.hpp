@@ -1,7 +1,6 @@
 #pragma once
 
-#include "Crypto.hpp"
-#include "Logger.hpp"
+#include "Utils.hpp"
 #include "Bencode.hpp"
 #include "Types.hpp"
 

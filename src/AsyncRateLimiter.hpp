@@ -5,7 +5,7 @@
 #include <boost/asio/bind_executor.hpp>
 #include <deque>
 
-#include "Logger.hpp"
+#include "Utils.hpp"
 
 namespace asio = boost::asio;
 

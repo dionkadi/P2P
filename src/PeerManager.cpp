@@ -1,17 +1,7 @@
 #include "PeerManager.hpp"
+#include "Utils.hpp"
 
-#include <algorithm>
-#include <boost/asio/awaitable.hpp>
-#include <boost/asio/dispatch.hpp>
-#include <boost/asio/strand.hpp>
-#include <boost/asio/use_awaitable.hpp>
-#include <cstddef>
-#include <iterator>
-#include <optional>
 #include <random>
-#include <ranges>
-#include "Logger.hpp"
-#include "PeerConnection.hpp"
 
 PeerManager::PeerManager(asio::io_context& io_context, std::shared_ptr<SessionState> state) noexcept
     : io_context_(io_context), strand_(asio::make_strand(io_context)), state_(state) 
@@ -170,4 +160,72 @@ asio::awaitable<std::vector<std::shared_ptr<PeerConnection>>> PeerManager::avail
     //     }
     // }
     co_return available_peers;
+}
+
+asio::awaitable<void> PeerManager::pex_loop() {
+    asio::steady_timer timer(io_context_);
+
+    while (true) {
+        std::string added = populate_added();
+        std::string dropped = populate_dropped();
+        
+        Dict pex_dict;
+        if (!added.empty()) {
+            pex_dict["added"] = Value(std::move(added));
+        }
+        if (!dropped.empty()) {
+            pex_dict["dropped"] = Value(std::move(dropped));
+        }
+
+        if (!pex_dict.empty()) {
+            auto encoded = encode(Value(std::move(pex_dict)));
+
+            for (const auto& conn : get_all_connections()) {
+                if (conn->supported_pex()) {
+                    uint8_t pex_id = static_cast<uint8_t>(ExtendedMessageType::ut_pex);
+                    co_await conn->send_extended_message(pex_id, encoded);
+                }
+            }
+        }
+        
+        timer.expires_after(std::chrono::minutes(1));
+        EC ec;
+        co_await timer.async_wait(asio::redirect_error(asio::use_awaitable, ec));
+
+        if (ec == asio::error::operation_aborted) {
+            LOGWARN("PEX loop aborted");
+            co_return;
+        }
+    }
+}
+
+std::string PeerManager::populate_added(size_t max_peers) {
+    std::string peers;
+    size_t added_peers = 0;
+    for (const auto& ep : known_pex_peers_) {
+        const auto ep_bytes = ep.address().to_v4().to_bytes();
+        peers.append(ep_bytes.begin(), ep_bytes.end());
+        uint16_t port = asio::detail::socket_ops::host_to_network_short(ep.port());
+        peers.append(reinterpret_cast<char *>(&port), 2);
+        ++added_peers;
+
+        if (added_peers > max_peers) {
+            break;
+        }
+    }
+    return peers;
+}
+
+std::string PeerManager::populate_dropped() {
+    std::string dropped;
+    while (!dropped_peers_.empty()) {
+        const auto& ep = dropped_peers_.front();
+        dropped_peers_.pop_front();
+        
+        const auto ep_bytes = ep.address().to_v4().to_bytes();
+        dropped.append(ep_bytes.begin(), ep_bytes.end());
+        uint16_t port = asio::detail::socket_ops::host_to_network_short(ep.port());
+        dropped.append(reinterpret_cast<char *>(&port), 2);
+    }
+    return dropped;
 }

@@ -1,12 +1,6 @@
 #include "PieceManager.hpp"
-#include <boost/asio/awaitable.hpp>
-#include <boost/asio/dispatch.hpp>
-#include <boost/asio/use_awaitable.hpp>
-#include <cstddef>
-#include <memory>
+
 #include <random>
-#include <ranges>
-#include <vector>
 
 PieceManager::PieceManager(asio::io_context& io_context, std::shared_ptr<SessionState> state)
     : io_context_(io_context), strand_(asio::make_strand(io_context)),

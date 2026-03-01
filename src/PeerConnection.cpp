@@ -1,14 +1,6 @@
 #include "PeerConnection.hpp"
 #include "Bencode.hpp"
-#include "Protocol.hpp"
-
-#include <boost/asio/awaitable.hpp>
-#include <boost/asio/dispatch.hpp>
-#include <boost/asio/strand.hpp>
-#include <boost/asio/use_awaitable.hpp>
-#include <cstdint>
-#include <exception>
-#include <memory>
+#include "Utils.hpp"
 
 asio::awaitable<std::shared_ptr<PeerConnection>> 
 PeerConnection::create(
@@ -306,4 +298,12 @@ asio::awaitable<void> PeerConnection::send_have(size_t index) {
     BufferWriter writer(have_msg);
     writer.write(asio::detail::socket_ops::host_to_network_long(static_cast<uint32_t>(index)));
     co_await socket_.send_message(have_msg);
+}
+
+asio::awaitable<void> PeerConnection::send_extended_message(uint8_t type_id, std::span<const std::byte> payload) {
+    std::vector<std::byte> msg_body;
+    msg_body.push_back(static_cast<std::byte>(MessageType::ExtendedMessage));
+    msg_body.push_back(static_cast<std::byte>(type_id));
+    msg_body.insert(msg_body.end(), payload.begin(), payload.end());
+    co_await socket_.send_message(msg_body);
 }

@@ -76,19 +76,32 @@ public:
     
     ExtendedMessageType extension_type(uint8_t index) const noexcept {
         std::lock_guard lock(mutex_);
-        if (!remote_extension_map_.count(index)) {
+        if (!remote_extension_.count(index)) {
             return ExtendedMessageType::UNKNOWN;
         }
-        return remote_extension_map_.at(index);
+        return remote_extension_.at(index);
     }
     void update_extension_type(uint8_t index, ExtendedMessageType type) noexcept {
         std::lock_guard lock(mutex_);
-        remote_extension_map_[index] = type;
+        remote_extension_[index] = type;
     }
     template<typename T>
     void bitfield(T&& other) {
         std::lock_guard lock(mutex_);
         bitfield_ = std::forward<T>(other);
+    }
+
+    bool supported_pex() noexcept {
+        std::call_once(pex_flag_, [self = shared_from_this()](){
+            for (const auto& [k, v] : self->remote_extension_) {
+                if (v == ExtendedMessageType::ut_pex) {
+                    self->supported_pex_ = true;
+                    return;
+                }
+            }
+            self->supported_pex_ = false;
+        });
+        return supported_pex_;
     }
 
     void close() noexcept { socket_.close(); }
@@ -99,6 +112,7 @@ public:
     asio::awaitable<void> send_bitfield(const std::vector<uint8_t>& bitfield_data);
     asio::awaitable<void> send_cancel(size_t index, uint32_t begin, uint32_t length);
     asio::awaitable<void> send_have(size_t index);
+    asio::awaitable<void> send_extended_message(uint8_t type_id, std::span<const std::byte> payload);
 
 private:
     PeerConnection(
@@ -121,12 +135,15 @@ private:
     std::shared_ptr<IPeerConnectionEvents> events_;
 
     std::vector<uint8_t> bitfield_;
-    std::map<uint8_t, ExtendedMessageType> remote_extension_map_;
+    std::map<uint8_t, ExtendedMessageType> remote_extension_;
 
     std::atomic_bool am_choking_{true};
     std::atomic_bool peer_is_choking_{true};
     std::atomic_bool am_interested_{false};
     std::atomic_bool peer_is_interested_{false};
+
+    std::once_flag pex_flag_;
+    bool supported_pex_;
 
     std::atomic_uint64_t bytes_downloaded_{0};
     std::atomic_uint64_t bytes_uploaded_{0};

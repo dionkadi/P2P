@@ -8,6 +8,7 @@
 #include "PeerManager.hpp"
 #include "IPeerEvents.hpp"
 #include "TrackerClient.hpp"
+#include "Utils.hpp"
 
 #include <boost/asio/any_io_executor.hpp>
 #include <boost/asio/strand.hpp>

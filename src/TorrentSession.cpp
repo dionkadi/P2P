@@ -1,21 +1,8 @@
 #include "TorrentSession.hpp"
-#include "Protocol.hpp"
+#include "Utils.hpp"
 
-#include <boost/asio/as_tuple.hpp>
-#include <boost/asio/awaitable.hpp>
-#include <boost/asio/co_spawn.hpp>
-#include <boost/asio/detached.hpp>
-#include <boost/asio/dispatch.hpp>
-#include <boost/asio/redirect_error.hpp>
-#include <boost/asio/use_awaitable.hpp>
+#include <algorithm>
 #include <boost/asio/experimental/awaitable_operators.hpp>
-#include <boost/system/detail/error_code.hpp>
-#include <cstddef>
-#include <cstdint>
-#include <exception>
-#include <memory>
-#include <random>
-#include <ranges>
 
 TorrentSession::TorrentSession(
     asio::io_context& io_context, 
@@ -217,6 +204,15 @@ asio::awaitable<void> TorrentSession::handle_new_connection(AsyncSocket socket, 
         }
     }
     peer_manager_->add_connection(conn->peer_id(), conn);
+
+    try {
+        auto [ip, port] = decode_address(peer_addr);
+        auto peer_ip = asio::ip::make_address_v4(ip);
+        EndPoint ep(peer_ip, port);
+        peer_manager_->add_known_peer(ep);
+    } catch (const std::exception& e) {
+        LOGWARN("Failed to add know peer {}: {}", peer_addr, e.what());
+    }
 
     std::vector<uint8_t> bitfield((state_->num_pieces() + 7) / 8, 0);
     std::string have_bitfield_str = state_->get_have_bitfield_str();
@@ -535,6 +531,15 @@ asio::awaitable<void> TorrentSession::on_disconnect(std::shared_ptr<PeerConnecti
         }
     }
 
+    try {
+        auto [ip, port] = decode_address(conn->peer_addr());
+        auto peer_ip = asio::ip::make_address_v4(ip);
+        EndPoint ep(peer_ip, port);
+        peer_manager_->drop_peer(ep);
+    } catch (const std::exception& e) {
+        LOGWARN("Failed to add dropped peer: {}", e.what());
+    }
+
     peer_manager_->remove_connection(conn->peer_id());
     piece_manager_->notify_one();
 }
@@ -562,6 +567,10 @@ asio::awaitable<void> TorrentSession::on_extended_message(std::shared_ptr<PeerCo
                     LOGDBG("\t{}", k);
                     uint8_t index = std::get<Integer>(v.get_variant());
                     conn->update_extension_type(index, to_extended_type(k));
+
+                    if (k == "ut_pex") {
+                        asio::co_spawn(io_context_, peer_manager_->pex_loop(), asio::detached);
+                    }
                 }
             }
 
@@ -574,7 +583,42 @@ asio::awaitable<void> TorrentSession::on_extended_message(std::shared_ptr<PeerCo
             break;
         }
         case ExtendedMessageType::ut_pex: {
-            LOGDBG("Unimplemented yet");
+            LOGDBG("Received PEX message");
+
+            auto decoded_payload = decode(extended_payload);
+            const auto *pex_dict = std::get_if<std::unique_ptr<Dict>>(&decoded_payload.get_variant());
+            if (!pex_dict) {
+                throw std::runtime_error("Invalid PEX message");
+            }
+
+            if (pex_dict->get()->count("added")) {
+                std::string added = std::get<std::string>(pex_dict->get()->at("added").get_variant());
+                for (size_t i = 0; i < added.size(); i += 6) {
+                    auto ip_bytes = asio::ip::address_v4::bytes_type();
+                    std::copy_n(added.begin() + i, 4, ip_bytes.begin());
+                    auto ip = asio::ip::make_address_v4(std::move(ip_bytes));
+                    uint16_t port_net = 0;
+                    std::copy_n(added.begin() + i + 4, 2, reinterpret_cast<unsigned char *>(&port_net));
+                    uint16_t port = asio::detail::socket_ops::network_to_host_short(port_net);
+                    EndPoint ep(ip, port);
+                    peer_manager_->add_known_peer(ep);
+                }
+            }
+
+            if (pex_dict->get()->count("dropped")) {
+                std::string dropped = std::get<std::string>(pex_dict->get()->at("dropped").get_variant());
+                for (size_t i = 0; i < dropped.size(); i += 6) {
+                    auto ip_bytes = asio::ip::address_v4::bytes_type();
+                    std::copy_n(dropped.begin() + i, 4, ip_bytes.begin());
+                    auto ip = asio::ip::make_address_v4(std::move(ip_bytes));
+                    uint16_t port_net = 0;
+                    std::copy_n(dropped.begin() + i + 4, 2, reinterpret_cast<unsigned char *>(&port_net));
+                    uint16_t port = asio::detail::socket_ops::network_to_host_short(port_net);
+                    EndPoint ep(ip, port);
+                    peer_manager_->drop_peer(ep);
+                }
+            }
+
             break;
         }
         case ExtendedMessageType::ut_metadata: {

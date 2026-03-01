@@ -7,7 +7,6 @@
 #include <boost/asio.hpp>
 
 #include "SessionState.hpp"
-#include "ThreadPool.hpp"
 #include "Types.hpp"
 
 namespace asio = boost::asio;

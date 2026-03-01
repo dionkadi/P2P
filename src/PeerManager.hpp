@@ -4,6 +4,7 @@
 #include <boost/asio/io_context.hpp>
 #include <cstddef>
 #include <map>
+#include <unordered_set>
 #include <memory>
 #include <mutex>
 
@@ -74,6 +75,21 @@ public:
     asio::awaitable<void> choke_loop();
     asio::awaitable<void> send_have_message_to_all(size_t piece_index);
 
+    asio::awaitable<void> pex_loop();
+
+    void add_known_peer(const EndPoint& ep) {
+        std::lock_guard lock(peer_mutex_);
+        known_pex_peers_.insert(ep);
+    }
+    void remove_known_peer(const EndPoint& ep) {
+        std::lock_guard lock(peer_mutex_);
+        known_pex_peers_.erase(ep);
+    }
+    void drop_peer(const EndPoint& ep) {
+        std::lock_guard lock(peer_mutex_);
+        dropped_peers_.push_back(ep);
+    }
+
     asio::awaitable<std::optional<AsyncSocket>> connect_to_peer(const std::string& peer_addr);
     asio::awaitable<std::vector<std::shared_ptr<PeerConnection>>> available_peers(size_t piece_index) const;
 
@@ -82,6 +98,12 @@ private:
     asio::strand<asio::any_io_executor> strand_;
     std::map<PeerId, std::shared_ptr<PeerConnection>> active_connections_;
     std::shared_ptr<SessionState> state_;
+    std::unordered_set<EndPoint> known_pex_peers_;
+    std::deque<EndPoint> dropped_peers_;
     size_t choke_loop_counter_{0};
     mutable std::mutex mutex_;
+    mutable std::mutex peer_mutex_;
+
+    std::string populate_added(size_t max_peers = 50);
+    std::string populate_dropped();
 };

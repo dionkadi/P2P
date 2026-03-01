@@ -1,24 +1,5 @@
 #include "FileManager.hpp"
-#include <algorithm>
-#include <boost/asio/async_result.hpp>
-#include <boost/asio/steady_timer.hpp>
-#include <boost/asio/this_coro.hpp>
-#include <boost/asio/use_awaitable.hpp>
-#include <boost/system/detail/error_code.hpp>
 #include <boost/asio/experimental/awaitable_operators.hpp>
-#include <cassert>
-#include <cstddef>
-#include <cstdint>
-#include <cstdio>
-#include <exception>
-#include <filesystem>
-#include <fstream>
-#include <ios>
-#include <memory>
-#include <mutex>
-#include <optional>
-#include <system_error>
-#include <vector>
 
 FileManager::FileManager(std::shared_ptr<SessionState> state)
     : state_(state),

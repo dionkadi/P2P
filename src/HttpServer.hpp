@@ -1,7 +1,7 @@
 // Http/HttpServer.hpp
 #pragma once
 
-#include "Logger.hpp"
+#include "Utils.hpp"
 
 #include <boost/beast/core.hpp>
 #include <boost/beast/http.hpp>
