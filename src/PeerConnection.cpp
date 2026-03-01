@@ -47,7 +47,8 @@ PeerConnection::PeerConnection(
     socket_(std::move(socket)),
     peer_addr_(std::move(peer_addr)),
     state_(std::move(state)),
-    events_(std::move(events))
+    events_(std::move(events)),
+    supported_pex_(false)
 {}
 
 asio::awaitable<bool> PeerConnection::perform_handshake(const PeerId& my_id) {

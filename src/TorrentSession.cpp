@@ -209,7 +209,7 @@ asio::awaitable<void> TorrentSession::handle_new_connection(AsyncSocket socket, 
         auto [ip, port] = decode_address(peer_addr);
         auto peer_ip = asio::ip::make_address_v4(ip);
         EndPoint ep(peer_ip, port);
-        peer_manager_->add_known_peer(ep);
+        peer_manager_->add_active_peer(ep);
     } catch (const std::exception& e) {
         LOGWARN("Failed to add know peer {}: {}", peer_addr, e.what());
     }
@@ -303,6 +303,25 @@ asio::awaitable<void> TorrentSession::tracker_announce_loop() {
             co_return; // Likely during shutdown
         }
     }
+}
+
+asio::awaitable<void> TorrentSession::discovered_peers_loop() {
+    for (const auto& ep : peer_manager_->get_discovered_peers()) {
+        std::string addr = std::format("{}:{}", ep.address().to_string(), ep.port());
+        bool already_connected = peer_manager_->contains_peer_addr(addr);
+        if (!already_connected) {
+            asio::co_spawn(io_context_, 
+                [addr, this] () -> asio::awaitable<void> {
+                    auto socket = co_await peer_manager_->connect_to_peer(addr);
+                    if (socket) {
+                        co_await handle_new_connection(std::move(*socket), addr);
+                    }
+                }, 
+                asio::detached
+            );
+        }
+    }
+    co_return ;
 }
 
 asio::awaitable<void> TorrentSession::periodically_save() {
@@ -535,7 +554,8 @@ asio::awaitable<void> TorrentSession::on_disconnect(std::shared_ptr<PeerConnecti
         auto [ip, port] = decode_address(conn->peer_addr());
         auto peer_ip = asio::ip::make_address_v4(ip);
         EndPoint ep(peer_ip, port);
-        peer_manager_->drop_peer(ep);
+        peer_manager_->add_dropped_peer(ep);
+        peer_manager_->remove_active_peer(ep);
     } catch (const std::exception& e) {
         LOGWARN("Failed to add dropped peer: {}", e.what());
     }
@@ -570,6 +590,7 @@ asio::awaitable<void> TorrentSession::on_extended_message(std::shared_ptr<PeerCo
 
                     if (k == "ut_pex") {
                         asio::co_spawn(io_context_, peer_manager_->pex_loop(), asio::detached);
+                        asio::co_spawn(io_context_, discovered_peers_loop(), asio::detached);
                     }
                 }
             }
@@ -601,7 +622,7 @@ asio::awaitable<void> TorrentSession::on_extended_message(std::shared_ptr<PeerCo
                     std::copy_n(added.begin() + i + 4, 2, reinterpret_cast<unsigned char *>(&port_net));
                     uint16_t port = asio::detail::socket_ops::network_to_host_short(port_net);
                     EndPoint ep(ip, port);
-                    peer_manager_->add_known_peer(ep);
+                    peer_manager_->add_discovered_peer(ep);
                 }
             }
 
@@ -615,7 +636,8 @@ asio::awaitable<void> TorrentSession::on_extended_message(std::shared_ptr<PeerCo
                     std::copy_n(dropped.begin() + i + 4, 2, reinterpret_cast<unsigned char *>(&port_net));
                     uint16_t port = asio::detail::socket_ops::network_to_host_short(port_net);
                     EndPoint ep(ip, port);
-                    peer_manager_->drop_peer(ep);
+                    peer_manager_->add_dropped_peer(ep);
+                    peer_manager_->remove_discovered_peer(ep);
                 }
             }
 

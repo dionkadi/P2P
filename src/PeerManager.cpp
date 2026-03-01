@@ -4,7 +4,7 @@
 #include <random>
 
 PeerManager::PeerManager(asio::io_context& io_context, std::shared_ptr<SessionState> state) noexcept
-    : io_context_(io_context), strand_(asio::make_strand(io_context)), state_(state) 
+    : io_context_(io_context), strand_(asio::make_strand(io_context)), state_(state)
 {}
 
 asio::awaitable<std::optional<AsyncSocket>> PeerManager::connect_to_peer(const std::string& peer_addr) {
@@ -202,7 +202,7 @@ asio::awaitable<void> PeerManager::pex_loop() {
 std::string PeerManager::populate_added(size_t max_peers) {
     std::string peers;
     size_t added_peers = 0;
-    for (const auto& ep : known_pex_peers_) {
+    for (const auto& ep : active_peers_) {
         const auto ep_bytes = ep.address().to_v4().to_bytes();
         peers.append(ep_bytes.begin(), ep_bytes.end());
         uint16_t port = asio::detail::socket_ops::host_to_network_short(ep.port());

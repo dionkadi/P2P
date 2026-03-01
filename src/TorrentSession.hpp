@@ -53,6 +53,7 @@ private:
     asio::awaitable<void> save_session_state();
 
     asio::awaitable<void> tracker_announce_loop();
+    asio::awaitable<void> discovered_peers_loop();
     asio::awaitable<void> handle_new_connection(AsyncSocket socket, std::string peer_addr);
     asio::awaitable<void> periodically_save();
 

@@ -77,17 +77,30 @@ public:
 
     asio::awaitable<void> pex_loop();
 
-    void add_known_peer(const EndPoint& ep) {
-        std::lock_guard lock(peer_mutex_);
-        known_pex_peers_.insert(ep);
+    void add_active_peer(const EndPoint& ep) {
+        std::lock_guard lock(active_mutex_);
+        active_peers_.insert(ep);
     }
-    void remove_known_peer(const EndPoint& ep) {
-        std::lock_guard lock(peer_mutex_);
-        known_pex_peers_.erase(ep);
+    void add_discovered_peer(const EndPoint& ep) {
+        std::lock_guard lock(discovered_mutex_);
+        discovered_peers_.insert(ep);
     }
-    void drop_peer(const EndPoint& ep) {
-        std::lock_guard lock(peer_mutex_);
+    void remove_active_peer(const EndPoint& ep) {
+        std::lock_guard lock(active_mutex_);
+        active_peers_.erase(ep);
+    }
+    void remove_discovered_peer(const EndPoint& ep) {
+        std::lock_guard lock(discovered_mutex_);
+        discovered_peers_.erase(ep);
+    }
+    void add_dropped_peer(const EndPoint& ep) {
+        std::lock_guard lock(dropped_mutex_);
         dropped_peers_.push_back(ep);
+    }
+
+    std::unordered_set<EndPoint> get_discovered_peers() const {
+        std::lock_guard lock(discovered_mutex_);
+        return discovered_peers_;
     }
 
     asio::awaitable<std::optional<AsyncSocket>> connect_to_peer(const std::string& peer_addr);
@@ -98,11 +111,14 @@ private:
     asio::strand<asio::any_io_executor> strand_;
     std::map<PeerId, std::shared_ptr<PeerConnection>> active_connections_;
     std::shared_ptr<SessionState> state_;
-    std::unordered_set<EndPoint> known_pex_peers_;
+    std::unordered_set<EndPoint> active_peers_;
+    std::unordered_set<EndPoint> discovered_peers_;
     std::deque<EndPoint> dropped_peers_;
     size_t choke_loop_counter_{0};
     mutable std::mutex mutex_;
-    mutable std::mutex peer_mutex_;
+    mutable std::mutex active_mutex_;
+    mutable std::mutex discovered_mutex_;
+    mutable std::mutex dropped_mutex_;
 
     std::string populate_added(size_t max_peers = 50);
     std::string populate_dropped();

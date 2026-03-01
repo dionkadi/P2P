@@ -358,3 +358,11 @@ struct PiecePayload {
     uint32_t begin;
     std::string block;
 };
+
+struct EndpointHash {
+    std::size_t operator()(const EndPoint& ep) const noexcept {
+        std::size_t h1 = std::hash<std::string>{}(ep.address().to_string());
+        std::size_t h2 = std::hash<unsigned short>{}(ep.port());
+        return h1 ^ (h2 << 1);
+    }
+};
