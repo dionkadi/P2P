@@ -23,9 +23,9 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 find_package(Threads REQUIRED)
 find_package(Boost REQUIRED COMPONENTS url)
 find_package(GTest REQUIRED)
+find_package(OpenSSL REQUIRED)
 
 add_subdirectory(third_party/json)
-add_subdirectory(third_party/picosha2)
 add_subdirectory(third_party/spdlog)
 
 add_library(p2p_common
@@ -38,7 +38,6 @@ add_library(p2p_common
 )
 
 target_include_directories(p2p_common PUBLIC
-    third_party/picosha2/
     third_party/json/include/nlohmann
     third_party/spdlog/include/spdlog
 )
@@ -46,9 +45,10 @@ target_include_directories(p2p_common PUBLIC
 target_link_libraries(p2p_common PUBLIC
     spdlog
     Threads::Threads
-    picosha2
     Boost::headers
     Boost::url
+    OpenSSL::SSL
+    OpenSSL::Crypto
 )
 
 add_executable(tracker src/main_tracker.cpp)
@@ -57,27 +57,25 @@ add_executable(client src/main_client.cpp)
 target_link_libraries(tracker PRIVATE p2p_common)
 target_link_libraries(client PRIVATE p2p_common)
 
-# add_executable(p2p_test
-#     test/bencode_test.cpp
-#     test/buffer_test.cpp
-#     test/crypto_test.cpp
-#     test/protocol_test.cpp
-#     test/torrentfile_test.cpp
-#     test/sessionstate_test.cpp
-#     test/asyncratelimiter_test.cpp
-#     test/filemanager_test.cpp
-#     # Add other test files as you write them
-# )
+add_executable(p2p_test
+    test/bencode_test.cpp
+    test/buffer_test.cpp
+    test/crypto_test.cpp
+    test/protocol_test.cpp
+    test/torrentfile_test.cpp
+    test/sessionstate_test.cpp
+    test/asyncratelimiter_test.cpp
+    test/filemanager_test.cpp
+)
 
-# target_include_directories(p2p_test
-#   PUBLIC
-#     src
-# )
+target_include_directories(p2p_test PUBLIC
+    src
+)
 
-# target_link_libraries(p2p_test
-#   PRIVATE
-#     p2p_common
-#     GTest::gtest
-#     GTest::gtest_main
-#     Boost::headers    
-# )
+target_link_libraries(p2p_test
+  PRIVATE
+    p2p_common
+    GTest::gtest
+    GTest::gtest_main
+    Boost::headers    
+)
