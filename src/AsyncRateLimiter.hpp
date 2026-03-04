@@ -27,6 +27,15 @@ public:
         }
     }
 
+    ~AsyncRateLimiter() {
+        for (auto& [amount, handler] : waiters_) {
+            asio::post(strand_, [h = std::move(handler)]() mutable {
+                h(boost::asio::error::operation_aborted);
+            });
+        }
+        waiters_.clear();
+    }
+
     asio::awaitable<void> await_tokens(size_t amount) {
         if (rate_bytes_per_second_ == 0) {
             co_return;  // If rate limiting is disabled, complete immediately.

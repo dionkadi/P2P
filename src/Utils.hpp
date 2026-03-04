@@ -1,7 +1,9 @@
 #pragma once
 
 #include <array>
+#include <chrono>
 #include <cstddef>
+#include <functional>
 #include <stdexcept>
 #include <string>
 #include <span>
@@ -11,6 +13,7 @@
 #include <mutex>
 #include <fstream>
 #include <queue>
+#include <system_error>
 #include <thread>
 #include <condition_variable>
 
@@ -399,3 +402,28 @@ class ThreadPool {
     std::mutex mutex_;
     std::condition_variable condition_;
 };
+
+// // ----------- TEMPDIR ------------
+// class TempDir {
+// public:
+//     TempDir(std::string name = std::to_string(std::hash<long>()(std::chrono::steady_clock::now().time_since_epoch().count()))) {
+//         temp_dir_ = std::filesystem::temp_directory_path();
+//         temp_dir_ /= name;
+//         std::error_code ec;
+//         std::filesystem::create_directories(temp_dir_, ec);
+//     }
+
+//     ~TempDir() {
+//         if (std::filesystem::exists(temp_dir_)) {
+//             std::error_code ec;
+//             std::filesystem::remove_all(temp_dir_, ec);
+//         }
+//     }
+
+//     std::filesystem::path operator*() {
+//         return temp_dir_;
+//     }
+
+// private:
+//     std::filesystem::path temp_dir_;
+// };

@@ -41,10 +41,6 @@ inline void gather_files(const std::filesystem::path& base_path, const std::file
 }
 
 inline bool MetaInfo::load_from_file(const std::string& file_path, std::vector<std::vector<std::string>>& out_tracker_tiers) {
-    if (info_.pieces.size() % 20 != 0) {
-        throw std::runtime_error("Invalid pieces length in torrent file.");
-    }
-
     std::ifstream f(file_path);
     if (!f) {
         LOGERR("Could not open torrent file: {}", file_path);
@@ -109,6 +105,10 @@ inline bool MetaInfo::load_from_file(const std::string& file_path, std::vector<s
         const auto& pieces_str = std::get<String>(info_dict.at("pieces").get_variant());
         info_.pieces.assign(reinterpret_cast<const std::byte*>(pieces_str.data()), 
                             reinterpret_cast<const std::byte*>(pieces_str.data()) + pieces_str.size());
+
+        if (info_.pieces.size() % 20 != 0) {
+            throw std::runtime_error("Invalid pieces length in torrent file.");
+        }
 
         if (info_dict.count("length")) {
             info_.total_size = std::get<Integer>(info_dict.at("length").get_variant());
@@ -202,7 +202,7 @@ inline bool MetaInfo::create_from_file(const std::filesystem::path& source_path,
     }
 
     if (buffer_fill > 0) {
-        auto hash = Crypto::calculate_sha1_hash_data(piece_buffer);
+        auto hash = Crypto::calculate_sha1_hash_data({piece_buffer.data(), buffer_fill});
         all_piece_hashes.insert(all_piece_hashes.end(), hash.begin(), hash.end());
     }
 
