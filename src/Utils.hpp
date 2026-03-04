@@ -9,6 +9,7 @@
 #include <memory>
 #include <filesystem>
 #include <mutex>
+#include <fstream>
 #include <queue>
 #include <thread>
 #include <condition_variable>
@@ -17,8 +18,8 @@
 #include "spdlog/sinks/stdout_color_sinks.h"
 #include "spdlog/sinks/rotating_file_sink.h"
 
-#include "picosha2.h"
-#include "sha1.hpp"
+#include <openssl/evp.h>
+#include <openssl/sha.h>
 
 // -------------- HELPERS ---------------
 inline std::pair<std::string, uint16_t> decode_address(const std::string& addr) {
@@ -99,13 +100,22 @@ public:
 
     size_t remaining() const noexcept { return view_.size(); }
     bool empty() const noexcept { return view_.empty(); }
-
-private:
+    
+    private:
     std::span<const std::byte> view_;
 };
 
 // ---------- CRYPTO -----------
 namespace Crypto {
+    
+inline std::string bytes_to_hex(std::span<const std::byte> data) {
+    std::stringstream ss;
+    ss << std::hex << std::setfill('0');
+    for (const auto& byte : data) {
+        ss << std::setw(2) << static_cast<unsigned int>(byte);
+    }
+    return ss.str();
+}
 
 inline std::string calculate_file_hash(const std::string& file_path) {
     std::ifstream file(file_path, std::ios::binary);
@@ -113,26 +123,52 @@ inline std::string calculate_file_hash(const std::string& file_path) {
         throw std::runtime_error(std::format("Failed to open file for hashing: {}", file_path));
     }
 
-    picosha2::hash256_one_by_one hasher;
-    std::vector<std::byte> buffer(4096);
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    if (!ctx) {
+        throw std::runtime_error("EVP_MD_CTX_new failed");
+    }
+    if (EVP_DigestInit_ex(ctx, EVP_sha256(), nullptr) != 1) {
+        EVP_MD_CTX_free(ctx);
+        throw std::runtime_error("EVP_DigestInit_ex failed");
+    }
 
+    std::array<std::byte, 4096> buffer;
     while (file) {
         file.read(reinterpret_cast<char*>(buffer.data()), buffer.size());
         std::streamsize bytes_read = file.gcount();
         if (bytes_read > 0) {
-            hasher.process(reinterpret_cast<const unsigned char*>(buffer.data()), 
-                            reinterpret_cast<const unsigned char*>(buffer.data()) + bytes_read);
+            if (EVP_DigestUpdate(ctx, buffer.data(), static_cast<size_t>(bytes_read)) != 1) {
+                EVP_MD_CTX_free(ctx);
+                throw std::runtime_error("EVP_DigestUpdate failed");
+            }
         }
     }
 
-    hasher.finish();
-    return picosha2::get_hash_hex_string(hasher);
+    unsigned char hash[EVP_MAX_MD_SIZE];
+    unsigned int hash_len = 0;
+
+    if (EVP_DigestFinal_ex(ctx, hash, &hash_len) != 1) {
+        EVP_MD_CTX_free(ctx);
+        throw std::runtime_error("EVP_DigestFinal_ex failed");
+    }
+
+    EVP_MD_CTX_free(ctx);
+
+    std::vector<std::byte> result(hash_len);
+    std::memcpy(result.data(), hash, hash_len);
+    return bytes_to_hex(result);
 }
 
 inline std::string calculate_data_hash(std::span<const std::byte> data) {
-    auto char_data_begin = reinterpret_cast<const unsigned char*>(data.data());
-    auto char_data_end = char_data_begin + data.size();
-    return picosha2::hash256_hex_string(char_data_begin, char_data_end);
+    unsigned char hash[EVP_MAX_MD_SIZE];
+    unsigned int hash_len = 0;
+    if (EVP_Digest(data.data(), data.size(), hash, &hash_len, EVP_sha256(), nullptr) != 1) {
+        throw std::runtime_error("EVP_Digest failed");
+    }
+
+    std::vector<std::byte> result(hash_len);
+    std::memcpy(result.data(), hash, hash_len);
+    return bytes_to_hex(result);
 }
 
 inline std::string calculate_string_hash(const std::string& str) {
@@ -148,10 +184,15 @@ inline std::vector<std::byte> hex_to_bytes(const std::string &hex) {
     bytes.reserve(hex.length() / 2);
     for (size_t i = 0; i < hex.length(); i += 2) {
         std::string_view byte_string_view(hex.data() + i, 2);
-        int value;
-        auto [ptr, ec] = std::from_chars(byte_string_view.data(), byte_string_view.data() + byte_string_view.size(), value, 16);
+        unsigned int value;
+        auto [ptr, ec] = std::from_chars(
+            hex.data() + i,
+            hex.data() + i + 2,
+            value,
+            16
+        );
         
-        if (ec != std::errc() || ptr != byte_string_view.data() + byte_string_view.size()) {
+        if (ec != std::errc() || ptr != hex.data() + i + 2) {
             throw std::invalid_argument("Invalid hex character sequence.");
         }
         bytes.push_back(static_cast<std::byte>(value));
@@ -159,19 +200,16 @@ inline std::vector<std::byte> hex_to_bytes(const std::string &hex) {
     return bytes;
 }
 
-inline std::string bytes_to_hex(std::span<const std::byte> data) {
-    std::stringstream ss;
-    ss << std::hex << std::setfill('0');
-    for (const auto& byte : data) {
-        ss << std::setw(2) << static_cast<unsigned int>(byte);
-    }
-    return ss.str();
-}
 
 inline std::vector<std::byte> calculate_sha1_hash_data(std::span<const std::byte> data) {
-    SHA1 checksum;
-    checksum.update(std::string(reinterpret_cast<const char*>(data.data()), data.size()));
-    return hex_to_bytes(checksum.final());
+    unsigned char hash[SHA_DIGEST_LENGTH];
+    if (!(SHA1(reinterpret_cast<const unsigned char*>(data.data()), data.size(), hash))) {
+        throw std::runtime_error("SHA1 failed");
+    }
+
+    std::vector<std::byte> result(SHA_DIGEST_LENGTH);
+    std::memcpy(result.data(), hash, SHA_DIGEST_LENGTH);
+    return result;
 }
 
 inline std::vector<std::byte> calculate_sha1_hash_file(const std::string& file_path) {
@@ -180,14 +218,40 @@ inline std::vector<std::byte> calculate_sha1_hash_file(const std::string& file_p
         throw std::runtime_error(std::format("Failed to open file for SHA1 hashing: {}", file_path));
     }
     
-    SHA1 checksum;
-    std::array<char, 4096> buffer;
-    while (file) {
-        file.read(buffer.data(), buffer.size());
-        checksum.update(std::string(buffer.data(), file.gcount()));
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    if (!ctx) {
+        throw std::runtime_error("EVP_MD_CTX_new failed");
     }
- 
-    return hex_to_bytes(checksum.final());
+    if (EVP_DigestInit_ex(ctx, EVP_sha1(), nullptr) != 1) {
+        EVP_MD_CTX_free(ctx);
+        throw std::runtime_error("EVP_DigestInit_ex failed");
+    }
+
+    std::array<std::byte, 4096> buffer;
+    while (file) {
+        file.read(reinterpret_cast<char*>(buffer.data()), buffer.size());
+        std::streamsize bytes_read = file.gcount();
+        if (bytes_read > 0) {
+            if (EVP_DigestUpdate(ctx, buffer.data(), static_cast<size_t>(bytes_read)) != 1) {
+                EVP_MD_CTX_free(ctx);
+                throw std::runtime_error("EVP_DigestUpdate failed");
+            }
+        }
+    }
+
+    unsigned char hash[EVP_MAX_MD_SIZE];
+    unsigned int hash_len = 0;
+
+    if (EVP_DigestFinal_ex(ctx, hash, &hash_len) != 1) {
+        EVP_MD_CTX_free(ctx);
+        throw std::runtime_error("EVP_DigestFinal_ex failed");
+    }
+
+    EVP_MD_CTX_free(ctx);
+
+    std::vector<std::byte> result(hash_len);
+    std::memcpy(result.data(), hash, hash_len);
+    return result;
 }
 
 } // namespace Crypto
