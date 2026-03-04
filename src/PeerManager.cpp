@@ -3,8 +3,8 @@
 
 #include <random>
 
-PeerManager::PeerManager(asio::io_context& io_context, std::shared_ptr<SessionState> state) noexcept
-    : io_context_(io_context), strand_(asio::make_strand(io_context)), state_(state)
+PeerManager::PeerManager(asio::io_context& io_context, std::shared_ptr<SessionState> state, std::chrono::seconds choke_interval) noexcept
+    : io_context_(io_context), strand_(asio::make_strand(io_context)), state_(state), choke_interval_(choke_interval)
 {}
 
 asio::awaitable<std::optional<AsyncSocket>> PeerManager::connect_to_peer(const std::string& peer_addr) {
@@ -42,7 +42,7 @@ asio::awaitable<void> PeerManager::choke_loop() {
 
     std::shared_ptr<PeerConnection> optimistically_unchoked_peer = nullptr;
     while (!state_->is_download_complete()) {
-        timer.expires_after(std::chrono::seconds(10));
+        timer.expires_after(choke_interval_);
         co_await timer.async_wait(asio::use_awaitable);
 
         co_await asio::dispatch(strand_, asio::use_awaitable);

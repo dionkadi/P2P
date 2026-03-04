@@ -11,29 +11,7 @@
 #include <filesystem>
 #include <iostream>
 #include <memory>
-#include <random>
 #include <string>
-
-static constexpr std::string_view PEER_ID_PREFIX = "-MI0001-"; // 8 bytes
-static constexpr std::string_view ALPHANUM = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-
-PeerId generate_peer_id() {
-    static std::mt19937 rng = []{
-        std::random_device rd;
-        return std::mt19937(rd());
-    }();
-
-    std::uniform_int_distribution<size_t> distrib(0, ALPHANUM.size() - 1);
-
-    PeerId peer_id{};
-    std::transform(PEER_ID_PREFIX.begin(), PEER_ID_PREFIX.end(), peer_id.begin(), 
-        [](char c) { return static_cast<std::byte>(c); });
-    // Fill the remaining 12 bytes with random characters
-    for (size_t i = PEER_ID_PREFIX.size(); i < peer_id.size(); ++i) {
-        peer_id[i] = static_cast<std::byte>(ALPHANUM[distrib(rng)]);
-    }
-    return peer_id;
-}
 
 std::vector<std::string> split(const std::string& s, char delimiter) {
     std::vector<std::string> tokens;

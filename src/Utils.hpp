@@ -15,7 +15,10 @@
 #include <queue>
 #include <system_error>
 #include <thread>
+#include <random>
 #include <condition_variable>
+#include <chrono>
+using namespace std::chrono_literals;
 
 #include <spdlog/spdlog.h>
 #include "spdlog/sinks/stdout_color_sinks.h"
@@ -41,6 +44,27 @@ inline std::pair<std::string, uint16_t> decode_address(const std::string& addr) 
     }
 
     return {ip, port};
+}
+
+static constexpr std::string_view PEER_ID_PREFIX = "-MI0001-"; // 8 bytes
+static constexpr std::string_view ALPHANUM = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+inline std::array<std::byte, 20> generate_peer_id() {
+    static std::mt19937 rng = []{
+        std::random_device rd;
+        return std::mt19937(rd());
+    }();
+
+    std::uniform_int_distribution<size_t> distrib(0, ALPHANUM.size() - 1);
+
+    std::array<std::byte, 20> peer_id{};
+    std::transform(PEER_ID_PREFIX.begin(), PEER_ID_PREFIX.end(), peer_id.begin(), 
+        [](char c) { return static_cast<std::byte>(c); });
+    // Fill the remaining 12 bytes with random characters
+    for (size_t i = PEER_ID_PREFIX.size(); i < peer_id.size(); ++i) {
+        peer_id[i] = static_cast<std::byte>(ALPHANUM[distrib(rng)]);
+    }
+    return peer_id;
 }
 
 // ----------- BUFFER --------------
@@ -403,27 +427,31 @@ class ThreadPool {
     std::condition_variable condition_;
 };
 
-// // ----------- TEMPDIR ------------
-// class TempDir {
-// public:
-//     TempDir(std::string name = std::to_string(std::hash<long>()(std::chrono::steady_clock::now().time_since_epoch().count()))) {
-//         temp_dir_ = std::filesystem::temp_directory_path();
-//         temp_dir_ /= name;
-//         std::error_code ec;
-//         std::filesystem::create_directories(temp_dir_, ec);
-//     }
+// ----------- TEMPDIR ------------
+class TempDir {
+public:
+    TempDir(std::string name = std::to_string(std::hash<long>()(std::chrono::steady_clock::now().time_since_epoch().count()))) {
+        temp_dir_ = std::filesystem::temp_directory_path();
+        temp_dir_ /= name;
+        std::error_code ec;
+        std::filesystem::remove_all(temp_dir_, ec);
+        std::filesystem::create_directories(temp_dir_, ec);
+    }
 
-//     ~TempDir() {
-//         if (std::filesystem::exists(temp_dir_)) {
-//             std::error_code ec;
-//             std::filesystem::remove_all(temp_dir_, ec);
-//         }
-//     }
+    ~TempDir() {
+        if (std::filesystem::exists(temp_dir_)) {
+            std::error_code ec;
+            std::filesystem::remove_all(temp_dir_, ec);
+        }
+    }
 
-//     std::filesystem::path operator*() {
-//         return temp_dir_;
-//     }
+    std::filesystem::path operator*() {
+        return temp_dir_;
+    }
 
-// private:
-//     std::filesystem::path temp_dir_;
-// };
+    TempDir(const TempDir&) = delete;
+    TempDir& operator=(const TempDir&) = delete;
+
+private:
+    std::filesystem::path temp_dir_;
+};

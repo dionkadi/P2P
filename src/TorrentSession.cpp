@@ -230,12 +230,17 @@ asio::awaitable<void> TorrentSession::tracker_announce_loop() {
     std::mt19937 g(rd());
 
     while (true) {
-        if (state_->is_download_complete() && mode_ != Mode::Seed) {
+        bool is_completed = state_->is_download_complete();
+        if (is_completed) {
+            on_complete_();
+        }
+
+        if (is_completed && mode_ != Mode::Seed) {
             LOGINFO("Download complete. Stopping tracker announcements.");
             co_return;
         }
 
-        if (state_->is_download_complete() && !completed_event_sent && mode_ != Mode::Seed) {
+        if (is_completed && !completed_event_sent && mode_ != Mode::Seed) {
             event = "completed";
             completed_event_sent = true;
         }
@@ -250,7 +255,7 @@ asio::awaitable<void> TorrentSession::tracker_announce_loop() {
             .left = state_->torrent_info().total_size - (state_->completed_pieces() * state_->torrent_info().piece_size), // Adjust for last piece
         };
 
-        int interval = 1800;
+        int interval = tracker_announce_interval_.count();
         bool announce_successful = false;
         co_await asio::dispatch(strand_, asio::use_awaitable);
         for (auto& tier : tracker_clients_by_tier_) {

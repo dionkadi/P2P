@@ -13,6 +13,7 @@
 #include <boost/asio/any_io_executor.hpp>
 #include <boost/asio/strand.hpp>
 #include <cstdint>
+#include <functional>
 #include <memory>
 
 class TorrentSession : public IPeerConnectionEvents, public std::enable_shared_from_this<TorrentSession> {
@@ -33,6 +34,9 @@ public:
 
     asio::awaitable<void> run();
     asio::awaitable<void> stop();
+
+    void set_on_complete(std::function<void()> cb) { on_complete_ = std::move(cb); }
+    void set_tracker_announce_interval(std::chrono::seconds interval) { tracker_announce_interval_ = interval; }
 
     // IPeerConnectionEvents implementation
     asio::awaitable<void> on_piece_block(std::shared_ptr<PeerConnection> conn, size_t piece_index, uint32_t begin, std::span<const std::byte> block_data) override;
@@ -76,4 +80,6 @@ private:
     AsyncRateLimiter<> download_limiter_;
     std::atomic<bool> shutting_down_{false};
     asio::steady_timer completion_timer_;
+    std::function<void()> on_complete_;
+    std::chrono::seconds tracker_announce_interval_;
 };
