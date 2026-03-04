@@ -204,9 +204,11 @@ TEST_F(TorrentFileTest, CreateSingleFileTorrent) {
 }
 
 TEST_F(TorrentFileTest, CreateMultiFileTorrent) {
-    create_data_file("multi_file_content_1", data_dir / "fileA.txt"); // 18 bytes
+    create_data_file("multi_file_content_1", data_dir / "fileA.txt");
     create_data_file("multi_file_content_2_longer", data_dir / "subfolder" / "fileB.txt"); // 25 bytes
-    uint64_t total_expected_size = 18 + 25; // 43 bytes
+    auto size1 = std::filesystem::file_size(data_dir / "fileA.txt");
+    auto size2 = std::filesystem::file_size(data_dir / "subfolder" / "fileB.txt");
+    uint64_t total_expected_size = size1 + size2;
 
     std::vector<std::string> tracker_urls = {"http://create.multi.tracker.com/announce"};
     uint32_t piece_size = 10; // Small piece size for hashing demo
@@ -223,9 +225,9 @@ TEST_F(TorrentFileTest, CreateMultiFileTorrent) {
     EXPECT_EQ(info.piece_size, piece_size);
     ASSERT_EQ(info.files.size(), 2);
     EXPECT_EQ(info.files[0].path.string(), "fileA.txt");
-    EXPECT_EQ(info.files[0].size, 18);
+    EXPECT_EQ(info.files[0].size, size1);
     EXPECT_EQ(info.files[1].path.string(), "subfolder/fileB.txt");
-    EXPECT_EQ(info.files[1].size, 25);
+    EXPECT_EQ(info.files[1].size, size2);
 
     // Manual hash verification for a small multi-file case:
     std::string full_content = "multi_file_content_1multi_file_content_2_longer"; // 43 bytes

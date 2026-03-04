@@ -91,19 +91,6 @@ inline void create_random_file(const fs::path& path, size_t size) {
     }
 }
 
-// Compute SHA1 hash of a file (same as Torrent creation)
-inline std::vector<std::byte> hash_file(const fs::path& path) {
-    return Crypto::calculate_sha1_hash_file(path.string());
-}
-
-// Create a torrent file from a single file
-inline void create_torrent(const fs::path& source_file,
-                           const fs::path& torrent_file,
-                           const std::vector<std::string>& trackers,
-                           uint32_t piece_size = 16384) {
-    MetaInfo::create_from_file(source_file, torrent_file, trackers, piece_size);
-}
-
 // Simple tracker that can be run in a separate thread
 class TestTracker {
 public:

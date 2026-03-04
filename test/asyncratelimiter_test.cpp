@@ -103,14 +103,14 @@ TEST(AsyncRateLimiterTest, MultipleConcurrentRequests) {
 TEST(AsyncRateLimiterTest, Cancellation) {
     asio::io_context io_context;
     bool operation_cancelled = false;
-    
+
+    auto limiter = std::make_shared<AsyncRateLimiter<>>(io_context, 10, 1);
     // This coroutine will try to acquire 100 tokens, which will take 10 seconds.
     // But the io_context will be stopped much earlier.
     auto long_wait_task = [&]() -> asio::awaitable<void> {
-        AsyncRateLimiter limiter(io_context, 10, 1); // Very slow rate
         asio::steady_timer timer(io_context);
         try {
-            co_await limiter.await_tokens(100);
+            co_await limiter->await_tokens(100);
         } catch (const boost::system::system_error& e) {
             // boost::system::errc::operation_canceled is the expected error code
             if (e.code() == asio::error::operation_aborted) {
@@ -125,8 +125,8 @@ TEST(AsyncRateLimiterTest, Cancellation) {
 
     // Run io_context for a short period, then stop it
     io_context.run_for(50ms);
-    io_context.stop(); // This should cancel pending async operations
-    io_context.run(); // allow the cancelled handler to complete
+    limiter.reset();
+    io_context.run_for(50ms);
 
     EXPECT_TRUE(operation_cancelled);
 }
