@@ -21,7 +21,14 @@ private:
 };
 
 inline void gather_files(const std::filesystem::path& base_path, const std::filesystem::path& current_path, std::vector<FileInfo>& files, uint64_t& total_size) {
+    std::vector<std::filesystem::directory_entry> entries;
     for (const auto& entry : std::filesystem::directory_iterator(current_path)) {
+        entries.push_back(entry);
+    }
+    std::sort(entries.begin(), entries.end(),
+            [](const auto& a, const auto& b) { return a.path() < b.path(); });
+
+    for (const auto& entry : entries) {
         auto relative_path = std::filesystem::relative(entry.path(), base_path);
         if (entry.is_directory()) {
             gather_files(base_path, entry.path(), files, total_size);
@@ -34,6 +41,10 @@ inline void gather_files(const std::filesystem::path& base_path, const std::file
 }
 
 inline bool MetaInfo::load_from_file(const std::string& file_path, std::vector<std::vector<std::string>>& out_tracker_tiers) {
+    if (info_.pieces.size() % 20 != 0) {
+        throw std::runtime_error("Invalid pieces length in torrent file.");
+    }
+
     std::ifstream f(file_path);
     if (!f) {
         LOGERR("Could not open torrent file: {}", file_path);

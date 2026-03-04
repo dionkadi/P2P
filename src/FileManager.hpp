@@ -26,6 +26,7 @@ private:
 class FileManager {
 public:
     explicit FileManager(std::shared_ptr<SessionState> state);
+    virtual ~FileManager() = default;
 
     FileManager(const FileManager&) = delete;
     FileManager& operator=(const FileManager&) = delete;
@@ -56,12 +57,14 @@ public:
     }
     asio::awaitable<std::map<std::string, int64_t>> async_get_file_mtimes();
 
+protected:
+    virtual asio::awaitable<int> async_prompt(const std::string& question);
+
 private:
     static ThreadPool& get_file_io_pool();
     
     asio::awaitable<void> async_write_to_file(const std::filesystem::path& path, uint64_t offset, std::span<const std::byte> data);
     asio::awaitable<std::vector<std::byte>> async_read_from_file(const std::filesystem::path& path, uint64_t offset, uint32_t size = 0);
-    asio::awaitable<int> async_prompt(const std::string& question);
 
     void build_maps();
 

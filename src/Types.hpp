@@ -57,7 +57,7 @@ inline ExtendedMessageType to_extended_type(const std::string& s) {
     if (s == "ut_metadata") {
         return ExtendedMessageType::ut_metadata;
     }
-    throw;
+    throw std::invalid_argument("Unknown extended message type");
 }
 
 #pragma pack(push, 1)

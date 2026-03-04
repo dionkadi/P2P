@@ -31,6 +31,7 @@ public:
 
     const MetaInfo& info() const noexcept { return meta_info_; }
     const TorrentInfo& torrent_info() const noexcept { return meta_info_.get_torrent_info(); }
+    TorrentInfo& torrent_info() noexcept { return meta_info_.get_torrent_info(); }
     const std::vector<std::byte>& info_hash() const noexcept { return meta_info_.get_info_hash(); }
     const std::vector<std::vector<std::string>>& tracker_tiers() const noexcept { return tracker_tiers_; }
 

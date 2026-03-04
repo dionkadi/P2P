@@ -1,4 +1,5 @@
 #include "FileManager.hpp"
+#include <iostream>
 #include <boost/asio/experimental/awaitable_operators.hpp>
 
 FileManager::FileManager(std::shared_ptr<SessionState> state)
