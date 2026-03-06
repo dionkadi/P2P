@@ -337,18 +337,21 @@ private:
     Logger() {}
 
     static void init() {
+        constexpr std::string_view name = "logs/server.log";
         try {
             std::filesystem::create_directory("logs");
+            std::ofstream f(name.data(), std::ios::trunc | std::ios::in | std::ios::out);
+            f.close();
         } catch (const std::exception& e) {
         }
 
-        auto console_sink = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
-        console_sink->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] [thread %t] %v");
+        // auto console_sink = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
+        // console_sink->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] [thread %t] %v");
 
-        auto file_sink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>("logs/server.log", 1024 * 1024 * 5, 3);
+        auto file_sink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(name.data(), 1024 * 1024 * 5, 3);
         file_sink->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] [thread %t] %v");
 
-        std::vector<spdlog::sink_ptr> sinks {console_sink, file_sink};
+        std::vector<spdlog::sink_ptr> sinks {file_sink};
         logger_ = std::make_shared<spdlog::logger>("server_logger", sinks.begin(), sinks.end());
 
         logger_->set_level(spdlog::level::debug);

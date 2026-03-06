@@ -19,7 +19,8 @@ namespace asio = boost::asio;
 
 class Tracker {
 public:
-    Tracker() noexcept : strand_(asio::make_strand(io_context_)) {}
+    // Tracker() noexcept : strand_(asio::make_strand(io_context_)) {}
+    Tracker(asio::io_context& ioc) noexcept : io_context_(ioc), strand_(asio::make_strand(ioc)) {}
 
     Tracker(const Tracker&) = delete;
     Tracker& operator= (const Tracker&) = delete;
@@ -55,10 +56,13 @@ public:
     }
     
     void run() {
-        LOGINFO("Tracker is running...");
-        io_context_.run();
-        LOGINFO("Tracker stopped");
+        // LOGINFO("Tracker is running...");
+        // io_context_.run();
+        // LOGINFO("Tracker stopped");
+        throw std::runtime_error("Tracker::run() should not be called in this test setup. Use shared io_context.");
     }
+
+    void stop_udp_listener();
 
     asio::io_context& get_io_context() noexcept { return io_context_; }
 
@@ -68,7 +72,7 @@ private:
 
     HttpHandler create_announce_handler();
     
-    asio::io_context io_context_;
+    asio::io_context& io_context_;
     asio::strand<asio::io_context::executor_type> strand_;
     std::map<std::vector<std::byte>, boost::container::flat_set<std::string>> peers_;
 
@@ -78,6 +82,7 @@ private:
         uint64_t connection_id;
         std::chrono::steady_clock::time_point expiry;
     };
+    std::unique_ptr<asio::ip::udp::socket> udp_socket_;
     // Use asio::ip::address as the key for protocol independence
     std::unordered_map<asio::ip::address, UdpClientInfo> udp_clients_;
     std::mt19937_64 rng_{std::random_device{}()};
@@ -183,17 +188,40 @@ inline HttpHandler Tracker::create_announce_handler() {
 
 inline asio::awaitable<void> Tracker::udp_listen_loop(int port) {
     auto executor = co_await asio::this_coro::executor;
-    asio::ip::udp::socket udp_socket(executor, asio::ip::udp::endpoint(asio::ip::udp::v4(), port));
+    udp_socket_ = std::make_unique<asio::ip::udp::socket>(executor, asio::ip::udp::endpoint(asio::ip::udp::v4(), port));
+    udp_socket_->set_option(asio::ip::udp::socket::reuse_address(true));
     LOGINFO("UDP server listening on port {}", port);
     std::vector<char> buffer(2048); 
     asio::ip::udp::endpoint remote_endpoint;
     while (true) {
-        size_t bytes_recvd = co_await udp_socket.async_receive_from(asio::buffer(buffer), remote_endpoint, asio::use_awaitable);
+        boost::system::error_code ec;
+        size_t bytes_recvd = co_await udp_socket_->async_receive_from(asio::buffer(buffer), remote_endpoint, asio::redirect_error(asio::use_awaitable, ec));
+        if (ec == asio::error::operation_aborted) {
+            LOGDBG("UDP listener aborted.");
+            co_return;
+        }
+        if (ec) {
+            LOGERR("UDP receive error: {}", ec.message());
+            co_return; // Or handle more gracefully
+        }
+        
         asio::co_spawn(
             executor,
-            handle_udp_request(remote_endpoint, {buffer.data(), bytes_recvd}, udp_socket),
+            handle_udp_request(remote_endpoint, {buffer.data(), bytes_recvd}, *udp_socket_),
             asio::detached
         );
+    }
+}
+
+inline void Tracker::stop_udp_listener() {
+    if (udp_socket_ && udp_socket_->is_open()) {
+        boost::system::error_code ec;
+        udp_socket_->cancel(ec);
+        udp_socket_->close(ec);
+        if (ec) {
+            LOGWARN("Error closing UDP socket: {}", ec.message());
+        }
+        udp_socket_.reset();
     }
 }
 
