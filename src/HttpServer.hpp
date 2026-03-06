@@ -100,6 +100,7 @@ inline asio::awaitable<void> http_listener(asio::io_context& ioc, tcp::endpoint 
     try {
         while (true) {
             tcp::socket socket = co_await acceptor.async_accept(asio::use_awaitable);
+            acceptor.set_option(tcp::acceptor::reuse_address(true));
             LOGINFO("[HTTP] Accepted connection from {}", socket.remote_endpoint().address().to_string());
             
             asio::co_spawn(executor, http_session(std::move(socket), router), asio::detached);
