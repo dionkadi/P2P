@@ -34,7 +34,7 @@ asio::awaitable<std::vector<std::byte>> FileManager::read_block(size_t piece_ind
             current_file_offset += file_info.size;
             continue;
         }
-
+        
         uint64_t file_start = current_file_offset;
         uint64_t file_end = current_file_offset + file_info.size;
         uint64_t read_start = global_offset + read_for_block;
@@ -105,16 +105,15 @@ void FileManager::build_maps() {
             uint64_t piece_start_offset = static_cast<uint64_t>(piece_idx) * piece_size;
             
             uint64_t actual_piece_size;
-            if (piece_idx == num_pieces - 1) { // Last piece
-                actual_piece_size = total_torrent_size - piece_start_offset;
-                // If total_torrent_size is a perfect multiple of piece_size, 
-                // the last piece will have piece_size.
-                // If total_torrent_size is 0, actual_piece_size should be 0.
-                if (total_torrent_size == 0 && num_pieces == 0) actual_piece_size = 0;
-                else if (actual_piece_size == 0 && total_torrent_size > 0 && num_pieces > 0) { // e.g. 10MB total, 2MB piece, last piece starts at 8MB, actual size 2MB
-                    actual_piece_size = piece_size;
+            if (piece_idx == num_pieces - 1) { // This is the last piece
+                if (total_torrent_size == 0) {
+                    actual_piece_size = 0; // Empty torrent
+                } else {
+                    uint64_t remainder = total_torrent_size % piece_size;
+                    // If remainder is 0 and total_torrent_size > 0, it means the last piece is a full piece_size.
+                    actual_piece_size = (remainder == 0) ? piece_size : remainder;
                 }
-            } else {
+            } else { // Not the last piece, so it's a full piece_size
                 actual_piece_size = piece_size;
             }
 
@@ -435,6 +434,9 @@ asio::awaitable<bool> FileManager::preallocate_files() {
 
         // selective downloading
         std::optional<bool> download_all_decision;
+        
+        download_all_decision.emplace(true);
+
         for (size_t i = 0; i < info.files.size(); ++i) {
             const auto& file = info.files[i];
             std::filesystem::path full_path = get_full_path_for_file(file);
