@@ -11,6 +11,7 @@
 #include "Utils.hpp"
 
 #include <boost/asio/any_io_executor.hpp>
+#include <boost/asio/steady_timer.hpp>
 #include <boost/asio/strand.hpp>
 #include <cstdint>
 #include <functional>
@@ -38,6 +39,8 @@ public:
     void set_on_complete(std::function<void()> cb) { on_complete_ = std::move(cb); }
     void set_tracker_announce_interval(std::chrono::seconds interval) { tracker_announce_interval_ = interval; }
 
+    const std::shared_ptr<PeerManager>& peer_manager() const noexcept { return peer_manager_; }
+
     // IPeerConnectionEvents implementation
     asio::awaitable<void> on_piece_block(std::shared_ptr<PeerConnection> conn, size_t piece_index, uint32_t begin, std::span<const std::byte> block_data) override;
     asio::awaitable<void> on_block_request(std::shared_ptr<PeerConnection> conn, size_t piece_index, uint32_t begin, uint32_t length) override;
@@ -57,6 +60,7 @@ private:
     asio::awaitable<void> save_session_state();
 
     asio::awaitable<void> tracker_announce_loop();
+    asio::awaitable<void> announce_tracker_for(std::string event = "");
     asio::awaitable<void> discovered_peers_loop();
     asio::awaitable<void> handle_new_connection(AsyncSocket socket, std::string peer_addr);
     asio::awaitable<void> periodically_save();
@@ -67,14 +71,17 @@ private:
 
     asio::io_context& io_context_;
     asio::strand<asio::any_io_executor> strand_;
+    asio::steady_timer save_timer_;
+    asio::steady_timer tracker_announce_timer_;
     PeerId my_peer_id_;
     uint16_t peer_port_;
     Mode mode_;
     std::vector<std::vector<std::shared_ptr<ITrackerClient>>> tracker_clients_by_tier_;
 
     std::shared_ptr<SessionState> state_;
-    std::unique_ptr<PieceManager> piece_manager_;
-    std::unique_ptr<PeerManager> peer_manager_;
+    std::shared_ptr<PieceManager> piece_manager_;
+    std::shared_ptr<PeerManager> peer_manager_;
+    std::unique_ptr<AsyncServerSocket> peer_server_;
     std::unique_ptr<FileManager> file_manager_;
     AsyncRateLimiter<> upload_limiter_;
     AsyncRateLimiter<> download_limiter_;

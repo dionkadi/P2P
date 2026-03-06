@@ -13,10 +13,12 @@ TorrentSession::TorrentSession(
     Mode mode,
     uint64_t upload_rate_bps, 
     uint64_t download_rate_bps 
-) : io_context_(io_context), strand_(asio::make_strand(io_context)), my_peer_id_(std::move(my_peer_id)), peer_port_(peer_port), mode_(mode),
+) : io_context_(io_context), strand_(asio::make_strand(io_context)), 
+    save_timer_(io_context_), tracker_announce_timer_(io_context_),
+    my_peer_id_(std::move(my_peer_id)), peer_port_(peer_port), mode_(mode),
     state_(std::make_shared<SessionState>(torrent_path, save_path)),
-    piece_manager_(std::make_unique<PieceManager>(io_context, state_)),
-    peer_manager_(std::make_unique<PeerManager>(io_context, state_)),
+    piece_manager_(std::make_shared<PieceManager>(io_context, state_)),
+    peer_manager_(std::make_shared<PeerManager>(io_context, state_)),
     file_manager_(std::make_unique<FileManager>(state_)),
     upload_limiter_(io_context, upload_rate_bps),
     download_limiter_(io_context, download_rate_bps),
@@ -92,12 +94,12 @@ asio::awaitable<void> TorrentSession::run() {
         co_return;
     }
 
+    peer_server_ = std::make_unique<AsyncServerSocket>(io_context_, peer_port_);
     asio::co_spawn(io_context_, [this]() -> asio::awaitable<void> {
-        AsyncServerSocket peer_server(io_context_, peer_port_);
         LOGINFO("Listening for incoming connections on port {}", peer_port_);
         while (!shutting_down_) {
             try {
-                AsyncSocket new_socket = co_await peer_server.accept();
+                AsyncSocket new_socket = co_await peer_server_->accept();
                 auto endpoint = new_socket.remote_endpoint();
                 std::string addr = endpoint.address().to_string() + ":" + std::to_string(endpoint.port());
                 asio::co_spawn(io_context_, handle_new_connection(std::move(new_socket), addr), asio::detached);
@@ -117,6 +119,8 @@ asio::awaitable<void> TorrentSession::run() {
                                     );
         asio::co_spawn(io_context_, piece_manager_->downloader(), asio::detached);
         asio::co_spawn(strand_, periodically_save(), asio::detached);
+        asio::co_spawn(strand_, peer_manager_->pex_loop(), asio::detached);
+        asio::co_spawn(strand_, discovered_peers_loop(), asio::detached);
     }
 
     try {
@@ -140,8 +144,23 @@ asio::awaitable<void> TorrentSession::stop() {
     }
 
     LOGINFO("Torrent session shutdown initiated.");
+    if (peer_server_) {
+        peer_server_->close();
+    }
+
     completion_timer_.cancel();
+    save_timer_.cancel();
+    tracker_announce_timer_.cancel();
+    peer_manager_->cancel();
     piece_manager_->notify_one();
+
+    asio::steady_timer announce_timeout_timer(io_context_);
+    announce_timeout_timer.expires_after(std::chrono::seconds(2));
+    auto result_announce = co_await (asio::co_spawn(strand_, announce_tracker_for("stopped"), asio::use_awaitable) || announce_timeout_timer.async_wait(asio::use_awaitable));
+    
+    if (result_announce.index() == 1) { // timeout
+        LOGWARN("Sending 'stopped' event to tracker timed out during shutdown.");
+    }
 
     if (mode_ == Mode::Leech) {
         LOGINFO("Shutdown initiated, saving final progress...");
@@ -162,10 +181,10 @@ asio::awaitable<void> TorrentSession::stop() {
     peer_manager_->close_all();
     peer_manager_->remove_all_connections();
 
-    if (!io_context_.stopped()) {
-        io_context_.stop();
-        LOGINFO("io_context stopped by TorrentSession::stop().");
-    }
+    // if (!io_context_.stopped()) {
+    //     io_context_.stop();
+    //     LOGINFO("io_context stopped by TorrentSession::stop().");
+    // }
 }
 
 asio::awaitable<void> TorrentSession::handle_new_connection(AsyncSocket socket, std::string peer_addr) {
@@ -186,7 +205,7 @@ asio::awaitable<void> TorrentSession::handle_new_connection(AsyncSocket socket, 
         co_return;
     }
 
-    asio::co_spawn(io_context_, [&conn] () -> asio::awaitable<void> {
+    asio::co_spawn(io_context_, [conn] () -> asio::awaitable<void> {
         co_await conn->send_simple_message(MessageType::Unchoke);
         conn->am_choking(false);
     }, asio::detached);
@@ -223,7 +242,6 @@ asio::awaitable<void> TorrentSession::handle_new_connection(AsyncSocket socket, 
 }
 
 asio::awaitable<void> TorrentSession::tracker_announce_loop() {
-    asio::steady_timer timer(io_context_);
     std::string event = "started";
     bool completed_event_sent = false;
     std::random_device rd;
@@ -231,9 +249,6 @@ asio::awaitable<void> TorrentSession::tracker_announce_loop() {
 
     while (true) {
         bool is_completed = state_->is_download_complete();
-        if (is_completed) {
-            on_complete_();
-        }
 
         if (is_completed && mode_ != Mode::Seed) {
             LOGINFO("Download complete. Stopping tracker announcements.");
@@ -245,29 +260,41 @@ asio::awaitable<void> TorrentSession::tracker_announce_loop() {
             completed_event_sent = true;
         }
 
-        AnnounceRequestParams params {
-            .info_hash_bytes = state_->info_hash(),
-            .peer_id = my_peer_id_,
-            .event = event,
-            .port = peer_port_,
-            .uploaded = state_->total_bytes_uploaded(),
-            .downloaded = state_->total_bytes_downloaded(),
-            .left = state_->torrent_info().total_size - (state_->completed_pieces() * state_->torrent_info().piece_size), // Adjust for last piece
-        };
+        co_await announce_tracker_for(event);
+        event = "";
+ 
+        tracker_announce_timer_.expires_after(tracker_announce_interval_);
+        boost::system::error_code ec;
+        co_await tracker_announce_timer_.async_wait(asio::redirect_error(asio::use_awaitable, ec)); // Wait on timer
+        if (ec == asio::error::operation_aborted) {
+            LOGDBG("Tracker announce timer aborted.");
+            co_return; // Likely during shutdown
+        }
+    }
+}
 
-        int interval = tracker_announce_interval_.count();
-        bool announce_successful = false;
-        co_await asio::dispatch(strand_, asio::use_awaitable);
-        for (auto& tier : tracker_clients_by_tier_) {
-            std::shuffle(tier.begin(), tier.end(), g);
+asio::awaitable<void> TorrentSession::announce_tracker_for(std::string event) {
+    AnnounceRequestParams params {
+        .info_hash_bytes = state_->info_hash(),
+        .peer_id = my_peer_id_,
+        .event = event,
+        .port = peer_port_,
+        .uploaded = state_->total_bytes_uploaded(),
+        .downloaded = state_->total_bytes_downloaded(),
+        .left = state_->torrent_info().total_size - (state_->completed_pieces() * state_->torrent_info().piece_size), // Adjust for last piece
+    };
 
-            for (const auto& tracker_client : tier) {
-                try {
-                    LOGINFO("Announcing to tracker {} (event: '{}')...", tracker_client->get_url(), event);
-                    auto result = co_await tracker_client->announce(params);
-                    interval = result.interval_seconds;
-                    announce_successful = true;
-                    
+    bool announce_successful = false;
+    co_await asio::dispatch(strand_, asio::use_awaitable);
+    for (auto& tier : tracker_clients_by_tier_) {
+        for (const auto& tracker_client : tier) {
+            try {
+                LOGINFO("Announcing to tracker {} (event: '{}')...", tracker_client->get_url(), event);
+                auto result = co_await tracker_client->announce(params);
+                announce_successful = true;
+                
+                if (event == "started") {
+                    tracker_announce_interval_ = std::chrono::seconds(result.interval_seconds);
                     for (const auto& peer_addr : result.peers) {
                         bool already_connected = peer_manager_->contains_peer_addr(peer_addr);
                         if (!already_connected) {
@@ -282,31 +309,21 @@ asio::awaitable<void> TorrentSession::tracker_announce_loop() {
                             );
                         }
                     }
-
-                    break;
-                } catch (const std::exception& e) {
-                    LOGERR("Failed to announce to tracker: {}. Retrying in {} seconds.", e.what(), interval);
                 }
+
+                break;
+            } catch (const std::exception& e) {
+                LOGERR("Failed to announce to tracker: {}.", e.what());
             }
-
-            if (announce_successful) {
-                break ;
-            }
         }
 
-        if (!announce_successful) {
-            LOGERR("All trackers failed to respond. Retrying in {} seconds.", interval);
+        if (announce_successful) {
+            break ;
         }
+    }
 
-        event = "";
- 
-        timer.expires_after(std::chrono::seconds(interval));
-        boost::system::error_code ec;
-        co_await timer.async_wait(asio::redirect_error(asio::use_awaitable, ec)); // Wait on timer
-        if (ec == asio::error::operation_aborted) {
-            LOGDBG("Tracker announce timer aborted.");
-            co_return; // Likely during shutdown
-        }
+    if (!announce_successful) {
+        LOGERR("Failed to announce '{}' to any tracker.", event);
     }
 }
 
@@ -330,11 +347,10 @@ asio::awaitable<void> TorrentSession::discovered_peers_loop() {
 }
 
 asio::awaitable<void> TorrentSession::periodically_save() {
-    asio::steady_timer timer(io_context_);
     while (!shutting_down_) {
-        timer.expires_after(std::chrono::minutes(1));
+        save_timer_.expires_after(std::chrono::minutes(1));
         boost::system::error_code ec;
-        co_await timer.async_wait(asio::redirect_error(asio::use_awaitable, ec));
+        co_await save_timer_.async_wait(asio::redirect_error(asio::use_awaitable, ec));
         if (ec == asio::error::operation_aborted) {
             LOGDBG("Periodically save timer aborted.");
             co_return; // Likely during shutdown
@@ -344,6 +360,8 @@ asio::awaitable<void> TorrentSession::periodically_save() {
 }
 
 asio::awaitable<void> TorrentSession::save_session_state() {
+    auto self = shared_from_this();
+    
     ResumeData resume_data;
     resume_data.total_uploaded = state_->total_bytes_uploaded();
     resume_data.total_downloaded = state_->total_bytes_downloaded();
@@ -421,6 +439,9 @@ asio::awaitable<void> TorrentSession::on_piece_block(std::shared_ptr<PeerConnect
             peer_manager_->close_all();
             peer_manager_->remove_all_connections();
             completion_timer_.cancel();
+            if (on_complete_) {
+                on_complete_();
+            }
         }
     }
 }
@@ -592,11 +613,6 @@ asio::awaitable<void> TorrentSession::on_extended_message(std::shared_ptr<PeerCo
                     LOGDBG("\t{}", k);
                     uint8_t index = std::get<Integer>(v.get_variant());
                     conn->update_extension_type(index, to_extended_type(k));
-
-                    if (k == "ut_pex") {
-                        asio::co_spawn(io_context_, peer_manager_->pex_loop(), asio::detached);
-                        asio::co_spawn(io_context_, discovered_peers_loop(), asio::detached);
-                    }
                 }
             }
 
