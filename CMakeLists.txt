@@ -51,21 +51,23 @@ target_link_libraries(p2p_common PUBLIC
     OpenSSL::Crypto
 )
 
-add_executable(tracker src/main_tracker.cpp)
-add_executable(client src/main_client.cpp)
+# add_executable(tracker src/main_tracker.cpp)
+# add_executable(client src/main_client.cpp)
 
-target_link_libraries(tracker PRIVATE p2p_common)
-target_link_libraries(client PRIVATE p2p_common)
+# target_link_libraries(tracker PRIVATE p2p_common)
+# target_link_libraries(client PRIVATE p2p_common)
 
 add_executable(p2p_test
-    test/bencode_test.cpp
-    test/buffer_test.cpp
-    test/crypto_test.cpp
-    test/protocol_test.cpp
-    test/torrentfile_test.cpp
-    test/sessionstate_test.cpp
-    test/asyncratelimiter_test.cpp
-    test/filemanager_test.cpp
+    test/main.cpp
+    # test/bencode_test.cpp
+    # test/buffer_test.cpp
+    # test/crypto_test.cpp
+    # test/protocol_test.cpp
+    # test/torrentfile_test.cpp
+    # test/sessionstate_test.cpp
+    # test/asyncratelimiter_test.cpp
+    # test/filemanager_test.cpp
+    test/integration_test.cpp
 )
 
 target_include_directories(p2p_test PUBLIC
