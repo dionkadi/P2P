@@ -9,7 +9,7 @@ namespace asio = boost::asio;
 static constexpr uint32_t MAX_MESSAGE_SIZE = 10 * 1024 * 1024;
 
 class AsyncSocket {
-    public:
+public:
     explicit AsyncSocket(asio::ip::tcp::socket socket) noexcept
         : socket_(std::move(socket)) {}
 
@@ -116,6 +116,7 @@ public:
     explicit AsyncServerSocket(asio::io_context& io_context, int port) noexcept
         : acceptor_(io_context, {asio::ip::tcp::v4(), static_cast<asio::ip::port_type>(port)}) 
     {    
+        acceptor_.set_option(asio::ip::tcp::acceptor::reuse_address(true));
         LOGINFO("Server listening on port {}", port);
     }
 
@@ -129,6 +130,12 @@ public:
         auto endpoint = socket.remote_endpoint();
         LOGINFO("Accepted connection from {}:{}", endpoint.address().to_string(), endpoint.port());
         co_return AsyncSocket(std::move(socket));
+    }
+
+    void close() {
+        boost::system::error_code ec;
+        acceptor_.cancel(ec);
+        acceptor_.close(ec);
     }
 
 private:
