@@ -30,6 +30,7 @@ std::map<std::string, std::string> PieceManager::get_in_progress_for_resume() co
 }
 
 asio::awaitable<void> PieceManager::downloader() {
+    auto self = shared_from_this();
     const int max_in_progress_pieces = 5;
 
     while (!state_->is_download_complete()) {
@@ -44,7 +45,7 @@ asio::awaitable<void> PieceManager::downloader() {
         
         if (slots_to_fill > 0) {
             for (int i = 0; i < slots_to_fill; ++i) {
-                asio::co_spawn(io_context_, request_one_piece(), asio::detached);
+                asio::co_spawn(io_context_, self->request_one_piece(), asio::detached);
             }
         }
 
@@ -60,6 +61,10 @@ asio::awaitable<void> PieceManager::downloader() {
 }
 
 asio::awaitable<void> PieceManager::request_one_piece() {
+    if (state_->is_download_complete()) {
+        co_return;
+    }
+
     for (const auto& [rarity, piece_set] : *pieces_by_rarity()) {
         if (rarity == 0) continue;  // We only care about pieces that are actually available (rarity > 0)
 
@@ -106,6 +111,8 @@ asio::awaitable<void> PieceManager::request_one_piece() {
 }
 
 asio::awaitable<bool> PieceManager::try_piece_download(size_t piece_index) {
+    auto self = shared_from_this();
+
     if (state_->piece_status(piece_index) != PieceStatus::Needed) {
         co_return false;
     }
@@ -150,11 +157,13 @@ asio::awaitable<bool> PieceManager::try_piece_download(size_t piece_index) {
         piece_progress->outstanding_requests[block_idx].push_back(peer_conn->peer_id());
     }
     
-    asio::co_spawn(io_context_, check_and_enter_endgame(), asio::detached);
+    asio::co_spawn(io_context_, self->check_and_enter_endgame(), asio::detached);
     co_return true;
 }
 
 asio::awaitable<void> PieceManager::check_and_enter_endgame() {
+    auto self = shared_from_this();
+    
     if (state_->is_in_endgame_mode()) {
         co_return ;
     }
@@ -167,11 +176,15 @@ asio::awaitable<void> PieceManager::check_and_enter_endgame() {
     if (needed_count > 0 && needed_count < state_->num_pieces() * 0.1) {
         LOGINFO("🎉 All pieces requested. Entering ENDGAME MODE. 🎉");
         state_->is_in_endgame_mode(true);
-        asio::co_spawn(io_context_, broadcast_outstanding_requests(), asio::detached);
+        asio::co_spawn(io_context_, self->broadcast_outstanding_requests(), asio::detached);
     }
 }
 
 asio::awaitable<void> PieceManager::broadcast_outstanding_requests() {
+    if (state_->is_download_complete()) {
+        co_return;
+    }
+    
     LOGINFO("Endgame: Re-requesting all outstanding blocks from all unchoked peers.");
 
     const auto& info = state_->torrent_info();
@@ -204,6 +217,8 @@ asio::awaitable<void> PieceManager::broadcast_outstanding_requests() {
 }
 
 asio::awaitable<void> PieceManager::return_piece_to_queue(size_t piece_index) {
+    auto self = shared_from_this();
+
     co_await asio::dispatch(strand_, asio::use_awaitable);
 
     auto it = in_progress_pieces_->find(piece_index);

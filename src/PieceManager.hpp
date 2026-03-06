@@ -21,7 +21,7 @@
 
 static constexpr uint32_t IN_PROGRESS_RARITY_GROUP_ID = std::numeric_limits<uint32_t>::max();
 
-class PieceManager {
+class PieceManager : public std::enable_shared_from_this<PieceManager> {
 public:
     using GetAvailableCallback = std::function<asio::awaitable<std::vector<std::shared_ptr<PeerConnection>>>(size_t)>;
     using InProgressType = std::shared_ptr<const std::map<size_t, std::shared_ptr<InProgressPiece>>>;
