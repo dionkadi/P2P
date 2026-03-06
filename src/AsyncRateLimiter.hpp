@@ -15,7 +15,7 @@ class AsyncRateLimiter {
 public:
     static constexpr std::chrono::milliseconds refill_interval = std::chrono::milliseconds(100);
 
-    AsyncRateLimiter(asio::io_context& io_context, uint64_t rate_bps, uint64_t capacity_factor = 2)
+    AsyncRateLimiter(asio::io_context& io_context, uint64_t rate_bps, uint64_t capacity_factor = 1)
         : strand_(asio::make_strand(io_context)),
           timer_(strand_), // Bind the timer to the strand
           rate_bytes_per_second_(rate_bps),
