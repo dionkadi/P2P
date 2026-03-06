@@ -4,7 +4,8 @@
 #include <random>
 
 PeerManager::PeerManager(asio::io_context& io_context, std::shared_ptr<SessionState> state, std::chrono::seconds choke_interval) noexcept
-    : io_context_(io_context), strand_(asio::make_strand(io_context)), state_(state), choke_interval_(choke_interval)
+    : io_context_(io_context), strand_(asio::make_strand(io_context)), pex_timer_(io_context_), choke_timer_(io_context_),
+    state_(state), choke_interval_(choke_interval)
 {}
 
 asio::awaitable<std::optional<AsyncSocket>> PeerManager::connect_to_peer(const std::string& peer_addr) {
@@ -37,13 +38,14 @@ asio::awaitable<std::optional<AsyncSocket>> PeerManager::connect_to_peer(const s
 }
 
 asio::awaitable<void> PeerManager::choke_loop() {
-    asio::steady_timer timer(io_context_);
+    auto self = shared_from_this();
+
     std::mt19937 rng(std::chrono::high_resolution_clock::now().time_since_epoch().count());
 
     std::shared_ptr<PeerConnection> optimistically_unchoked_peer = nullptr;
     while (!state_->is_download_complete()) {
-        timer.expires_after(choke_interval_);
-        co_await timer.async_wait(asio::use_awaitable);
+        choke_timer_.expires_after(choke_interval_);
+        co_await choke_timer_.async_wait(asio::use_awaitable);
 
         co_await asio::dispatch(strand_, asio::use_awaitable);
         ++choke_loop_counter_;
@@ -163,8 +165,8 @@ asio::awaitable<std::vector<std::shared_ptr<PeerConnection>>> PeerManager::avail
 }
 
 asio::awaitable<void> PeerManager::pex_loop() {
-    asio::steady_timer timer(io_context_);
-
+    auto self = shared_from_this();
+    
     while (true) {
         std::string added = populate_added();
         std::string dropped = populate_dropped();
@@ -188,9 +190,9 @@ asio::awaitable<void> PeerManager::pex_loop() {
             }
         }
         
-        timer.expires_after(std::chrono::minutes(1));
+        pex_timer_.expires_after(std::chrono::minutes(1));
         EC ec;
-        co_await timer.async_wait(asio::redirect_error(asio::use_awaitable, ec));
+        co_await pex_timer_.async_wait(asio::redirect_error(asio::use_awaitable, ec));
 
         if (ec == asio::error::operation_aborted) {
             LOGWARN("PEX loop aborted");

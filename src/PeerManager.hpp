@@ -2,6 +2,7 @@
 
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/io_context.hpp>
+#include <boost/asio/steady_timer.hpp>
 #include <cstddef>
 #include <map>
 #include <unordered_set>
@@ -11,7 +12,7 @@
 #include "PeerConnection.hpp"
 #include "SessionState.hpp"
 
-class PeerManager{
+class PeerManager : public std::enable_shared_from_this<PeerManager> {
 public:
     PeerManager(asio::io_context& io_context, std::shared_ptr<SessionState> state, std::chrono::seconds choke_interval = 10s) noexcept;
 
@@ -103,12 +104,34 @@ public:
         return discovered_peers_;
     }
 
+    std::vector<PeerId> get_unchoked_peers() const {
+        std::lock_guard lock(mutex_);
+        std::vector<PeerId> result;
+        std::ranges::for_each(active_connections_, [&result](const auto& p) {
+            const auto& [pid, conn] = p;
+            if (!conn->am_choking()) {
+                result.push_back(pid);
+            }
+        });
+        return result;
+    }
+
+    void cancel() noexcept {
+        LOGDBG("PeerManager: Cancelling pex_timer_...");
+        pex_timer_.cancel();
+        LOGDBG("PeerManager: pex_timer_ cancelled. Cancelling choke_timer_...");
+        choke_timer_.cancel();
+        LOGDBG("PeerManager: choke_timer_ cancelled.");
+    }
+
     asio::awaitable<std::optional<AsyncSocket>> connect_to_peer(const std::string& peer_addr);
     asio::awaitable<std::vector<std::shared_ptr<PeerConnection>>> available_peers(size_t piece_index) const;
 
 private:
     asio::io_context& io_context_;
     asio::strand<asio::any_io_executor> strand_;
+    asio::steady_timer pex_timer_;
+    asio::steady_timer choke_timer_;
     std::map<PeerId, std::shared_ptr<PeerConnection>> active_connections_;
     std::shared_ptr<SessionState> state_;
     std::unordered_set<EndPoint> active_peers_;
