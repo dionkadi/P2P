@@ -1,13 +1,20 @@
 #pragma once
 
+#include <gtest/gtest.h>
 #include <vector>
 #include <string>
 #include <cstddef>
 #include <algorithm>
 #include <sstream>
 #include <iomanip>
-#include "Types.hpp" // For PeerId, InfoHash
 #include <chrono>
+#include <random>
+#include <filesystem>
+
+#include "Types.hpp"
+#include "Tracker.hpp"
+#include "TorrentFile.hpp"
+#include "TorrentSession.hpp"
 
 using namespace std::chrono_literals;
 
@@ -48,14 +55,6 @@ inline PeerId string_to_peer_id(const std::string& s) {
     return id;
 }
 
-// Helper to create an InfoHash from a hex string (assuming Crypto::hex_to_bytes exists)
-// You might need to include Crypto.hpp here or define hex_to_bytes within the test helpers.
-#include "Utils.hpp"
-inline InfoHash hex_to_info_hash(const std::string& hex) {
-    return Crypto::hex_to_bytes(hex);
-}
-
-
 template <typename Awaitable>
 void RunAsync(asio::io_context& io, Awaitable&& awaitable) {
     asio::co_spawn(io, std::forward<Awaitable>(awaitable),
@@ -65,97 +64,10 @@ void RunAsync(asio::io_context& io, Awaitable&& awaitable) {
     io.run();
 }
 
-#include <random>
-#include <filesystem>
-#include "Tracker.hpp"
-#include "TorrentFile.hpp"
-
-namespace asio = boost::asio;
-namespace fs = std::filesystem;
-using namespace std::chrono_literals;
-
-// Helper to create a random file of given size
-inline void create_random_file(const fs::path& path, size_t size) {
-    std::ofstream ofs(path, std::ios::binary);
-    std::vector<char> buf(4096);
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_int_distribution<int> dist(0, 255);
-    size_t written = 0;
-    while (written < size) {
-        size_t chunk = std::min(buf.size(), size - written);
-        for (size_t i = 0; i < chunk; ++i)
-            buf[i] = static_cast<char>(dist(gen));
-        ofs.write(buf.data(), chunk);
-        written += chunk;
-    }
+template <typename Awaitable>
+void RunAsyncFor(asio::io_context& io, std::chrono::milliseconds duration, Awaitable&& awaitable) {
+    asio::co_spawn(io, std::forward<Awaitable>(awaitable), [](std::exception_ptr e) {
+                       if (e) std::rethrow_exception(e);
+                   });
+    io.run_for(duration);
 }
-
-// Simple tracker that can be run in a separate thread
-class TestTracker {
-public:
-    TestTracker() : io_(), work_guard_(asio::make_work_guard(io_)) {
-        thread_ = std::thread([this] { io_.run(); });
-    }
-
-    ~TestTracker() {
-        work_guard_.reset();
-        io_.stop();
-        if (thread_.joinable())
-            thread_.join();
-    }
-
-    void listen_http(int port) {
-        tracker_.listen_http(port);
-    }
-
-    void listen_udp(int port) {
-        tracker_.listen_udp(port);
-    }
-
-private:
-    asio::io_context io_;
-    asio::executor_work_guard<asio::io_context::executor_type> work_guard_;
-    std::thread thread_;
-    Tracker tracker_;
-};
-
-// Helper to wait for a future with timeout
-template<typename T>
-bool wait_for_future(std::future<T>& fut, std::chrono::milliseconds timeout) {
-    return fut.wait_for(timeout) == std::future_status::ready;
-}
-
-// RAII temporary directory
-struct TempDir {
-    fs::path path;
-    TempDir() {
-        path = fs::temp_directory_path() / "bittorrent_integ_test";
-        fs::remove_all(path);
-        fs::create_directories(path);
-    }
-    ~TempDir() { fs::remove_all(path); }
-    TempDir(const TempDir&) = delete;
-    TempDir& operator=(const TempDir&) = delete;
-};
-
-// RAII file with random content
-struct TestFile {
-    fs::path path;
-    size_t size;
-    TestFile(const fs::path& dir, size_t sz) : size(sz) {
-        path = dir / "test.dat";
-        create_random_file(path, sz);
-    }
-};
-
-// RAII torrent file
-struct TestTorrent {
-    fs::path path;
-    TestTorrent(const fs::path& dir, const fs::path& source_file,
-                const std::vector<std::string>& trackers,
-                uint32_t piece_size = 16384) {
-        path = dir / "test.torrent";
-        create_torrent(source_file, path, trackers, piece_size);
-    }
-};

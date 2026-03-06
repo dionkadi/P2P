@@ -1,12 +1,4 @@
-#include "gtest/gtest.h"
-#include "TorrentFile.hpp"
-#include "Bencode.hpp"
-#include "helper.hpp" // For string_to_bytes, bytes_to_string
-#include <filesystem>
-#include <fstream>
-#include <string>
-#include <vector>
-#include <algorithm>
+#include "helper.hpp"
 
 // Fixture for torrent file tests to handle temporary files
 class TorrentFileTest : public ::testing::Test {

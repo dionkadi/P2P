@@ -1,13 +1,8 @@
-#include "gtest/gtest.h"
-#include "helper.hpp" // For string_to_peer_id, hex_to_info_hash, etc.
-#include <vector>
-#include <string>
-#include <array>
-#include <stdexcept>
+#include "helper.hpp"
 
 TEST(HandshakeTest, SerializeDeserializeBasic) {
     Handshake original_hs;
-    original_hs.info_hash_bytes = hex_to_info_hash("e29fc0e5dceeefea80401e32723796c0a86a8695");
+    original_hs.info_hash_bytes = Crypto::hex_to_bytes("e29fc0e5dceeefea80401e32723796c0a86a8695");
     original_hs.peer_id_bytes = string_to_peer_id("-MI0001-TESTPEERID00");
     original_hs.extended = false;
 
@@ -23,7 +18,7 @@ TEST(HandshakeTest, SerializeDeserializeBasic) {
 
 TEST(HandshakeTest, SerializeDeserializeExtended) {
     Handshake original_hs;
-    original_hs.info_hash_bytes = hex_to_info_hash("e29fc0e5dceeefea80401e32723796c0a86a8695");
+    original_hs.info_hash_bytes = Crypto::hex_to_bytes("e29fc0e5dceeefea80401e32723796c0a86a8695");
     original_hs.peer_id_bytes = string_to_peer_id("-MI0001-EXTENDEDP2P0");
     original_hs.extended = true;
 
@@ -56,7 +51,7 @@ TEST(HandshakeTest, DeserializeInvalidSize) {
 
 TEST(HandshakeTest, DeserializeProtocolMismatch) {
     Handshake original_hs;
-    original_hs.info_hash_bytes = hex_to_info_hash("e29fc0e5dceeefea80401e32723796c0a86a8695");
+    original_hs.info_hash_bytes = Crypto::hex_to_bytes("e29fc0e5dceeefea80401e32723796c0a86a8695");
     original_hs.peer_id_bytes = string_to_peer_id("-MI0001-TESTPEERID00");
     original_hs.extended = false;
     std::vector<std::byte> serialized = original_hs.serialize();

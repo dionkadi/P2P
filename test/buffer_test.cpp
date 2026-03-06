@@ -1,10 +1,4 @@
-#include "gtest/gtest.h"
-#include "Utils.hpp"
-#include <vector>
-#include <cstdint>
-#include <string_view>
-#include <stdexcept>
-#include <cstring> // For std::memcpy
+#include "helper.hpp"
 
 // POD struct for testing
 struct TestPOD {

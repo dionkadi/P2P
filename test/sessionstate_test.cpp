@@ -1,10 +1,4 @@
-#include "gtest/gtest.h"
-#include "SessionState.hpp"
-#include "helper.hpp" // For string_to_bytes, bytes_to_string
-#include <filesystem>
-#include <fstream>
-#include <string>
-#include <vector>
+#include "helper.hpp"
 
 // Fixture for SessionState tests to handle temporary files
 class SessionStateTest : public ::testing::Test {

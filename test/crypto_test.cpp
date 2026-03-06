@@ -1,10 +1,4 @@
-#include "gtest/gtest.h"
-#include "Utils.hpp"
-#include "helper.hpp" // For string_to_bytes, bytes_to_string
-#include <string>
-#include <vector>
-#include <filesystem>
-#include <fstream>
+#include "helper.hpp"
 
 TEST(CryptoTest, HexToBytesValid) {
     std::string hex_str = "010a2fbcde";

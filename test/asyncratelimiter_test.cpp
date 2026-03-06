@@ -1,20 +1,4 @@
-#include "gtest/gtest.h"
-#include "AsyncRateLimiter.hpp"
 #include "helper.hpp"
-#include <boost/asio.hpp>
-#include <boost/asio/co_spawn.hpp>
-#include <boost/asio/deferred.hpp>
-#include <boost/asio/detached.hpp>
-#include <boost/asio/experimental/awaitable_operators.hpp>
-#include <boost/asio/experimental/cancellation_condition.hpp>
-#include <boost/asio/experimental/parallel_group.hpp>
-#include <boost/asio/io_context.hpp>
-#include <boost/asio/use_awaitable.hpp>
-#include <chrono>
-#include <utility>
-#include <vector>
-
-namespace asio = boost::asio;
 
 TEST(AsyncRateLimiterTest, NoRateLimitWhenRateIsZero) {
     asio::io_context io_context;
