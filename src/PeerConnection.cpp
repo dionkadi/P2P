@@ -44,6 +44,7 @@ PeerConnection::PeerConnection(
     std::shared_ptr<SessionState> state, std::shared_ptr<IPeerConnectionEvents> events
 ) noexcept : io_context_(io_context),
     strand_(asio::make_strand(io_context_)),
+    keep_alive_timer_(strand_),
     socket_(std::move(socket)),
     peer_addr_(std::move(peer_addr)),
     state_(std::move(state)),
@@ -220,11 +221,10 @@ asio::awaitable<void> PeerConnection::message_loop() {
 
 asio::awaitable<void> PeerConnection::keep_alive_loop() {
     auto self = shared_from_this();
-    asio::steady_timer timer(strand_);
 
     while (true) {
-        timer.expires_after(std::chrono::minutes(2));
-        auto [ec] = co_await timer.async_wait(asio::as_tuple(asio::use_awaitable));
+        keep_alive_timer_.expires_after(std::chrono::minutes(2));
+        auto [ec] = co_await keep_alive_timer_.async_wait(asio::as_tuple(asio::use_awaitable));
         if (ec == asio::error::operation_aborted) {
             LOGDBG("Keep-alive timer for {} aborted. Exiting loop.", peer_id_);
             co_return;

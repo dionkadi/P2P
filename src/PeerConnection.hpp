@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <boost/asio/io_context.hpp>
+#include <boost/asio/steady_timer.hpp>
 #include <boost/asio/strand.hpp>
 #include <cstddef>
 #include <cstdint>
@@ -104,7 +105,12 @@ public:
         return supported_pex_;
     }
 
-    void close() noexcept { socket_.close(); }
+    void close() noexcept {
+        asio::post(strand_, [self = shared_from_this()] {
+            self->socket_.close();
+            self->keep_alive_timer_.cancel();
+        });
+    }
     
     asio::awaitable<void> send_simple_message(MessageType type);
     asio::awaitable<void> send_request(size_t index, uint32_t begin, uint32_t length);
@@ -128,6 +134,7 @@ private:
 
     asio::io_context& io_context_;
     asio::strand<asio::io_context::executor_type> strand_;
+    asio::steady_timer keep_alive_timer_;
     AsyncSocket socket_;
     std::string peer_addr_;
     PeerId peer_id_{};
