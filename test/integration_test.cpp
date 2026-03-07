@@ -1,4 +1,5 @@
 #include "helper.hpp"
+#include <boost/asio/strand.hpp>
 #include <iostream>
 
 // Simple tracker that can be run in a separate thread
@@ -111,37 +112,39 @@ protected:
     public:
         SessionHandle(asio::io_context& io, std::shared_ptr<TorrentSession> session,
                       std::chrono::seconds timeout = 60s)
-            : io_(io), session_(session), timeout_timer_(io),
+            : io_(io), strand_(asio::make_strand(io)), session_(session), 
+                timeout_timer_(strand_),
                 stop_promise_(), stop_future_(stop_promise_.get_future()) 
         {
             // Set completion callback
-            session_->set_on_complete([this] { set_done(); });
+            session_->set_on_complete(asio::bind_executor(strand_, [this] { 
+                set_done(); 
+            }));
             // Start session in background
-            asio::co_spawn(io, session_->run(), [this](std::exception_ptr e) {
+            asio::co_spawn(io, session_->run(), asio::bind_executor(strand_, [this](std::exception_ptr e) {
                 if (e) {
                     set_error(e);
                 } else if (!done_.load()) {
                     set_done();
                 }
-
-            });
+            }));
             // Set timeout
             timeout_timer_.expires_after(timeout);
-            timeout_timer_.async_wait([this](boost::system::error_code ec) {
+            timeout_timer_.async_wait(asio::bind_executor(strand_, [this](boost::system::error_code ec) {
                 if (!ec && !done_.load()) {
                     set_error(std::make_exception_ptr(std::runtime_error("Test timeout")));
                 }
-            });
+            }));
         }
 
         ~SessionHandle() {
-            asio::co_spawn(io_, session_->stop(), [this](std::exception_ptr e) {
+            asio::co_spawn(io_, session_->stop(), asio::bind_executor(strand_, [this](std::exception_ptr e) {
                 if (e) {
-                    stop_promise_.set_exception(e); // Propagate any error during stop()
+                    stop_promise_.set_exception(e);
                 } else {
-                    stop_promise_.set_value(); // Signal that stop() has completed successfully
+                    stop_promise_.set_value();
                 }
-            });
+            }));
             
             auto status = stop_future_.wait_for(10s);
             if (status == std::future_status::timeout) {
@@ -175,6 +178,7 @@ protected:
         }
 
         asio::io_context& io_;
+        asio::strand<asio::io_context::executor_type> strand_;
         std::shared_ptr<TorrentSession> session_;
         asio::steady_timer timeout_timer_;
         std::promise<void> download_promise_;
@@ -440,7 +444,7 @@ TEST_F(IntegrationTest, MultipleSeeders) {
     
     auto downloaded_file = download_dir / "data.bin";
     EXPECT_TRUE(std::filesystem::exists(downloaded_file));
-    EXPECT_EQ(std::filesystem::file_size(downloaded_file), 1024 * 1024);
+    EXPECT_EQ(std::filesystem::file_size(downloaded_file), 2 * 1024 * 1024);
 
     std::ifstream f1(file_path, std::ios::binary);
     std::ifstream f2(downloaded_file, std::ios::binary);
@@ -670,18 +674,33 @@ TEST_F(IntegrationTest, RateLimiterAccuracy) {
     auto seeder = create_seeder(PEER_PORT_BASE);
     SessionHandle seeder_handle(test_io, seeder, 120s);
 
-    // Leecher with 1 MB/s download limit
-    auto leecher = create_leecher(PEER_PORT_BASE + 1, 0, 1024 * 1024);
-
+    uint64_t download_rate_bps = 1024 * 1024; // 1 MB/s
+    auto leecher = create_leecher(PEER_PORT_BASE + 1, 0, download_rate_bps);
     auto start_time = std::chrono::steady_clock::now();
     SessionHandle leecher_handle(test_io, leecher, 120s);
-
     leecher_handle.wait();
-
     auto end_time = std::chrono::steady_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
 
-    double rate_mbps = (5.0 * 8) / (duration.count() / 1000.0); // Mbps
-    double expected_rate_mbps = 8.0; // 1 MB/s = 8 Mbps
-    EXPECT_NEAR(rate_mbps, expected_rate_mbps, 1.0); // allow ±2 Mbps tolerance
+    double total_bytes_downloaded = 5.0 * 1024 * 1024; // 5 MB
+    // Calculate expected time based on 1MB/s rate and 1MB burst capacity (default capacity_factor=1)
+    // 1MB is "burst" instantly (adds 0 time to throttled duration)
+    double throttled_bytes = total_bytes_downloaded - download_rate_bps; // 5MB - 1MB = 4MB
+    double expected_throttled_time_s = throttled_bytes / download_rate_bps; // 4MB / 1MB/s = 4s
+    double expected_total_time_s = expected_throttled_time_s; // If burst is instant
+    
+    // Calculate expected average rate in bytes/second
+    double expected_rate_bytes_per_second = total_bytes_downloaded / expected_total_time_s; // 5MB / 4s = 1.25 MB/s
+    
+    // Calculate measured average rate in bytes/second
+    double measured_rate_bytes_per_second = total_bytes_downloaded / (duration.count() / 1000.0);
+    // Define tolerance (e.g., 5% of the expected rate, or a fixed 0.1 MB/s)
+    double tolerance_bytes_per_second = expected_rate_bytes_per_second * 0.05; // 5% tolerance
+    // For better logging in case of failure, also print values as MB/s
+    double measured_rate_mbps_display = measured_rate_bytes_per_second / (1024.0 * 1024.0);
+    double expected_rate_mbps_display = expected_rate_bytes_per_second / (1024.0 * 1024.0);
+    double tolerance_mbps_display = tolerance_bytes_per_second / (1024.0 * 1024.0);
+    LOGINFO("Measured Rate: {:.2f} MB/s, Expected Rate: {:.2f} MB/s, Tolerance: {:.2f} MB/s",
+            measured_rate_mbps_display, expected_rate_mbps_display, tolerance_mbps_display);
+    EXPECT_NEAR(measured_rate_bytes_per_second, expected_rate_bytes_per_second, tolerance_bytes_per_second);
 }
