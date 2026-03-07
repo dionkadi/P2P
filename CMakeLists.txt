@@ -19,14 +19,12 @@ set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -Wall -Wextra -Werror")
 set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -O0 -g -fsanitize=address -fno-omit-frame-pointer -fno-optimize-sibling-calls")
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-
 find_package(Threads REQUIRED)
 find_package(Boost REQUIRED COMPONENTS url)
 find_package(GTest REQUIRED)
 find_package(OpenSSL REQUIRED)
+find_package(spdlog REQUIRED)
 
-add_subdirectory(third_party/json)
-add_subdirectory(third_party/spdlog)
 
 add_library(p2p_common
     src/Bencode.cpp  
@@ -37,13 +35,8 @@ add_library(p2p_common
     src/TorrentSession.cpp
 )
 
-target_include_directories(p2p_common PUBLIC
-    third_party/json/include/nlohmann
-    third_party/spdlog/include/spdlog
-)
-
 target_link_libraries(p2p_common PUBLIC
-    spdlog
+    spdlog::spdlog
     Threads::Threads
     Boost::headers
     Boost::url
