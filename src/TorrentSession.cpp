@@ -15,6 +15,7 @@ TorrentSession::TorrentSession(
     uint64_t download_rate_bps 
 ) : io_context_(io_context), strand_(asio::make_strand(io_context)), 
     save_timer_(io_context_), tracker_announce_timer_(io_context_),
+    discovered_peers_timer_(io_context_),
     my_peer_id_(std::move(my_peer_id)), peer_port_(peer_port), mode_(mode),
     state_(std::make_shared<SessionState>(torrent_path, save_path)),
     piece_manager_(std::make_shared<PieceManager>(io_context, state_)),
@@ -151,6 +152,7 @@ asio::awaitable<void> TorrentSession::stop() {
     completion_timer_.cancel();
     save_timer_.cancel();
     tracker_announce_timer_.cancel();
+    discovered_peers_timer_.cancel();
     peer_manager_->cancel();
     piece_manager_->notify_one();
 
@@ -328,22 +330,33 @@ asio::awaitable<void> TorrentSession::announce_tracker_for(std::string event) {
 }
 
 asio::awaitable<void> TorrentSession::discovered_peers_loop() {
-    for (const auto& ep : peer_manager_->get_discovered_peers()) {
-        std::string addr = std::format("{}:{}", ep.address().to_string(), ep.port());
-        bool already_connected = peer_manager_->contains_peer_addr(addr);
-        if (!already_connected) {
-            asio::co_spawn(io_context_, 
-                [addr, this] () -> asio::awaitable<void> {
-                    auto socket = co_await peer_manager_->connect_to_peer(addr);
-                    if (socket) {
-                        co_await handle_new_connection(std::move(*socket), addr);
-                    }
-                }, 
-                asio::detached
-            );
+    auto self = shared_from_this();
+
+    while (!shutting_down_) {
+        for (const auto& ep : peer_manager_->get_discovered_peers()) {
+            std::string addr = std::format("{}:{}", ep.address().to_string(), ep.port());
+            bool already_connected = peer_manager_->contains_peer_addr(addr);
+            if (!already_connected) {
+                asio::co_spawn(io_context_, 
+                    [addr, this] () -> asio::awaitable<void> {
+                        auto socket = co_await peer_manager_->connect_to_peer(addr);
+                        if (socket) {
+                            co_await handle_new_connection(std::move(*socket), addr);
+                        }
+                    }, 
+                    asio::detached
+                );
+            }
+        }
+
+        discovered_peers_timer_.expires_after(1min);
+        boost::system::error_code ec;
+        co_await discovered_peers_timer_.async_wait(asio::redirect_error(asio::use_awaitable, ec));
+        if (ec == asio::error::operation_aborted) {
+            LOGDBG("Discovered peers periodic loop aborted.");
+            co_return;
         }
     }
-    co_return ;
 }
 
 asio::awaitable<void> TorrentSession::periodically_save() {
@@ -450,6 +463,11 @@ asio::awaitable<void> TorrentSession::on_block_request(std::shared_ptr<PeerConne
     bool should_respond = false;
     if (!conn->am_choking() && conn->peer_is_interested()) {
         should_respond = true;
+    } else if (!conn->am_choking() && !conn->peer_is_interested()) {
+        LOGWARN("Peer {} sent REQUEST for piece {} begin {} length {} without previously signaling interest. Assuming interested for this request and updating state.", 
+                conn->peer_id(), piece_index, begin, length);
+        conn->peer_is_interested(true); // Update state to reflect their implied interest
+        should_respond = true;
     }
  
     if (!should_respond) {
@@ -550,7 +568,7 @@ asio::awaitable<void> TorrentSession::on_choke_status_changed(std::shared_ptr<Pe
             
             if (has_needed_pieces) {
                 conn->am_interested(true);
-                asio::co_spawn(io_context_, conn->send_simple_message(MessageType::Interested), asio::detached);
+                co_await conn->send_simple_message(MessageType::Interested);
             }
         }
 
@@ -591,9 +609,18 @@ asio::awaitable<void> TorrentSession::on_disconnect(std::shared_ptr<PeerConnecti
 }
 
 asio::awaitable<void> TorrentSession::on_extended_message(std::shared_ptr<PeerConnection> conn, std::span<const std::byte> payload) {
+    if (payload.empty()) {
+        LOGWARN("Received empty extended message payload from peer {}. Disconnecting.", conn->peer_id());
+        conn->close(); // Disconnect on malformed message
+        co_return;
+    }
+
     conn->update_extension_type(0, ExtendedMessageType::Handshake);
     auto remote_id = static_cast<uint8_t>(payload[0]);
     auto message_type = conn->extension_type(remote_id);
+
+    LOGDBG("Received extended message type {} (ID: {}) from peer {}",
+           static_cast<int>(message_type), remote_id, conn->peer_id());
 
     std::span<const std::byte> extended_payload(payload.data() + 1, payload.size() - 1);
     switch (message_type) {
@@ -636,6 +663,11 @@ asio::awaitable<void> TorrentSession::on_extended_message(std::shared_ptr<PeerCo
             if (pex_dict->get()->count("added")) {
                 std::string added = std::get<std::string>(pex_dict->get()->at("added").get_variant());
                 for (size_t i = 0; i < added.size(); i += 6) {
+                    if (i + 6 > added.size()) { // Bounds check for IP:Port pair
+                        LOGERR("Malformed PEX 'added' payload from peer {}. Not enough bytes for an IP:Port pair. Disconnecting.", conn->peer_id());
+                        conn->close(); 
+                        co_return;
+                    }
                     auto ip_bytes = asio::ip::address_v4::bytes_type();
                     std::copy_n(added.begin() + i, 4, ip_bytes.begin());
                     auto ip = asio::ip::make_address_v4(std::move(ip_bytes));
@@ -643,13 +675,24 @@ asio::awaitable<void> TorrentSession::on_extended_message(std::shared_ptr<PeerCo
                     std::copy_n(added.begin() + i + 4, 2, reinterpret_cast<unsigned char *>(&port_net));
                     uint16_t port = asio::detail::socket_ops::network_to_host_short(port_net);
                     EndPoint ep(ip, port);
-                    peer_manager_->add_discovered_peer(ep);
+                    // Filter out self-connection from PEX
+                    if (ip == asio::ip::make_address_v4("127.0.0.1") && port == peer_port_) { // Assuming peer_port_ is this session's listening port
+                        LOGDBG("PEX: Ignoring self-peer {}:{} received from {}", ip.to_string(), port, conn->peer_id());
+                    } else {
+                        peer_manager_->add_discovered_peer(ep);
+                        LOGDBG("PEX: Discovered peer {}:{} from {}", ip.to_string(), port, conn->peer_id());
+                    }
                 }
             }
 
             if (pex_dict->get()->count("dropped")) {
                 std::string dropped = std::get<std::string>(pex_dict->get()->at("dropped").get_variant());
                 for (size_t i = 0; i < dropped.size(); i += 6) {
+                    if (i + 6 > dropped.size()) { // Bounds check
+                        LOGERR("Malformed PEX 'dropped' payload from peer {}. Not enough bytes for an IP:Port pair. Disconnecting.", conn->peer_id());
+                        conn->close(); 
+                        co_return;
+                    }
                     auto ip_bytes = asio::ip::address_v4::bytes_type();
                     std::copy_n(dropped.begin() + i, 4, ip_bytes.begin());
                     auto ip = asio::ip::make_address_v4(std::move(ip_bytes));
@@ -659,17 +702,23 @@ asio::awaitable<void> TorrentSession::on_extended_message(std::shared_ptr<PeerCo
                     EndPoint ep(ip, port);
                     peer_manager_->add_dropped_peer(ep);
                     peer_manager_->remove_discovered_peer(ep);
+                    LOGDBG("PEX: Dropped peer {}:{} from {}", ip.to_string(), port, conn->peer_id());
                 }
             }
 
             break;
         }
         case ExtendedMessageType::ut_metadata: {
-            LOGDBG("Unimplemented yet");
-            break;
+            LOGWARN("UT_METADATA not implemented yet. Received from peer {}. Disconnecting.", conn->peer_id());
+            conn->close(); // Disconnect if unimplemented essential feature is received
+            co_return;
         }
-        default:
-            LOGERR("Unknown extension type");
+        default: {
+            LOGWARN("Received unhandled extended message type {} (ID: {}) from peer {}. Disconnecting.", 
+                    static_cast<int>(message_type), remote_id, conn->peer_id());
+            conn->close(); // Disconnect on unhandled extended message
+            co_return;
+        }
     }
     co_return ;
 }

@@ -73,6 +73,7 @@ private:
     asio::strand<asio::any_io_executor> strand_;
     asio::steady_timer save_timer_;
     asio::steady_timer tracker_announce_timer_;
+    asio::steady_timer discovered_peers_timer_;
     PeerId my_peer_id_;
     uint16_t peer_port_;
     Mode mode_;

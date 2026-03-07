@@ -147,18 +147,22 @@ asio::awaitable<void> PeerConnection::message_loop() {
 
             switch (type) {
                 case MessageType::Choke:
+                    // LOGDBG("Peer {} sent CHOKE. Setting peer_is_choking to true.", peer_id_);
                     peer_is_choking_.store(true, std::memory_order_relaxed);
                     co_await events_->on_choke_status_changed(self, true);
                     break;
                 case MessageType::Unchoke: {
+                    // LOGDBG("Peer {} sent UNCHOKE. Setting peer_is_choking to false.", peer_id_);
                     peer_is_choking_.store(false, std::memory_order_relaxed);
                     co_await events_->on_choke_status_changed(self, false);
                     break;
                 }
                 case MessageType::Interested:
+                    // LOGDBG("Peer {} sent INTERESTED. Setting peer_is_interested to true.", peer_id_);
                     peer_is_interested_.store(true, std::memory_order_relaxed);
                     break;
                 case MessageType::NotInterested:  
+                    // LOGDBG("Peer {} sent NOT INTERESTED. Setting peer_is_interested to false.", peer_id_);
                     peer_is_interested_.store(false, std::memory_order_relaxed);
                     break;
                 case MessageType::Bitfield: {
@@ -204,6 +208,8 @@ asio::awaitable<void> PeerConnection::message_loop() {
                         break;
                     }
                     RequestPayload req = RequestPayload::deserialize(payload);
+                    // LOGDBG("Peer {} sent REQUEST for piece {} begin {} length {}. Current state: am_choking={}, peer_is_interested={}", 
+                    //        peer_id_, req.index, req.begin, req.length, am_choking_.load(), peer_is_interested_.load());
                     co_await events_->on_block_request(self, req.index, req.begin, req.length);
                     break;
                 }

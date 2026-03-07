@@ -570,7 +570,7 @@ asio::awaitable<std::map<std::string, int64_t>> FileManager::async_get_file_mtim
                         auto full_path = get_full_path_for_file(file_info);
                         try {
                             if (std::filesystem::exists(full_path)) {
-                                mtimes[full_path.string()] = std::filesystem::last_write_time(full_path).time_since_epoch().count();
+                                mtimes[file_info.path.string()] = std::filesystem::last_write_time(full_path).time_since_epoch().count();
                             }
                         } catch (const std::exception& e) {
                             LOGWARN("Could not get mtime for {}: {}", full_path.string(), e.what());
