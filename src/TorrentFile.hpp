@@ -2,7 +2,6 @@
 
 #include "Utils.hpp"
 #include "Bencode.hpp"
-#include "Types.hpp"
 
 #include <ranges>
 

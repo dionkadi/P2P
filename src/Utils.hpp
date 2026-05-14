@@ -1,9 +1,12 @@
 #pragma once
 
 #include <boost/asio.hpp>
+#include <boost/asio/experimental/channel.hpp>
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <array>
+#include <type_traits>
 #include <vector>
 #include <string_view>
 #include <endian.h>
@@ -12,6 +15,7 @@
 #include <random>
 #include <string>
 #include <map>
+#include <set>
 #include <queue>
 #include <deque>
 #include <chrono>
@@ -971,4 +975,15 @@ inline Value create_error_response(const String& transaction_id, Integer error_c
         {"y", Value("e")},
         {"e", Value(List{Value(error_code), Value(error_message)})}
     });
+}
+
+
+template <typename T>
+void print_size(const T&) {
+    // no member size()
+}
+
+template <typename T, typename = std::void_t<decltype(std::declval<T>().size())>>
+void print_size(const T&) {
+
 }

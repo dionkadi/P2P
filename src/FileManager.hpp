@@ -9,7 +9,7 @@
 #include <boost/asio.hpp>
 
 #include "SessionState.hpp"
-#include "Types.hpp"
+#include "Utils.hpp"
 
 namespace asio = boost::asio;
 

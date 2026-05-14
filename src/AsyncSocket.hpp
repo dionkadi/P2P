@@ -1,6 +1,14 @@
 #pragma once
 
 #include <boost/asio.hpp>
+#include <boost/asio/awaitable.hpp>
+#include <boost/asio/io_context.hpp>
+#include <boost/asio/ip/udp.hpp>
+#include <boost/asio/redirect_error.hpp>
+#include <boost/asio/use_awaitable.hpp>
+#include <boost/system/detail/error_code.hpp>
+#include <cstdint>
+#include <string>
 namespace asio = boost::asio;
 
 #include "Utils.hpp"
@@ -140,4 +148,83 @@ public:
 
 private:
     asio::ip::tcp::acceptor acceptor_;
+};
+
+using udp = asio::ip::udp;
+
+class AsyncUdpSocket {
+public:
+    explicit AsyncUdpSocket(asio::io_context& io_context, uint16_t port = 0)
+        : socket_(io_context)
+    {
+        if (port > 0) {
+            socket_.open(udp::v4());
+            socket_.bind(udp::endpoint(udp::v4(), port));
+            LOGINFO("UDP socket bound to port {}", port);
+        }
+    }
+
+    AsyncUdpSocket(const AsyncUdpSocket&) = delete;
+    AsyncUdpSocket& operator=(const AsyncUdpSocket&) = delete;
+    AsyncUdpSocket(AsyncUdpSocket&&) noexcept = default;
+    AsyncUdpSocket& operator=(AsyncUdpSocket&&) noexcept = default;
+
+    asio::awaitable<void> send_to(std::span<const std::byte> data, const udp::endpoint& remote) {
+        if (!socket_.is_open()) {
+            socket_.open(udp::v4());
+        }
+
+        boost::system::error_code ec;
+        co_await socket_.async_send_to(asio::buffer(data.data(), data.size()), remote, asio::redirect_error(asio::use_awaitable, ec));
+        if (ec) {
+            LOGERR("UDP send_to error to {}: {}. Data size: {}", remote.address().to_string(), ec.message(), data.size());
+            throw boost::system::system_error(ec, "UDP send_to failed");
+        }
+    }
+
+    // Returns a pair: (std::vector<std::byte> received_bytes, udp::endpoint remote_endpoint)
+    asio::awaitable<std::tuple<std::vector<std::byte>, udp::endpoint>>
+    receive_from(size_t max_buffer_size = 2048) {
+        std::vector<std::byte> buffer(max_buffer_size);
+        udp::endpoint remote;
+        boost::system::error_code ec;
+        size_t bytes_received = co_await socket_.async_receive_from(asio::buffer(buffer), remote, asio::redirect_error(asio::use_awaitable, ec));
+        if (ec) {
+            // Operation aborted is normal during shutdown
+            if (ec == asio::error::operation_aborted) {
+                throw boost::system::system_error(ec, "UDP receive_from aborted");
+            }
+            LOGERR("UDP receive_from error: {}", ec.message());
+            throw boost::system::system_error(ec, "UDP receive_from failed");
+        }
+
+        buffer.resize(bytes_received);
+        co_return std::make_tuple(std::move(buffer), remote);
+    }
+
+    static udp::endpoint resolve_endpoint(asio::io_context io_context, const std::string& host, uint16_t port) {
+        udp::resolver resolver(io_context);
+        return *resolver.resolve(host, std::to_string(port)).begin();
+    }
+
+    udp::endpoint local_endpoint() const {
+        boost::system::error_code ec;
+        auto ep = socket_.local_endpoint(ec);
+        if (ec) {
+            LOGWARN("Error getting UDP local_endpoint: {}", ec.message());
+            return {};
+        }
+        return ep;
+    }
+
+    void close() {
+        if (socket_.is_open()) {
+            boost::system::error_code ec;
+            socket_.cancel(ec); // Cancel any pending async operations
+            socket_.close(ec);
+        }
+    }
+
+private:
+    udp::socket socket_;
 };

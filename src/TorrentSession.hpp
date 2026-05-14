@@ -1,6 +1,6 @@
 #pragma once
 
-#include "Types.hpp"
+#include "Utils.hpp"
 #include "AsyncRateLimiter.hpp"
 #include "SessionState.hpp"
 #include "PieceManager.hpp"
