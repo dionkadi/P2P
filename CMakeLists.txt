@@ -29,6 +29,7 @@ find_package(spdlog REQUIRED)
 add_library(p2p_common
     src/Bencode.cpp  
     src/FileManager.cpp  
+    src/Kademlia.cpp
     src/PeerConnection.cpp  
     src/PeerManager.cpp  
     src/PieceManager.cpp  
