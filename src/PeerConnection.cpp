@@ -55,9 +55,11 @@ PeerConnection::PeerConnection(
 asio::awaitable<bool> PeerConnection::perform_handshake(const PeerId& my_id) {
     try {
         LOGDBG("Starting handshake with peer {}", peer_addr_);
-        const auto& info_hash_bytes = state_->info_hash();
+        const auto& info_hash_vec = state_->info_hash();
+        InfoHash info_hash_arr{};
+        std::ranges::copy(info_hash_vec, info_hash_arr.begin());
         Handshake my_handshake {
-            .info_hash_bytes = info_hash_bytes, 
+            .info_hash_bytes = info_hash_arr,
             .peer_id_bytes = my_id,
             .extended = true
         };
@@ -67,9 +69,9 @@ asio::awaitable<bool> PeerConnection::perform_handshake(const PeerId& my_id) {
         std::vector<std::byte> handshake_buffer = co_await socket_.receive_raw(HANDSHAKE_BASE_LEN);
         Handshake peer_handshake = Handshake::deserialize(handshake_buffer);
 
-        if (peer_handshake.info_hash_bytes != info_hash_bytes) {
+        if (peer_handshake.info_hash_bytes != info_hash_arr) {
             LOGERR("Info hash mismatch with {}. Expected {}, got {}.",
-                   peer_addr_, Crypto::bytes_to_hex(info_hash_bytes), Crypto::bytes_to_hex(peer_handshake.info_hash_bytes));
+                   peer_addr_, Crypto::bytes_to_hex(info_hash_arr), Crypto::bytes_to_hex(peer_handshake.info_hash_bytes));
             throw std::runtime_error("Info hash mismatch");
         }
 
@@ -313,4 +315,12 @@ asio::awaitable<void> PeerConnection::send_extended_message(uint8_t type_id, std
     msg_body.push_back(static_cast<std::byte>(type_id));
     msg_body.insert(msg_body.end(), payload.begin(), payload.end());
     co_await socket_.send_message(msg_body);
+}
+
+asio::awaitable<void> PeerConnection::send_metadata_request(uint8_t ext_id, int piece) {
+    Dict msg_dict;
+    msg_dict["msg_type"] = Value(static_cast<Integer>(0));
+    msg_dict["piece"] = Value(static_cast<Integer>(piece));
+    auto encoded = encode(Value(std::move(msg_dict)));
+    co_await send_extended_message(ext_id, encoded);
 }

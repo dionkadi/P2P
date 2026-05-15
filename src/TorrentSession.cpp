@@ -1,4 +1,5 @@
 #include "TorrentSession.hpp"
+#include "MagnetUri.hpp"
 #include "Utils.hpp"
 
 #include <algorithm>
@@ -21,6 +22,13 @@ TorrentSession::TorrentSession(
     piece_manager_(std::make_shared<PieceManager>(io_context, state_)),
     peer_manager_(std::make_shared<PeerManager>(io_context, state_)),
     file_manager_(std::make_unique<FileManager>(state_)),
+    dht_node_(std::make_shared<DHTNode>(io_context, peer_port)),
+    dht_announce_timer_(io_context),
+    dht_bootstrap_nodes_({
+        "router.bittorrent.com:6881",
+        "dht.libtorrent.org:25401",
+        "dht.transmissionbt.com:6881"
+    }),
     upload_limiter_(io_context, upload_rate_bps),
     download_limiter_(io_context, download_rate_bps),
     completion_timer_(io_context) 
@@ -51,7 +59,88 @@ TorrentSession::TorrentSession(
     completion_timer_.expires_at(asio::steady_timer::time_point::max());
 }
 
+// Internal constructor: create from a pre-built SessionState (magnet links)
+TorrentSession::TorrentSession(
+    asio::io_context& io_context,
+    PeerId my_peer_id,
+    std::shared_ptr<SessionState> state,
+    int peer_port,
+    Mode mode,
+    uint64_t upload_rate_bps,
+    uint64_t download_rate_bps
+) : io_context_(io_context), strand_(asio::make_strand(io_context)),
+    save_timer_(io_context_), tracker_announce_timer_(io_context_),
+    discovered_peers_timer_(io_context_),
+    my_peer_id_(std::move(my_peer_id)), peer_port_(peer_port), mode_(mode),
+    state_(std::move(state)),
+    piece_manager_(std::make_shared<PieceManager>(io_context, state_)),
+    peer_manager_(std::make_shared<PeerManager>(io_context, state_)),
+    file_manager_(std::make_unique<FileManager>(state_)),
+    dht_node_(std::make_shared<DHTNode>(io_context, peer_port)),
+    dht_announce_timer_(io_context),
+    dht_bootstrap_nodes_({
+        "router.bittorrent.com:6881",
+        "dht.libtorrent.org:25401",
+        "dht.transmissionbt.com:6881"
+    }),
+    upload_limiter_(io_context, upload_rate_bps),
+    download_limiter_(io_context, download_rate_bps),
+    completion_timer_(io_context)
+{
+    for (const auto& tier : state_->tracker_tiers()) {
+        auto client_tier_view = tier
+                                | std::views::transform([&](const std::string& url) -> std::shared_ptr<ITrackerClient> {
+                                    try {
+                                        return create_tracker_client(io_context, url);
+                                    } catch (const std::exception& e) {
+                                        LOGWARN("Failed to create tracker client for URL '{}': {}", url, e.what());
+                                        return nullptr;
+                                    }
+                                })
+                                | std::views::filter([](const std::shared_ptr<ITrackerClient>& client) {
+                                    return client != nullptr;
+                                });
+        std::vector<std::shared_ptr<ITrackerClient>> client_tier(client_tier_view.begin(), client_tier_view.end());
+        if (!client_tier.empty()) {
+            tracker_clients_by_tier_.push_back(std::move(client_tier));
+        }
+    }
+    completion_timer_.expires_at(asio::steady_timer::time_point::max());
+}
+
+std::shared_ptr<TorrentSession> TorrentSession::create_from_magnet(
+    asio::io_context& io_context,
+    PeerId my_peer_id,
+    const std::string& magnet_uri,
+    const std::filesystem::path& save_path,
+    int peer_port,
+    Mode mode,
+    uint64_t upload_rate_bps,
+    uint64_t download_rate_bps
+) {
+    MagnetLink link = parse_magnet_uri(magnet_uri);
+    std::vector<std::vector<std::string>> tracker_tiers;
+    if (!link.tracker_urls.empty()) {
+        tracker_tiers.push_back(link.tracker_urls);
+    }
+
+    InfoHash info_hash_arr = link.info_hash;
+    auto state = std::make_shared<SessionState>(info_hash_arr, std::move(tracker_tiers), save_path);
+    auto session = std::shared_ptr<TorrentSession>(new TorrentSession(
+        io_context, std::move(my_peer_id), state, peer_port, mode,
+        upload_rate_bps, download_rate_bps
+    ));
+    session->metadata_download_active_ = true;
+    return session;
+}
+
 asio::awaitable<bool> TorrentSession::init() {
+    // Magnet link mode: no metadata yet, skip file operations
+    if (state_->num_pieces() == 0) {
+        LOGINFO("Session started in metadata-download mode (magnet link). Waiting for metadata from peers...");
+        co_return true;
+    }
+
     if (mode_ == Mode::Seed) {
         bool success = co_await file_manager_->verify_seed_data();
         if (!success) {
@@ -111,6 +200,13 @@ asio::awaitable<void> TorrentSession::run() {
     }, asio::detached);
 
     asio::co_spawn(strand_, tracker_announce_loop(), asio::detached);
+
+    dht_node_->start();
+    LOGINFO("DHT node started on UDP port {}", peer_port_);
+    asio::co_spawn(io_context_, [self = shared_from_this()]() -> asio::awaitable<void> {
+        co_await self->dht_node_->bootstrap(self->dht_bootstrap_nodes_);
+    }, asio::detached);
+    asio::co_spawn(strand_, dht_announce_loop(), asio::detached);
     
     if (mode_ == Mode::Leech) {
         asio::co_spawn(io_context_, peer_manager_->choke_loop(), asio::detached);
@@ -148,6 +244,9 @@ asio::awaitable<void> TorrentSession::stop() {
     if (peer_server_) {
         peer_server_->close();
     }
+
+    dht_node_->stop();
+    dht_announce_timer_.cancel();
 
     completion_timer_.cancel();
     save_timer_.cancel();
@@ -354,6 +453,33 @@ asio::awaitable<void> TorrentSession::discovered_peers_loop() {
         co_await discovered_peers_timer_.async_wait(asio::redirect_error(asio::use_awaitable, ec));
         if (ec == asio::error::operation_aborted) {
             LOGDBG("Discovered peers periodic loop aborted.");
+            co_return;
+        }
+    }
+}
+
+asio::awaitable<void> TorrentSession::dht_announce_loop() {
+    while (!shutting_down_) {
+        const auto& info_hash_vec = state_->info_hash();
+        InfoHash info_hash{};
+        std::ranges::copy(info_hash_vec, info_hash.begin());
+
+        if (mode_ == Mode::Seed || state_->is_download_complete()) {
+            co_await dht_node_->announce_peer(info_hash, peer_port_);
+        }
+
+        auto dht_peers = co_await dht_node_->get_peers(info_hash, 50);
+        for (const auto& ep : dht_peers) {
+            if (ep.port() != peer_port_ || ep.address().to_string() != "127.0.0.1") {
+                peer_manager_->add_discovered_peer(ep);
+            }
+        }
+
+        dht_announce_timer_.expires_after(std::chrono::minutes(30));
+        boost::system::error_code ec;
+        co_await dht_announce_timer_.async_wait(asio::redirect_error(asio::use_awaitable, ec));
+        if (ec == asio::error::operation_aborted) {
+            LOGDBG("DHT announce timer aborted.");
             co_return;
         }
     }
@@ -648,7 +774,24 @@ asio::awaitable<void> TorrentSession::on_extended_message(std::shared_ptr<PeerCo
                 LOGDBG("Version: {}", version);
             }
 
-            // ...
+            if (m_dict) {
+                for (auto &[k, v] : **m_dict) {
+                    uint8_t index = std::get<Integer>(v.get_variant());
+                    if (k == "ut_metadata") {
+                        conn->metadata_ext_id(index);
+                        LOGDBG("Peer {} supports ut_metadata at extension ID {}", conn->peer_id(), index);
+                    }
+                }
+            }
+            if (ehs_dict->get()->count("metadata_size")) {
+                int32_t size = static_cast<int32_t>(std::get<Integer>(ehs_dict->get()->at("metadata_size").get_variant()));
+                conn->metadata_size(size);
+
+                bool need_metadata = metadata_download_active_ && state_->torrent_info().pieces.empty();
+                if (need_metadata && conn->metadata_ext_id() != 0 && size > 0) {
+                    asio::co_spawn(io_context_, request_metadata_from_peer(conn), asio::detached);
+                }
+            }
             break;
         }
         case ExtendedMessageType::ut_pex: {
@@ -709,9 +852,114 @@ asio::awaitable<void> TorrentSession::on_extended_message(std::shared_ptr<PeerCo
             break;
         }
         case ExtendedMessageType::ut_metadata: {
-            LOGWARN("UT_METADATA not implemented yet. Received from peer {}. Disconnecting.", conn->peer_id());
-            conn->close(); // Disconnect if unimplemented essential feature is received
-            co_return;
+            if (extended_payload.empty()) {
+                LOGWARN("Empty ut_metadata payload from peer {}", conn->peer_id());
+                co_return;
+            }
+
+            auto decoded_val = decode(extended_payload);
+            const auto* msg_dict = std::get_if<std::unique_ptr<Dict>>(&decoded_val.get_variant());
+            if (!msg_dict) {
+                LOGWARN("Invalid ut_metadata message from peer {}", conn->peer_id());
+                co_return;
+            }
+
+            const Dict& msg = **msg_dict;
+            Integer msg_type = 0;
+            Integer piece_idx = 0;
+            if (msg.count("msg_type")) msg_type = std::get<Integer>(msg.at("msg_type").get_variant());
+            if (msg.count("piece")) piece_idx = std::get<Integer>(msg.at("piece").get_variant());
+
+            if (msg_type == 0) {
+                // Request from peer for a metadata piece
+                if (mode_ != Mode::Seed) {
+                    co_return;
+                }
+                const auto& info_bencoded = state_->info().get_info_bencoded();
+                if (info_bencoded.empty()) {
+                    LOGWARN("Metadata requested but we don't have it yet");
+                    co_return;
+                }
+                int num_pieces = (static_cast<int>(info_bencoded.size()) + METADATA_PIECE_SIZE - 1) / METADATA_PIECE_SIZE;
+                if (piece_idx < 0 || piece_idx >= num_pieces) {
+                    // Reject
+                    Dict reject_dict;
+                    reject_dict["msg_type"] = Value(static_cast<Integer>(2));
+                    reject_dict["piece"] = Value(piece_idx);
+                    auto reject_payload = encode(Value(std::move(reject_dict)));
+                    co_await conn->send_extended_message(conn->metadata_ext_id(), reject_payload);
+                    co_return;
+                }
+
+                size_t offset = static_cast<size_t>(piece_idx) * METADATA_PIECE_SIZE;
+                size_t length = std::min<size_t>(METADATA_PIECE_SIZE, info_bencoded.size() - offset);
+                std::span<const std::byte> piece_data(info_bencoded.data() + offset, length);
+
+                Dict data_dict;
+                data_dict["msg_type"] = Value(static_cast<Integer>(1));
+                data_dict["piece"] = Value(piece_idx);
+                data_dict["total_size"] = Value(static_cast<Integer>(info_bencoded.size()));
+                auto dict_encoded = encode(Value(std::move(data_dict)));
+                // Append raw piece data after the bencoded dict
+                dict_encoded.insert(dict_encoded.end(), piece_data.begin(), piece_data.end());
+                co_await conn->send_extended_message(conn->metadata_ext_id(), dict_encoded);
+                LOGDBG("Sent metadata piece {} to peer {}", piece_idx, conn->peer_id());
+            } else if (msg_type == 1) {
+                // Data: piece of metadata received from peer
+                size_t total_size = 0;
+                if (msg.count("total_size")) total_size = std::get<Integer>(msg.at("total_size").get_variant());
+                if (total_size == 0) {
+                    LOGWARN("ut_metadata data message missing total_size from peer {}", conn->peer_id());
+                    co_return;
+                }
+
+                // The raw metadata piece data follows the bencoded dict
+                size_t dict_end = 0;
+                // Find where the bencoded dict ends by finding the 'e' that closes the top-level dict
+                int depth = 0;
+                for (size_t i = 0; i < extended_payload.size(); ++i) {
+                    char c = static_cast<char>(extended_payload[i]);
+                    if (c == 'd' || c == 'l' || c == 'i') {
+                        if (depth == 0 && (c == 'd' || c == 'l')) {
+                            // OK, start of dict/list
+                        }
+                        if (c == 'd' || c == 'l') depth++;
+                    } else if (c == 'e') {
+                        depth--;
+                        if (depth == 0) {
+                            dict_end = i + 1;
+                            break;
+                        }
+                    }
+                }
+                if (dict_end == 0 || dict_end >= extended_payload.size()) {
+                    LOGWARN("ut_metadata data message has no payload data from peer {}", conn->peer_id());
+                    co_return;
+                }
+                std::span<const std::byte> raw_piece = extended_payload.subspan(dict_end);
+
+                if (metadata_download_active_) {
+                    metadata_buffer_.resize(total_size);
+                    size_t offset = static_cast<size_t>(piece_idx) * METADATA_PIECE_SIZE;
+                    if (offset + raw_piece.size() <= total_size) {
+                        std::ranges::copy(raw_piece, metadata_buffer_.begin() + offset);
+                        metadata_pieces_received_++;
+                        LOGDBG("Received metadata piece {}/{} from peer {}", piece_idx,
+                               (total_size + METADATA_PIECE_SIZE - 1) / METADATA_PIECE_SIZE,
+                               conn->peer_id());
+
+                        size_t total_pieces = (total_size + METADATA_PIECE_SIZE - 1) / METADATA_PIECE_SIZE;
+                        if (metadata_pieces_received_ >= total_pieces) {
+                            LOGINFO("Full metadata received ({} bytes) from peer {}", total_size, conn->peer_id());
+                            co_await on_metadata_complete();
+                        }
+                    }
+                }
+            } else if (msg_type == 2) {
+                // Reject
+                LOGDBG("Peer {} rejected metadata piece {}", conn->peer_id(), piece_idx);
+            }
+            break;
         }
         default: {
             LOGWARN("Received unhandled extended message type {} (ID: {}) from peer {}. Disconnecting.", 
@@ -963,4 +1211,115 @@ asio::awaitable<void> TorrentSession::send_cancel_for_block(uint32_t piece_index
                                     asio::co_spawn(io_context_, conn->send_cancel(piece_index, offset, length), asio::detached);
                                 }
                             });
+}
+
+asio::awaitable<void> TorrentSession::request_metadata_from_peer(std::shared_ptr<PeerConnection> conn) {
+    if (state_->num_pieces() > 0) {
+        co_return;
+    }
+    uint8_t ext_id = conn->metadata_ext_id();
+    if (ext_id == 0) {
+        co_return;
+    }
+
+    int32_t total_size = conn->metadata_size();
+    if (total_size <= 0) {
+        co_return;
+    }
+
+    if (metadata_buffer_.empty()) {
+        metadata_buffer_.resize(static_cast<size_t>(total_size));
+        metadata_pieces_received_ = 0;
+    }
+
+    int total_pieces = (total_size + static_cast<int>(METADATA_PIECE_SIZE) - 1) / static_cast<int>(METADATA_PIECE_SIZE);
+    for (int piece = 0; piece < total_pieces; ++piece) {
+        co_await conn->send_metadata_request(ext_id, piece);
+        LOGDBG("Requested metadata piece {}/{} from peer {}", piece + 1, total_pieces, conn->peer_id());
+    }
+}
+
+asio::awaitable<void> TorrentSession::on_metadata_complete() {
+    try {
+        Value info_val = decode(metadata_buffer_);
+        const auto* info_dict_ptr = std::get_if<std::unique_ptr<Dict>>(&info_val.get_variant());
+        if (!info_dict_ptr) {
+            LOGERR("Received metadata is not a dictionary");
+            metadata_download_active_ = false;
+            co_return;
+        }
+
+        state_->info_mut().set_info_bencoded(metadata_buffer_);
+        const Dict& info_dict = **info_dict_ptr;
+        auto& info = state_->torrent_info();
+        info.name = std::get<String>(info_dict.at("name").get_variant());
+        info.piece_size = std::get<Integer>(info_dict.at("piece length").get_variant());
+        const auto& pieces_str = std::get<String>(info_dict.at("pieces").get_variant());
+        info.pieces.assign(reinterpret_cast<const std::byte*>(pieces_str.data()),
+                           reinterpret_cast<const std::byte*>(pieces_str.data()) + pieces_str.size());
+
+        if (info_dict.count("length")) {
+            info.total_size = std::get<Integer>(info_dict.at("length").get_variant());
+            info.files.push_back({std::filesystem::path(info.name), info.total_size, true});
+        } else {
+            const List* file_list = std::get_if<std::unique_ptr<List>>(&info_dict.at("files").get_variant())->get();
+            for (const auto& file_val : *file_list) {
+                const Dict* file_dict = std::get_if<std::unique_ptr<Dict>>(&file_val.get_variant())->get();
+                uint64_t length = std::get<Integer>(file_dict->at("length").get_variant());
+                const List* path_list = std::get_if<std::unique_ptr<List>>(&file_dict->at("path").get_variant())->get();
+                std::filesystem::path file_path;
+                for (const std::string& part : *path_list | std::views::transform(
+                        [](const Value& pv) { return std::get<String>(pv.get_variant()); })) {
+                    file_path /= part;
+                }
+                info.files.push_back({file_path, length, true});
+                info.total_size += length;
+            }
+        }
+
+        size_t num_pieces = info.pieces.size() / 20;
+        state_->init_pieces(num_pieces);
+
+        LOGINFO("Metadata received and parsed: {} ({} pieces, {} bytes)",
+                info.name, num_pieces, info.total_size);
+
+        // File manager, choker, downloader were skipped in init()
+        // because metadata wasn't available yet. Start them now.
+        if (mode_ == Mode::Seed) {
+            co_await file_manager_->verify_seed_data();
+            std::ranges::for_each(std::views::iota(0UL, num_pieces),
+                                  [this](size_t i) { state_->piece_status(i, PieceStatus::Have); });
+            state_->completed_pieces(num_pieces);
+            state_->is_download_complete(true);
+            co_await piece_manager_->build_piece_rarity();
+        } else {
+            if (!co_await file_manager_->preallocate_files()) {
+                LOGERR("Failed to preallocate files after metadata download");
+                co_return;
+            }
+            co_await piece_manager_->build_piece_rarity();
+        }
+
+        // Start download loops that were skipped in init()
+        if (mode_ == Mode::Leech) {
+            asio::co_spawn(io_context_, peer_manager_->choke_loop(), asio::detached);
+            piece_manager_->set_callback([this](size_t piece_index)
+                -> asio::awaitable<std::vector<std::shared_ptr<PeerConnection>>> {
+                    co_return co_await peer_manager_->available_peers(piece_index);
+                });
+            asio::co_spawn(io_context_, piece_manager_->downloader(), asio::detached);
+            asio::co_spawn(strand_, periodically_save(), asio::detached);
+            asio::co_spawn(strand_, discovered_peers_loop(), asio::detached);
+        }
+
+        metadata_download_active_ = false;
+        metadata_buffer_.clear();
+        metadata_pieces_received_ = 0;
+
+    } catch (const std::exception& e) {
+        LOGERR("Failed to parse received metadata: {}", e.what());
+        metadata_download_active_ = false;
+        metadata_buffer_.clear();
+        metadata_pieces_received_ = 0;
+    }
 }

@@ -119,6 +119,13 @@ public:
     asio::awaitable<void> send_cancel(size_t index, uint32_t begin, uint32_t length);
     asio::awaitable<void> send_have(size_t index);
     asio::awaitable<void> send_extended_message(uint8_t type_id, std::span<const std::byte> payload);
+    asio::awaitable<void> send_metadata_request(uint8_t ext_id, int piece);
+
+    bool supports_metadata() const noexcept { return metadata_ext_id_ != 0; }
+    uint8_t metadata_ext_id() const noexcept { return metadata_ext_id_; }
+    void metadata_ext_id(uint8_t id) noexcept { metadata_ext_id_ = id; }
+    int32_t metadata_size() const noexcept { return metadata_size_; }
+    void metadata_size(int32_t size) noexcept { metadata_size_ = size; }
 
 private:
     PeerConnection(
@@ -151,6 +158,8 @@ private:
 
     std::once_flag pex_flag_;
     bool supported_pex_;
+    uint8_t metadata_ext_id_{0};  // 0 = not supported
+    int32_t metadata_size_{0};    // -1 = unknown, 0+ = bytes
 
     std::atomic_uint64_t bytes_downloaded_{0};
     std::atomic_uint64_t bytes_uploaded_{0};

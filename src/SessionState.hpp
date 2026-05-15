@@ -29,7 +29,18 @@ public:
         piece_status_.resize(num_pieces_, PieceStatus::Needed);
     }
 
+    // Construct from magnet link (no metadata yet)
+    SessionState(const InfoHash& info_hash, std::vector<std::vector<std::string>> tracker_tiers, const std::filesystem::path& save_path)
+        : tracker_tiers_(std::move(tracker_tiers))
+        , data_file_path_(save_path)
+        , num_pieces_(0)
+    {
+        std::vector<std::byte> hash_vec(info_hash.begin(), info_hash.end());
+        meta_info_.set_info_hash(std::move(hash_vec));
+    }
+
     const MetaInfo& info() const noexcept { return meta_info_; }
+    MetaInfo& info_mut() noexcept { return meta_info_; }
     const TorrentInfo& torrent_info() const noexcept { return meta_info_.get_torrent_info(); }
     TorrentInfo& torrent_info() noexcept { return meta_info_.get_torrent_info(); }
     const std::vector<std::byte>& info_hash() const noexcept { return meta_info_.get_info_hash(); }
@@ -59,6 +70,10 @@ public:
     void add_completed_pieces(size_t val) noexcept { completed_pieces_.fetch_add(val, std::memory_order_relaxed); }
     void is_download_complete(bool val) noexcept { is_download_complete_.store(val, std::memory_order_relaxed); }
     void is_in_endgame_mode(bool val) noexcept { is_in_endgame_mode_.store(val, std::memory_order_relaxed); }
+    void init_pieces(size_t count) {
+        num_pieces_ = count;
+        piece_status_.resize(num_pieces_, PieceStatus::Needed);
+    }
 
     std::string progress() const {
         auto completed = completed_pieces_.load();

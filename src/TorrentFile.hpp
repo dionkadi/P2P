@@ -11,12 +11,16 @@ public:
     static bool create_from_file(const std::filesystem::path& source_path, const std::filesystem::path& torrent_path, const std::vector<std::string>& tracker_urls, uint32_t piece_size = 262144);
     
     const std::vector<std::byte>& get_info_hash() const noexcept { return info_hash_bytes_; }
+    void set_info_hash(std::vector<std::byte> hash) { info_hash_bytes_ = std::move(hash); }
     const TorrentInfo& get_torrent_info() const noexcept { return info_; }
     TorrentInfo& get_torrent_info() noexcept { return info_; }
+    const std::vector<std::byte>& get_info_bencoded() const noexcept { return info_bencoded_; }
+    void set_info_bencoded(std::vector<std::byte> data) { info_bencoded_ = std::move(data); }
 
 private:
     TorrentInfo info_;
     std::vector<std::byte> info_hash_bytes_;
+    std::vector<std::byte> info_bencoded_;
 };
 
 inline void gather_files(const std::filesystem::path& base_path, const std::filesystem::path& current_path, std::vector<FileInfo>& files, uint64_t& total_size) {
@@ -96,8 +100,8 @@ inline bool MetaInfo::load_from_file(const std::string& file_path, std::vector<s
 
         const auto& info_dict = **info_dict_ptr;
 
-        std::vector<std::byte> info_bencoded = encode(Value(info_dict));
-        info_hash_bytes_ = Crypto::calculate_sha1_hash_data({info_bencoded.data(), info_bencoded.size()});
+        info_bencoded_ = encode(Value(info_dict));
+        info_hash_bytes_ = Crypto::calculate_sha1_hash_data({info_bencoded_.data(), info_bencoded_.size()});
 
         info_.name = std::get<String>(info_dict.at("name").get_variant());
         info_.piece_size = std::get<Integer>(info_dict.at("piece length").get_variant());
@@ -216,7 +220,7 @@ inline bool MetaInfo::create_from_file(const std::filesystem::path& source_path,
         announce_list_tiers.push_back(Value(std::move(tier)));
     }
     metainfo_dict["announce-list"] = Value(std::move(announce_list_tiers));
-    metainfo_dict["info"] = Value(info_dict);
+    metainfo_dict["info"] = Value(std::move(info_dict));
 
     std::vector<std::byte> bencoded_data = encode(Value(metainfo_dict));
     std::ofstream out_file(torrent_path, std::ios::binary);
