@@ -263,11 +263,82 @@ dht->stop();
 
 ## Integration Points
 
-| Component | Integration |
+### TorrentSession Integration
+
+The DHT node is integrated into `TorrentSession` as follows:
+
+| File | Change |
 |---|---|
-| `TorrentSession` | Owns a `DHTNode` instance; calls `bootstrap()` on start, `announce_peer()` every announce interval, feeds discovered peers to `PeerManager` |
-| `PeerConnection` | DHT-enabled peers exchange UDP port via PORT message (bit 7 of reserved bytes in handshake) |
-| `TorrentFile` | Trackerless torrents use `nodes` key instead of `announce` for initial DHT contacts |
+| `TorrentSession.hpp` | Added `std::shared_ptr<DHTNode> dht_node_` member, `asio::steady_timer dht_announce_timer_`, `dht_announce_loop()` method |
+| `TorrentSession.cpp` | Constructs `DHTNode` on the same `peer_port` (UDP, coexists with TCP peer server), starts it in `run()`, spawns announce loop, handles graceful shutdown in `stop()` |
+
+**Integration flow**:
+
+```
+TorrentSession::run()
+  ├── dht_node_->start()                      // Start UDP listen loop
+  ├── dht_node_->bootstrap(seed_nodes)         // Discover initial DHT peers
+  └── asio::co_spawn(dht_announce_loop())      // Periodic DHT operations
+
+dht_announce_loop()
+  ├── if Seeder/Complete: dht_node_->announce_peer(info_hash, port)
+  ├── dht_node_->get_peers(info_hash, 50)       // Discover peers via DHT
+  ├── peer_manager_->add_discovered_peer(ep)   // Feed into existing PEX loop
+  └── sleep(30 min)                             // Repeat
+
+TorrentSession::stop()
+  ├── dht_node_->stop()                         // Close socket, cancel timers
+  └── dht_announce_timer_.cancel()
+```
+
+Discovered peers from the DHT are fed into `peer_manager_->add_discovered_peer()`, which is the same mechanism used by PEX. The existing `discovered_peers_loop()` picks them up and initiates TCP connections.
+
+**Seed nodes** (default):
+- `router.bittorrent.com:6881`
+- `dht.libtorrent.org:25401`
+- `dht.transmissionbt.com:6881`
+
+### PeerConnection
+
+DHT-enabled peers exchange UDP port via PORT message (bit 7 of reserved bytes in handshake). The extended handshake mechanism in `PeerConnection` already supports this.
+
+### TorrentFile
+
+Trackerless torrents use `nodes` key instead of `announce` for initial DHT contacts. Currently, the project requires at least one tracker URL (the constructor throws if `tracker_clients_by_tier_` is empty). Full DHT-only support requires relaxing this constraint.
+
+---
+
+## Tests
+
+### Test File: `test/dht_test.cpp`
+
+**Unit Tests** (`KBucketTest`):
+
+| Test | Description |
+|---|---|
+| `AddNodeToEmptyBucket` | Verifies the first node is accepted |
+| `AddNodeToFullBucketReplacesBad` | Full bucket with a Bad node — new node replaces it |
+| `TouchMovesNodeToBack` | Touching a node moves it to LRU tail |
+
+**Unit Tests** (`RouteTableTest`):
+
+| Test | Description |
+|---|---|
+| `InsertAndFindClosest` | Inserts 5 nodes at various XOR distances, verifies `find_closest_nodes` returns them sorted by distance |
+| `DontInsertSelf` | Ensures own node ID is never inserted into the routing table |
+| `UpdateStatus` | Changes a node's status and verifies the change is reflected |
+
+**Integration Tests** (`DHTIntegrationTest`):
+
+| Test | Description |
+|---|---|
+| `PingBetweenTwoNodes` | Two `DHTNode` instances on different UDP ports; A pings B, verifies success |
+| `FindNode` | A pings B, then A does `find_nodes` for a random target — confirms B is in results |
+| `GetPeersAndAnnouncePeer` | Full cycle: bootstrap, announce_peer on A, get_peers on B, verifies peer propagation |
+| `GetPeersWithStoredPeers` | Three-step: get_peers (obtain token), announce_peer (with token), get_peers (verify stored) |
+| `TokenValidation` | Validates the test infrastructure for token-based operations |
+
+All tests use 2-worker io_context thread pool and ephemeral-range UDP ports.
 
 ---
 
@@ -278,3 +349,4 @@ dht->stop();
 3. **Bucket splitting**: The routing table uses fixed 160 buckets rather than dynamic Kademlia tree splitting. The current implementation pre-allocates all 160 buckets. Nodes that would fall into a bucket whose range includes the local node ID are handled via the `needs_refresh` mechanism rather than bucket splitting.
 4. **Ping on full bucket**: When a bucket is full and all nodes are Good, the new node is discarded. A full implementation would asynchronously ping the oldest node and potentially replace it.
 5. **`from_compact_node_info`**: This function parses compact node info without auto-inserting into the routing table. The caller must insert nodes as needed.
+6. **Tracker requirement**: The `TorrentSession` constructor currently throws if no tracker URLs are configured. Full DHT/trackerless support requires making tracker clients optional.
