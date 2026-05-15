@@ -1,4 +1,5 @@
 #include "helper.hpp"
+#include "MagnetUri.hpp"
 #include <boost/asio/strand.hpp>
 #include <iostream>
 
@@ -703,4 +704,278 @@ TEST_F(IntegrationTest, RateLimiterAccuracy) {
     LOGINFO("Measured Rate: {:.2f} MB/s, Expected Rate: {:.2f} MB/s, Tolerance: {:.2f} MB/s",
             measured_rate_mbps_display, expected_rate_mbps_display, tolerance_mbps_display);
     EXPECT_NEAR(measured_rate_bytes_per_second, expected_rate_bytes_per_second, tolerance_bytes_per_second);
+}
+
+// ==================== BEP-5: DHT Real-World Integration Tests ====================
+
+class DHTNetworkTest : public ::testing::Test {
+protected:
+    static constexpr uint16_t DHT_BASE_PORT = 18901;
+
+    asio::io_context test_io;
+    std::optional<asio::executor_work_guard<asio::io_context::executor_type>> work_guard;
+    std::vector<std::jthread> worker_threads;
+
+    std::vector<std::shared_ptr<DHTNode>> nodes;
+
+    void SetUp() override {
+        work_guard.emplace(asio::make_work_guard(test_io));
+        for (int i = 0; i < 2; ++i) {
+            worker_threads.emplace_back([this] {
+                try { test_io.run(); }
+                catch (const std::exception& e) { LOGCRITICAL("DHT test worker failed: {}", e.what()); }
+            });
+        }
+    }
+
+    void TearDown() override {
+        for (auto& n : nodes) {
+            n->stop();
+        }
+        nodes.clear();
+        work_guard->reset();
+        test_io.stop();
+        for (auto& t : worker_threads) {
+            if (t.joinable()) t.join();
+        }
+        test_io.restart();
+    }
+
+    std::shared_ptr<DHTNode> add_node() {
+        uint16_t port = DHT_BASE_PORT + static_cast<uint16_t>(nodes.size());
+        auto node = std::make_shared<DHTNode>(test_io, port);
+        node->start();
+        nodes.push_back(node);
+        return node;
+    }
+
+    void ping_between(std::shared_ptr<DHTNode> a, std::shared_ptr<DHTNode> b) {
+        udp::endpoint ep_b(asio::ip::make_address_v4("127.0.0.1"), b->get_port());
+        std::promise<void> done;
+        asio::co_spawn(test_io, [&]() -> asio::awaitable<void> {
+            co_await a->send_ping(ep_b);
+            done.set_value();
+        }, asio::detached);
+        done.get_future().wait_for(5s);
+    }
+};
+
+TEST_F(DHTNetworkTest, ThreeNodeDiscovery) {
+    auto node_a = add_node();
+    auto node_b = add_node();
+    auto node_c = add_node();
+
+    std::this_thread::sleep_for(50ms);
+
+    // Bootstrap chain: A→B, A→C
+    ping_between(node_a, node_b);
+    ping_between(node_a, node_c);
+
+    std::this_thread::sleep_for(50ms);
+
+    // A should have both B and C in routing table
+    NodeId target = node_b->get_node_id();
+    std::vector<BucketEntry> found;
+    {
+        std::promise<void> done;
+        asio::co_spawn(test_io, [&]() -> asio::awaitable<void> {
+            found = co_await node_a->find_nodes(target, 8);
+            done.set_value();
+        }, asio::detached);
+        done.get_future().wait_for(5s);
+    }
+
+    EXPECT_FALSE(found.empty());
+    bool found_b = std::ranges::any_of(found, [&](const BucketEntry& e) { return e.id == node_b->get_node_id(); });
+    bool found_c = std::ranges::any_of(found, [&](const BucketEntry& e) { return e.id == node_c->get_node_id(); });
+    EXPECT_TRUE(found_b) << "Node A should have discovered node B";
+    EXPECT_TRUE(found_c) << "Node A should have discovered node C";
+}
+
+TEST_F(DHTNetworkTest, BootstrapAndIterativeLookup) {
+    auto seed = add_node();
+    auto joiner = add_node();
+
+    std::this_thread::sleep_for(50ms);
+
+    // Bootstrap: seed is known, joiner bootstraps to seed
+    ping_between(joiner, seed);
+
+    std::this_thread::sleep_for(50ms);
+
+    // Iterative find_node from joiner for a random target
+    NodeId random_target = generate_id("");
+    std::vector<BucketEntry> closest;
+    {
+        std::promise<void> done;
+        asio::co_spawn(test_io, [&]() -> asio::awaitable<void> {
+            closest = co_await joiner->find_nodes(random_target, 8);
+            done.set_value();
+        }, asio::detached);
+        done.get_future().wait_for(10s);
+    }
+
+    EXPECT_FALSE(closest.empty());
+    bool found_seed = std::ranges::any_of(closest, [&](const BucketEntry& e) { return e.id == seed->get_node_id(); });
+    EXPECT_TRUE(found_seed) << "Joiner should find seed node via iterative lookup";
+}
+
+TEST_F(DHTNetworkTest, AnnounceAndGetPeers) {
+    auto node_a = add_node();
+    auto node_b = add_node();
+    std::this_thread::sleep_for(50ms);
+
+    ping_between(node_a, node_b);
+    std::this_thread::sleep_for(50ms);
+
+    InfoHash test_hash{};
+    std::ranges::fill(test_hash, std::byte{0xAA});
+
+    // A announces a peer
+    {
+        std::promise<void> done;
+        asio::co_spawn(test_io, [&]() -> asio::awaitable<void> {
+            co_await node_a->announce_peer(test_hash, 7777);
+            done.set_value();
+        }, asio::detached);
+        done.get_future().wait_for(10s);
+    }
+
+    std::this_thread::sleep_for(500ms);
+
+    // B queries for peers
+    std::vector<EndPoint> peers;
+    {
+        std::promise<void> done;
+        asio::co_spawn(test_io, [&]() -> asio::awaitable<void> {
+            peers = co_await node_b->get_peers(test_hash, 8);
+            done.set_value();
+        }, asio::detached);
+        done.get_future().wait_for(10s);
+    }
+
+    LOGINFO("DHT get_peers returned {} peers", peers.size());
+    for (const auto& ep : peers) {
+        LOGINFO("  DHT peer: {}:{}", ep.address().to_string(), ep.port());
+    }
+}
+
+// ==================== BEP-9: Magnet Link Integration Tests ====================
+
+TEST_F(IntegrationTest, MagnetUriFromTorrentRoundtrip) {
+    auto file_path = seed_dir / "data.bin";
+    create_test_file(file_path, 512 * 1024);
+
+    std::vector<std::string> trackers = {
+        "http://127.0.0.1:" + std::to_string(TRACKER_HTTP_PORT) + "/announce"
+    };
+    create_torrent(file_path, trackers);
+
+    // Load the torrent to get the info_hash
+    std::vector<std::vector<std::string>> loaded_tiers;
+    MetaInfo meta;
+    ASSERT_TRUE(meta.load_from_file(torrent_path.string(), loaded_tiers));
+
+    auto info_hash_hex = Crypto::bytes_to_hex(meta.get_info_hash());
+    auto display_name = meta.get_torrent_info().name;
+
+    // Build a magnet URI from the torrent info
+    std::string magnet_uri = "magnet:?xt=urn:btih:" + info_hash_hex
+                             + "&dn=" + display_name
+                             + "&tr=" + trackers[0];
+
+    // Parse it back
+    MagnetLink link = parse_magnet_uri(magnet_uri);
+    EXPECT_TRUE(link.valid());
+    EXPECT_EQ(link.display_name, display_name);
+    ASSERT_EQ(link.tracker_urls.size(), 1);
+    EXPECT_EQ(link.tracker_urls[0], trackers[0]);
+
+    // Verify the info_hash matches
+    InfoHash expected_hash{};
+    std::ranges::copy(meta.get_info_hash(), expected_hash.begin());
+    EXPECT_EQ(link.info_hash, expected_hash);
+}
+
+TEST_F(IntegrationTest, MagnetUriWithMultipleTrackers) {
+    auto file_path = seed_dir / "data.bin";
+    create_test_file(file_path, 256 * 1024);
+
+    std::vector<std::string> trackers = {
+        "http://127.0.0.1:" + std::to_string(TRACKER_HTTP_PORT) + "/announce",
+        "udp://127.0.0.1:" + std::to_string(TRACKER_UDP_PORT)
+    };
+    create_torrent(file_path, trackers);
+
+    std::vector<std::vector<std::string>> loaded_tiers;
+    MetaInfo meta;
+    ASSERT_TRUE(meta.load_from_file(torrent_path.string(), loaded_tiers));
+
+    auto info_hash_hex = Crypto::bytes_to_hex(meta.get_info_hash());
+
+    // Build magnet with both trackers
+    std::string magnet_uri = "magnet:?xt=urn:btih:" + info_hash_hex + "&dn=test";
+    for (const auto& tr : trackers) {
+        magnet_uri += "&tr=" + tr;
+    }
+
+    MagnetLink link = parse_magnet_uri(magnet_uri);
+    EXPECT_TRUE(link.valid());
+    ASSERT_EQ(link.tracker_urls.size(), 2);
+    EXPECT_EQ(link.tracker_urls[0], trackers[0]);
+    EXPECT_EQ(link.tracker_urls[1], trackers[1]);
+}
+
+TEST_F(IntegrationTest, TorrentSessionFromMagnet) {
+    auto file_path = seed_dir / "data.bin";
+    create_test_file(file_path, 512 * 1024);
+
+    std::vector<std::string> trackers = {
+        "http://127.0.0.1:" + std::to_string(TRACKER_HTTP_PORT) + "/announce"
+    };
+    create_torrent(file_path, trackers);
+
+    std::vector<std::vector<std::string>> loaded_tiers;
+    MetaInfo meta;
+    ASSERT_TRUE(meta.load_from_file(torrent_path.string(), loaded_tiers));
+
+    auto info_hash_hex = Crypto::bytes_to_hex(meta.get_info_hash());
+    std::string magnet_uri = "magnet:?xt=urn:btih:" + info_hash_hex
+                             + "&dn=" + meta.get_torrent_info().name
+                             + "&tr=" + trackers[0];
+
+    start_tracker();
+
+    auto peer_id = generate_peer_id();
+    auto session = TorrentSession::create_from_magnet(
+        test_io, peer_id, magnet_uri, download_dir, PEER_PORT_BASE + 3, Mode::Leech, 0, 0
+    );
+
+    EXPECT_NE(session, nullptr);
+    EXPECT_EQ(session->get_port(), PEER_PORT_BASE + 3);
+
+    InfoHash expected_hash{};
+    std::ranges::copy(meta.get_info_hash(), expected_hash.begin());
+    const auto& session_hash = session->get_info_hash();
+    ASSERT_EQ(session_hash.size(), HASH_SIZE);
+    for (size_t i = 0; i < HASH_SIZE; ++i) {
+        EXPECT_EQ(session_hash[i], expected_hash[i]);
+    }
+
+    EXPECT_TRUE(session->get_torrent_info().pieces.empty());
+
+    asio::steady_timer timer(test_io);
+    timer.expires_after(500ms);
+    std::promise<void> run_done;
+    asio::co_spawn(test_io, [&]() -> asio::awaitable<void> {
+        co_await session->run();
+        run_done.set_value();
+    }, asio::detached);
+
+    timer.async_wait([&](boost::system::error_code) {
+        asio::co_spawn(test_io, session->stop(), asio::detached);
+    });
+
+    run_done.get_future().wait_for(10s);
+    EXPECT_EQ(session->get_info_hash().size(), HASH_SIZE);
 }

@@ -55,6 +55,10 @@ inline PeerId string_to_peer_id(const std::string& s) {
     return id;
 }
 
+inline PeerId generate_peer_id() {
+    return generate_id(PEER_ID_PREFIX);
+}
+
 template <typename Awaitable>
 void RunAsync(asio::io_context& io, Awaitable&& awaitable) {
     asio::co_spawn(io, std::forward<Awaitable>(awaitable),
