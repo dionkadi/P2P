@@ -11,7 +11,10 @@
 #include <filesystem>
 #include <iostream>
 #include <memory>
+#include <sstream>
 #include <string>
+#include <thread>
+#include <vector>
 
 std::vector<std::string> split(const std::string& s, char delimiter) {
     std::vector<std::string> tokens;
@@ -78,7 +81,7 @@ int main(int argc, char* argv[]) {
             std::filesystem::path torrent_path = argv[2];
             std::filesystem::path content_dir = argv[3];
             int peer_port = std::stoi(argv[4]);
-            PeerId my_peer_id = generate_peer_id();
+            PeerId my_peer_id = generate_id();
             LOGINFO("Client starting with Peer ID: {}", my_peer_id);
             std::shared_ptr<TorrentSession> session_ptr = std::make_shared<TorrentSession>(
                 io_context, my_peer_id, torrent_path, content_dir, peer_port, 

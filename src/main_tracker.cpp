@@ -26,11 +26,12 @@ int main(
     // }
 
     try {
-        Tracker tracker;
+        asio::io_context ioc;
+        Tracker tracker(ioc);
 
-        asio::signal_set signals(tracker.get_io_context(), SIGINT, SIGTERM);
+        asio::signal_set signals(ioc, SIGINT, SIGTERM);
         signals.async_wait([&] (auto, auto) {
-            tracker.get_io_context().stop();
+            ioc.stop();
         });
 
         tracker.listen_http(port);

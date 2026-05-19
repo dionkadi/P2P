@@ -45,11 +45,11 @@ target_link_libraries(p2p_common PUBLIC
     OpenSSL::Crypto
 )
 
-# add_executable(tracker src/main_tracker.cpp)
-# add_executable(client src/main_client.cpp)
+add_executable(tracker src/main_tracker.cpp)
+add_executable(client src/main_client.cpp)
 
-# target_link_libraries(tracker PRIVATE p2p_common)
-# target_link_libraries(client PRIVATE p2p_common)
+target_link_libraries(tracker PRIVATE p2p_common)
+target_link_libraries(client PRIVATE p2p_common)
 
 add_executable(p2p_test
     test/main.cpp
