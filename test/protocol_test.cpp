@@ -325,3 +325,136 @@ TEST(PeerManagerLimitsTest, AddConnectionRejectsWhenNoPeerToReplace) {
     EXPECT_FALSE(pm->add_connection(id1, make_test_conn(io, "1.2.3.4:6881", id1)));
     EXPECT_EQ(pm->connection_count(), 0);
 }
+
+// ============================================================
+// Block Request Timeout Tests (PieceManager)
+// ============================================================
+
+// Helper: create a SessionState with initialized pieces for PieceManager testing
+static std::shared_ptr<SessionState> make_test_state_with_pieces(size_t num_pieces = 5, uint64_t piece_size = 262144) {
+    InfoHash dummy_hash{};
+    dummy_hash.fill(std::byte{0});
+    auto state = std::make_shared<SessionState>(
+        dummy_hash,
+        std::vector<std::vector<std::string>>{},
+        std::filesystem::temp_directory_path() / "p2p_test_pm_timeout"
+    );
+    state->init_pieces(num_pieces);
+
+    auto& t_info = state->torrent_info();
+    t_info.total_size = num_pieces * piece_size;
+    t_info.piece_size = piece_size;
+    t_info.pieces.resize(num_pieces * 20, std::byte{0});
+    t_info.name = "test_torrent";
+
+    return state;
+}
+
+TEST(PieceManagerTimeoutTest, BlockWithinTimeoutDoesNotTrigger) {
+    asio::io_context io;
+    auto state = make_test_state_with_pieces(1, BLOCK_SIZE);
+    auto pm = std::make_shared<PieceManager>(io, state);
+
+    bool timeout_fired = false;
+    pm->set_block_timeout_callback([&](uint32_t, uint32_t) -> asio::awaitable<void> {
+        timeout_fired = true;
+        co_return;
+    });
+    pm->set_callback([&](size_t) -> asio::awaitable<std::vector<std::shared_ptr<PeerConnection>>> {
+        co_return std::vector<std::shared_ptr<PeerConnection>>{};
+    });
+
+    state->piece_status(0, PieceStatus::InProgress);
+    auto piece = std::make_shared<InProgressPiece>(static_cast<uint64_t>(BLOCK_SIZE));
+    pm->emplace_in_progress_pieces(0, piece);
+
+    // Set request time to 5 seconds ago (well within the 30s timeout)
+    piece->request_times[0] = std::chrono::steady_clock::now() - 5s;
+
+    RunAsync(io, pm->check_block_timeouts());
+
+    EXPECT_FALSE(timeout_fired) << "Timeout callback should not fire for a block within the timeout period";
+}
+
+TEST(PieceManagerTimeoutTest, BlockPastTimeoutTriggersCancelAndRerequest) {
+    asio::io_context io;
+    auto state = make_test_state_with_pieces(1, BLOCK_SIZE);
+    auto pm = std::make_shared<PieceManager>(io, state);
+
+    bool timeout_fired = false;
+    uint32_t timed_out_piece = 999;
+    uint32_t timed_out_block = 999;
+    pm->set_block_timeout_callback([&](uint32_t piece_idx, uint32_t block_idx) -> asio::awaitable<void> {
+        timeout_fired = true;
+        timed_out_piece = piece_idx;
+        timed_out_block = block_idx;
+        co_return;
+    });
+    pm->set_callback([&](size_t) -> asio::awaitable<std::vector<std::shared_ptr<PeerConnection>>> {
+        co_return std::vector<std::shared_ptr<PeerConnection>>{};
+    });
+
+    state->piece_status(0, PieceStatus::InProgress);
+    auto piece = std::make_shared<InProgressPiece>(static_cast<uint64_t>(BLOCK_SIZE));
+    pm->emplace_in_progress_pieces(0, piece);
+
+    // Set request time to 31 seconds ago (past the 30s timeout)
+    piece->request_times[0] = std::chrono::steady_clock::now() - 31s;
+
+    RunAsync(io, pm->check_block_timeouts());
+
+    EXPECT_TRUE(timeout_fired) << "Timeout callback should fire for a block past the timeout period";
+    EXPECT_EQ(timed_out_piece, 0);
+    EXPECT_EQ(timed_out_block, 0);
+}
+
+TEST(PieceManagerTimeoutTest, UnrequestedBlockDoesNotTrigger) {
+    asio::io_context io;
+    auto state = make_test_state_with_pieces(1, BLOCK_SIZE);
+    auto pm = std::make_shared<PieceManager>(io, state);
+
+    bool timeout_fired = false;
+    pm->set_block_timeout_callback([&](uint32_t, uint32_t) -> asio::awaitable<void> {
+        timeout_fired = true;
+        co_return;
+    });
+    pm->set_callback([&](size_t) -> asio::awaitable<std::vector<std::shared_ptr<PeerConnection>>> {
+        co_return std::vector<std::shared_ptr<PeerConnection>>{};
+    });
+
+    state->piece_status(0, PieceStatus::InProgress);
+    auto piece = std::make_shared<InProgressPiece>(static_cast<uint64_t>(BLOCK_SIZE));
+    pm->emplace_in_progress_pieces(0, piece);
+
+    // request_times[0] is default TimePoint{} (never requested) - should be skipped
+    RunAsync(io, pm->check_block_timeouts());
+
+    EXPECT_FALSE(timeout_fired) << "Timeout callback should not fire for an unrequested block";
+}
+
+TEST(PieceManagerTimeoutTest, ReceivedBlockDoesNotTrigger) {
+    asio::io_context io;
+    auto state = make_test_state_with_pieces(1, BLOCK_SIZE);
+    auto pm = std::make_shared<PieceManager>(io, state);
+
+    bool timeout_fired = false;
+    pm->set_block_timeout_callback([&](uint32_t, uint32_t) -> asio::awaitable<void> {
+        timeout_fired = true;
+        co_return;
+    });
+    pm->set_callback([&](size_t) -> asio::awaitable<std::vector<std::shared_ptr<PeerConnection>>> {
+        co_return std::vector<std::shared_ptr<PeerConnection>>{};
+    });
+
+    state->piece_status(0, PieceStatus::InProgress);
+    auto piece = std::make_shared<InProgressPiece>(static_cast<uint64_t>(BLOCK_SIZE));
+    pm->emplace_in_progress_pieces(0, piece);
+
+    // Block has been received (marks as received), even with old request time it should not fire
+    piece->request_times[0] = std::chrono::steady_clock::now() - 31s;
+    piece->blocks_received[0] = true;
+
+    RunAsync(io, pm->check_block_timeouts());
+
+    EXPECT_FALSE(timeout_fired) << "Timeout callback should not fire for a block already received";
+}

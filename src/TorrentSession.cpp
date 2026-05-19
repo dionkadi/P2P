@@ -214,6 +214,10 @@ asio::awaitable<void> TorrentSession::run() {
                                             -> asio::awaitable<std::vector<std::shared_ptr<PeerConnection>>> 
                                         { co_return co_await peer_manager_->available_peers(piece_index); }
                                     );
+        piece_manager_->set_block_timeout_callback([this](uint32_t piece_index, uint32_t block_index)
+                                                        -> asio::awaitable<void> {
+                                                    co_await send_cancel_for_block(piece_index, block_index, PeerId{});
+                                                });
         asio::co_spawn(io_context_, piece_manager_->downloader(), asio::detached);
         asio::co_spawn(strand_, periodically_save(), asio::detached);
         asio::co_spawn(strand_, peer_manager_->pex_loop(), asio::detached);
@@ -1310,6 +1314,10 @@ asio::awaitable<void> TorrentSession::on_metadata_complete() {
                 -> asio::awaitable<std::vector<std::shared_ptr<PeerConnection>>> {
                     co_return co_await peer_manager_->available_peers(piece_index);
                 });
+            piece_manager_->set_block_timeout_callback([this](uint32_t piece_index, uint32_t block_index)
+                                                            -> asio::awaitable<void> {
+                                                        co_await send_cancel_for_block(piece_index, block_index, PeerId{});
+                                                    });
             asio::co_spawn(io_context_, piece_manager_->downloader(), asio::detached);
             asio::co_spawn(strand_, periodically_save(), asio::detached);
             asio::co_spawn(strand_, discovered_peers_loop(), asio::detached);

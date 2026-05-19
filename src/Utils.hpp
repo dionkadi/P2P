@@ -628,11 +628,13 @@ struct InProgressPiece {
     uint32_t total_blocks = 0;
 
     std::vector<std::vector<PeerId>> outstanding_requests;
+    std::vector<TimePoint> request_times;  // When each block was first requested (for timeout detection)
 
     InProgressPiece(uint64_t piece_size): data(piece_size) {
         total_blocks = (piece_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
         blocks_received.resize(total_blocks, false);
         outstanding_requests.resize(total_blocks);
+        request_times.resize(total_blocks);  // Default TimePoint{} (epoch = "not requested")
     }
 };
 

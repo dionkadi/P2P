@@ -4,7 +4,7 @@
 
 PieceManager::PieceManager(asio::io_context& io_context, std::shared_ptr<SessionState> state)
     : io_context_(io_context), strand_(asio::make_strand(io_context)),
-      piece_request_trigger_(io_context), state_(state) 
+      piece_request_trigger_(io_context), block_timeout_timer_(io_context), state_(state) 
 {
     const size_t num_pieces = state_->num_pieces();
     piece_availability_ = std::make_shared<std::vector<size_t>>();
@@ -32,6 +32,9 @@ std::map<std::string, std::string> PieceManager::get_in_progress_for_resume() co
 asio::awaitable<void> PieceManager::downloader() {
     auto self = shared_from_this();
     const int max_in_progress_pieces = 5;
+
+    // Start the periodic block timeout checker
+    asio::co_spawn(io_context_, self->block_timeout_loop(), asio::detached);
 
     while (!state_->is_download_complete()) {
         int slots_to_fill = 0;
@@ -155,6 +158,7 @@ asio::awaitable<bool> PieceManager::try_piece_download(size_t piece_index) {
         );
         
         piece_progress->outstanding_requests[block_idx].push_back(peer_conn->peer_id());
+        piece_progress->request_times[block_idx] = std::chrono::steady_clock::now();
     }
     
     asio::co_spawn(io_context_, self->check_and_enter_endgame(), asio::detached);
@@ -211,6 +215,7 @@ asio::awaitable<void> PieceManager::broadcast_outstanding_requests() {
                     co_await peer_conn->send_request(piece_idx, offset, length);
                     piece_progress->outstanding_requests[block_idx].push_back(peer_conn->peer_id());
                 }
+                piece_progress->request_times[block_idx] = std::chrono::steady_clock::now();
             }
         }
     }
@@ -336,6 +341,7 @@ asio::awaitable<void> PieceManager::resume_piece_download(size_t piece_index) {
                         );
                         piece_progress->outstanding_requests[block_idx].push_back(peer_conn->peer_id());
                     }
+                    piece_progress->request_times[block_idx] = std::chrono::steady_clock::now();
                 }
             }
         } else {
@@ -358,9 +364,81 @@ asio::awaitable<void> PieceManager::resume_piece_download(size_t piece_index) {
                     
                     // Track that we made a request for this block
                     piece_progress->outstanding_requests[block_idx].push_back(peer_conn->peer_id());
+                    piece_progress->request_times[block_idx] = std::chrono::steady_clock::now();
                 }
             }
         }
         co_return;
+    }
+}
+
+asio::awaitable<void> PieceManager::check_block_timeouts() {
+    auto self = shared_from_this();
+    co_await asio::dispatch(strand_, asio::use_awaitable);
+
+    if (state_->is_download_complete()) {
+        co_return;
+    }
+
+    auto pieces = in_progress_pieces();
+    auto now = std::chrono::steady_clock::now();
+
+    for (const auto& [piece_idx, piece_progress] : *pieces) {
+        for (uint32_t block_idx = 0; block_idx < piece_progress->total_blocks; ++block_idx) {
+            if (piece_progress->blocks_received[block_idx]) {
+                continue;
+            }
+
+            auto request_time = piece_progress->request_times[block_idx];
+            if (request_time == TimePoint{}) {
+                continue;
+            }
+
+            if (now - request_time > BLOCK_REQUEST_TIMEOUT) {
+                LOGWARN("Block {}/{} timed out after {}s. Cancelling and re-requesting.",
+                        piece_idx, block_idx, BLOCK_REQUEST_TIMEOUT.count());
+
+                if (block_timeout_callback_) {
+                    co_await block_timeout_callback_(static_cast<uint32_t>(piece_idx), block_idx);
+                }
+
+                auto available_peers = co_await get_available_peers_(piece_idx);
+                if (!available_peers.empty()) {
+                    uint32_t offset = block_idx * BLOCK_SIZE;
+                    uint32_t length = (block_idx == piece_progress->total_blocks - 1)
+                        ? (piece_progress->data.size() - offset)
+                        : BLOCK_SIZE;
+
+                    auto& new_peer = available_peers[block_idx % available_peers.size()];
+                    asio::co_spawn(io_context_,
+                        [new_peer, piece_idx, offset, length]() -> asio::awaitable<void> {
+                            co_await new_peer->send_request(piece_idx, offset, length);
+                        },
+                        asio::detached
+                    );
+
+                    piece_progress->outstanding_requests[block_idx].push_back(new_peer->peer_id());
+                    piece_progress->request_times[block_idx] = now;
+                }
+            }
+        }
+    }
+}
+
+asio::awaitable<void> PieceManager::block_timeout_loop() {
+    auto self = shared_from_this();
+
+    while (!state_->is_download_complete()) {
+        co_await self->check_block_timeouts();
+
+        block_timeout_timer_.expires_after(std::chrono::seconds(1));
+        try {
+            co_await block_timeout_timer_.async_wait(asio::use_awaitable);
+        } catch (const boost::system::system_error& e) {
+            if (e.code() == asio::error::operation_aborted) {
+                break;
+            }
+            throw;
+        }
     }
 }

@@ -20,10 +20,12 @@
 #include "PeerConnection.hpp"
 
 static constexpr uint32_t IN_PROGRESS_RARITY_GROUP_ID = std::numeric_limits<uint32_t>::max();
+static constexpr auto BLOCK_REQUEST_TIMEOUT = std::chrono::seconds(30);
 
 class PieceManager : public std::enable_shared_from_this<PieceManager> {
 public:
     using GetAvailableCallback = std::function<asio::awaitable<std::vector<std::shared_ptr<PeerConnection>>>(size_t)>;
+    using BlockTimeoutCallback = std::function<asio::awaitable<void>(uint32_t piece_index, uint32_t block_index)>;
     using InProgressType = std::shared_ptr<const std::map<size_t, std::shared_ptr<InProgressPiece>>>;
     using AvailType = std::shared_ptr<const std::vector<size_t>>;
     using RarityType = std::shared_ptr<const std::map<size_t, std::shared_ptr<std::unordered_set<int>>>>;
@@ -106,18 +108,30 @@ public:
         std::lock_guard lock(mutex_);
         get_available_peers_ = std::move(cb); 
     }
+    void set_block_timeout_callback(BlockTimeoutCallback cb) { 
+        std::lock_guard lock(mutex_);
+        block_timeout_callback_ = std::move(cb); 
+    }
+
+    // Scans all in-progress pieces for blocks whose request has exceeded BLOCK_REQUEST_TIMEOUT.
+    // On timeout: calls the timeout callback (cancel) and re-requests from another peer.
+    asio::awaitable<void> check_block_timeouts();
 
 private:
 
     asio::awaitable<bool> try_piece_download(size_t piece_index);
 
+    asio::awaitable<void> block_timeout_loop();
+
     asio::io_context& io_context_;
     asio::strand<asio::io_context::executor_type> strand_;
     asio::steady_timer piece_request_trigger_;
+    asio::steady_timer block_timeout_timer_;
     std::shared_ptr<std::map<size_t, std::shared_ptr<InProgressPiece>>> in_progress_pieces_;
     std::shared_ptr<std::vector<size_t>> piece_availability_;
     std::shared_ptr<std::map<size_t, std::shared_ptr<std::unordered_set<int>>>> pieces_by_rarity_;
     std::shared_ptr<SessionState> state_;
     mutable std::mutex mutex_;
     GetAvailableCallback get_available_peers_;
+    BlockTimeoutCallback block_timeout_callback_;
 };
