@@ -323,7 +323,10 @@ asio::awaitable<void> TorrentSession::handle_new_connection(AsyncSocket socket, 
             }
         }
     }
-    peer_manager_->add_connection(conn->peer_id(), conn);
+    if (!peer_manager_->add_connection(conn->peer_id(), conn)) {
+        LOGWARN("handle_new_connection: connection rejected by PeerManager for {} (limits)", conn->peer_addr());
+        co_return;
+    }
 
     try {
         auto [ip, port] = decode_address(peer_addr);

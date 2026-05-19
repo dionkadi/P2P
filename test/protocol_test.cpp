@@ -144,3 +144,184 @@ TEST(MessageTypeTest, ExtendedMessageValue) {
     // Ensure ExtendedMessage maps to 20 as per BitTorrent spec
     EXPECT_EQ(static_cast<uint8_t>(MessageType::ExtendedMessage), 20);
 }
+
+// ============================================================
+// PeerManager Connection Limit Tests
+// ============================================================
+
+// Test helper: a PeerConnection subclass that can be constructed for testing
+struct TestPeerConn : public PeerConnection {
+    TestPeerConn(asio::io_context& io, const std::string& addr, const PeerId& pid)
+        : PeerConnection(io, AsyncSocket(asio::ip::tcp::socket(io)), addr, nullptr, nullptr)
+    {
+        peer_id_ = pid;
+    }
+};
+
+// Factory helper to create test peer connections with transfer rates
+static std::shared_ptr<TestPeerConn> make_test_conn(
+    asio::io_context& io, const std::string& addr, const PeerId& pid,
+    uint64_t dl = 0, uint64_t ul = 0)
+{
+    auto conn = std::make_shared<TestPeerConn>(io, addr, pid);
+    conn->bytes_downloaded(dl);
+    conn->bytes_uploaded(ul);
+    return conn;
+}
+
+// Generates a unique PeerId for testing
+static PeerId test_peer_id(const std::string& suffix) {
+    PeerId id{};
+    std::string s = "-MI0001-" + suffix;
+    s.resize(PEER_ID_SIZE, ' ');
+    std::transform(s.begin(), s.end(), id.begin(),
+                   [](char c) { return static_cast<std::byte>(c); });
+    return id;
+}
+
+TEST(PeerManagerLimitsTest, ExtractIpFromAddr) {
+    EXPECT_EQ(PeerManager::extract_ip_from_addr("1.2.3.4:6881"), "1.2.3.4");
+    EXPECT_EQ(PeerManager::extract_ip_from_addr("192.168.1.1:12345"), "192.168.1.1");
+    EXPECT_EQ(PeerManager::extract_ip_from_addr("10.0.0.1:80"), "10.0.0.1");
+    // IPv6 with port
+    EXPECT_EQ(PeerManager::extract_ip_from_addr("[::1]:6881"), "[::1]");
+    // No port
+    EXPECT_EQ(PeerManager::extract_ip_from_addr("1.2.3.4"), "1.2.3.4");
+    // Empty string
+    EXPECT_EQ(PeerManager::extract_ip_from_addr(""), "");
+}
+
+// Helper to create a minimal SessionState for PeerManager testing
+static std::shared_ptr<SessionState> make_test_state() {
+    InfoHash dummy_hash{};
+    dummy_hash.fill(std::byte{0});
+    return std::make_shared<SessionState>(
+        dummy_hash,
+        std::vector<std::vector<std::string>>{},
+        std::filesystem::temp_directory_path() / "p2p_test_peermgr"
+    );
+}
+
+TEST(PeerManagerLimitsTest, DefaultLimits) {
+    asio::io_context io;
+    auto state = make_test_state();
+    auto pm = std::make_shared<PeerManager>(io, state);
+
+    EXPECT_EQ(pm->max_total_connections(), 200);
+    EXPECT_EQ(pm->max_connections_per_ip(), 2);
+    EXPECT_EQ(pm->max_half_open_connections(), 40);
+    EXPECT_EQ(pm->half_open_connections(), 0);
+}
+
+TEST(PeerManagerLimitsTest, SettersUpdateLimits) {
+    asio::io_context io;
+    auto state = make_test_state();
+    auto pm = std::make_shared<PeerManager>(io, state);
+
+    pm->set_max_total_connections(10);
+    pm->set_max_connections_per_ip(1);
+    pm->set_max_half_open_connections(5);
+
+    EXPECT_EQ(pm->max_total_connections(), 10);
+    EXPECT_EQ(pm->max_connections_per_ip(), 1);
+    EXPECT_EQ(pm->max_half_open_connections(), 5);
+}
+
+TEST(PeerManagerLimitsTest, ConnectToPeerRejectsAtHalfOpenLimit) {
+    asio::io_context io;
+    auto state = make_test_state();
+    auto pm = std::make_shared<PeerManager>(io, state);
+
+    // Set half-open limit to 0 so any connection attempt is rejected immediately
+    pm->set_max_half_open_connections(0);
+
+    // connect_to_peer should return nullopt without attempting connection
+    auto result = std::optional<AsyncSocket>{};
+    asio::co_spawn(io, [&]() -> asio::awaitable<void> {
+        result = co_await pm->connect_to_peer("1.2.3.4:6881");
+    }, asio::detached);
+    io.run();
+
+    EXPECT_FALSE(result.has_value());
+    EXPECT_EQ(pm->half_open_connections(), 0);
+}
+
+TEST(PeerManagerLimitsTest, AddConnectionRejectsPerIpLimit) {
+    asio::io_context io;
+    auto state = make_test_state();
+    auto pm = std::make_shared<PeerManager>(io, state);
+
+    pm->set_max_connections_per_ip(1);  // Only 1 per IP
+    pm->set_max_total_connections(10);
+
+    PeerId id1 = test_peer_id("peer1");
+    PeerId id2 = test_peer_id("peer2");
+
+    // First connection from 1.2.3.4 should succeed
+    EXPECT_TRUE(pm->add_connection(id1, make_test_conn(io, "1.2.3.4:6881", id1)));
+    EXPECT_EQ(pm->connection_count(), 1);
+
+    // Second connection from same IP should be rejected
+    EXPECT_FALSE(pm->add_connection(id2, make_test_conn(io, "1.2.3.4:6882", id2)));
+    EXPECT_EQ(pm->connection_count(), 1);
+}
+
+TEST(PeerManagerLimitsTest, AddConnectionAllowsDifferentIps) {
+    asio::io_context io;
+    auto state = make_test_state();
+    auto pm = std::make_shared<PeerManager>(io, state);
+
+    pm->set_max_connections_per_ip(1);
+    pm->set_max_total_connections(10);
+
+    PeerId id1 = test_peer_id("peer1");
+    PeerId id2 = test_peer_id("peer2");
+
+    EXPECT_TRUE(pm->add_connection(id1, make_test_conn(io, "1.2.3.4:6881", id1)));
+    // Different IP should succeed
+    EXPECT_TRUE(pm->add_connection(id2, make_test_conn(io, "5.6.7.8:6881", id2)));
+    EXPECT_EQ(pm->connection_count(), 2);
+}
+
+TEST(PeerManagerLimitsTest, AddConnectionReplacesWorstPeer) {
+    asio::io_context io;
+    auto state = make_test_state();
+    auto pm = std::make_shared<PeerManager>(io, state);
+
+    pm->set_max_total_connections(2);  // Only allow 2 connections
+
+    PeerId id1 = test_peer_id("peer1");
+    PeerId id2 = test_peer_id("peer2");
+    PeerId id3 = test_peer_id("peer3");
+
+    // Add two peers with different transfer rates
+    // peer1 has low activity (worst)
+    EXPECT_TRUE(pm->add_connection(id1, make_test_conn(io, "1.2.3.4:6881", id1, 10, 10)));
+    // peer2 has higher activity
+    EXPECT_TRUE(pm->add_connection(id2, make_test_conn(io, "5.6.7.8:6881", id2, 100, 200)));
+    EXPECT_EQ(pm->connection_count(), 2);
+
+    // Adding a third peer should replace the worst (peer1 with rate 20)
+    EXPECT_TRUE(pm->add_connection(id3, make_test_conn(io, "9.10.11.12:6881", id3, 50, 50)));
+    EXPECT_EQ(pm->connection_count(), 2);
+
+    // peer1 should have been removed, peer2 and peer3 should remain
+    EXPECT_FALSE(pm->contains_peer(id1));
+    EXPECT_TRUE(pm->contains_peer(id2));
+    EXPECT_TRUE(pm->contains_peer(id3));
+}
+
+TEST(PeerManagerLimitsTest, AddConnectionRejectsWhenNoPeerToReplace) {
+    asio::io_context io;
+    auto state = make_test_state();
+    auto pm = std::make_shared<PeerManager>(io, state);
+    pm->set_max_total_connections(0);
+    pm->set_max_connections_per_ip(1);
+
+    PeerId id1 = test_peer_id("peer1");
+
+    // With max_total_connections=0, find_worst_peer_locked returns nullptr
+    // (empty map), so the connection is rejected.
+    EXPECT_FALSE(pm->add_connection(id1, make_test_conn(io, "1.2.3.4:6881", id1)));
+    EXPECT_EQ(pm->connection_count(), 0);
+}

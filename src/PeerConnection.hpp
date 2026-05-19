@@ -127,17 +127,11 @@ public:
     int32_t metadata_size() const noexcept { return metadata_size_; }
     void metadata_size(int32_t size) noexcept { metadata_size_ = size; }
 
-private:
+protected:
     PeerConnection(
         asio::io_context& io_context, AsyncSocket socket, std::string peer_addr, 
         std::shared_ptr<SessionState> state, std::shared_ptr<IPeerConnectionEvents> events
     ) noexcept;
-
-    asio::awaitable<bool> perform_handshake(const PeerId& my_peer_id);
-    asio::awaitable<void> message_loop();
-    asio::awaitable<void> keep_alive_loop();
-
-    void start_loops();
 
     asio::io_context& io_context_;
     asio::strand<asio::io_context::executor_type> strand_;
@@ -145,6 +139,14 @@ private:
     AsyncSocket socket_;
     std::string peer_addr_;
     PeerId peer_id_{};
+
+private:
+    asio::awaitable<bool> perform_handshake(const PeerId& my_peer_id);
+    asio::awaitable<void> message_loop();
+    asio::awaitable<void> keep_alive_loop();
+
+    void start_loops();
+
     std::shared_ptr<SessionState> state_;
     std::shared_ptr<IPeerConnectionEvents> events_;
 

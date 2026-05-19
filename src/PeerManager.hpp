@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/steady_timer.hpp>
@@ -21,10 +22,7 @@ public:
     PeerManager(PeerManager&&) noexcept = delete;
     PeerManager& operator=(PeerManager&&) noexcept = delete;
 
-    void add_connection(const PeerId& id, std::shared_ptr<PeerConnection> conn) {
-        std::lock_guard lock(mutex_);
-        active_connections_[id] = std::move(conn);
-    }
+    bool add_connection(const PeerId& id, std::shared_ptr<PeerConnection> conn);
     void remove_connection(const PeerId& id) {
         std::lock_guard lock(mutex_);
         active_connections_.erase(id);
@@ -73,6 +71,16 @@ public:
         return active_connections_.size();
     }
     
+    // Connection limit accessors
+    size_t max_total_connections() const noexcept { return max_total_connections_; }
+    size_t max_connections_per_ip() const noexcept { return max_connections_per_ip_; }
+    size_t max_half_open_connections() const noexcept { return max_half_open_connections_; }
+    size_t half_open_connections() const noexcept { return half_open_connections_.load(); }
+
+    void set_max_total_connections(size_t n) noexcept { max_total_connections_ = n; }
+    void set_max_connections_per_ip(size_t n) noexcept { max_connections_per_ip_ = n; }
+    void set_max_half_open_connections(size_t n) noexcept { max_half_open_connections_ = n; }
+
     asio::awaitable<void> choke_loop();
     asio::awaitable<void> send_have_message_to_all(size_t piece_index);
 
@@ -127,6 +135,8 @@ public:
     asio::awaitable<std::optional<AsyncSocket>> connect_to_peer(const std::string& peer_addr);
     asio::awaitable<std::vector<std::shared_ptr<PeerConnection>>> available_peers(size_t piece_index) const;
 
+    static std::string extract_ip_from_addr(const std::string& peer_addr);
+
 private:
     asio::io_context& io_context_;
     asio::strand<asio::any_io_executor> strand_;
@@ -143,6 +153,14 @@ private:
     mutable std::mutex active_mutex_;
     mutable std::mutex discovered_mutex_;
     mutable std::mutex dropped_mutex_;
+
+    // Connection limit fields
+    size_t max_total_connections_{200};
+    size_t max_connections_per_ip_{2};
+    size_t max_half_open_connections_{40};
+    std::atomic<size_t> half_open_connections_{0};
+
+    std::shared_ptr<PeerConnection> find_worst_peer_locked();
 
     std::string populate_added(size_t max_peers = 50);
     std::string populate_dropped();

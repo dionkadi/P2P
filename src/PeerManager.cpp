@@ -1,6 +1,8 @@
 #include "PeerManager.hpp"
 #include "Utils.hpp"
 
+#include <algorithm>
+#include <limits>
 #include <random>
 
 PeerManager::PeerManager(asio::io_context& io_context, std::shared_ptr<SessionState> state, std::chrono::seconds choke_interval) noexcept
@@ -8,19 +10,95 @@ PeerManager::PeerManager(asio::io_context& io_context, std::shared_ptr<SessionSt
     state_(state), choke_interval_(choke_interval)
 {}
 
+bool PeerManager::add_connection(const PeerId& id, std::shared_ptr<PeerConnection> conn) {
+    std::lock_guard lock(mutex_);
+
+    // Decrement half-open count since the handshake completed (for outgoing connections).
+    // For incoming connections that bypassed connect_to_peer, this is a no-op.
+    if (half_open_connections_.load() > 0) {
+        --half_open_connections_;
+    }
+
+    // Enforce per-IP connection limit
+    std::string ip = extract_ip_from_addr(conn->peer_addr());
+    size_t ip_count = 0;
+    for (const auto& [pid, existing] : active_connections_) {
+        if (extract_ip_from_addr(existing->peer_addr()) == ip) {
+            ++ip_count;
+        }
+    }
+    if (ip_count >= max_connections_per_ip_) {
+        LOGWARN("add_connection: rejecting {} ({}): max {} connections per IP reached",
+                id, conn->peer_addr(), max_connections_per_ip_);
+        conn->close();
+        return false;
+    }
+
+    // Enforce total connection limit with replace-worst-peer strategy
+    if (active_connections_.size() >= max_total_connections_) {
+        auto worst = find_worst_peer_locked();
+        if (worst) {
+            LOGINFO("add_connection: replacing worst peer {} (rate={}) with new peer {}",
+                    worst->peer_id(), worst->bytes_downloaded() + worst->bytes_uploaded(), id);
+            worst->close();
+            active_connections_.erase(worst->peer_id());
+        } else {
+            LOGWARN("add_connection: rejecting {}: max total connections ({}) reached and no peer to replace",
+                    id, max_total_connections_);
+            conn->close();
+            return false;
+        }
+    }
+
+    active_connections_[id] = std::move(conn);
+    return true;
+}
+
+std::shared_ptr<PeerConnection> PeerManager::find_worst_peer_locked() {
+    std::shared_ptr<PeerConnection> worst;
+    uint64_t min_rate = std::numeric_limits<uint64_t>::max();
+    for (const auto& [pid, conn] : active_connections_) {
+        uint64_t rate = conn->bytes_downloaded() + conn->bytes_uploaded();
+        if (rate < min_rate) {
+            min_rate = rate;
+            worst = conn;
+        }
+    }
+    return worst;
+}
+
+std::string PeerManager::extract_ip_from_addr(const std::string& peer_addr) {
+    auto colon_pos = peer_addr.rfind(':');
+    if (colon_pos == std::string::npos) {
+        return peer_addr;
+    }
+    return peer_addr.substr(0, colon_pos);
+}
+
 asio::awaitable<std::optional<AsyncSocket>> PeerManager::connect_to_peer(const std::string& peer_addr) {
+    // Check half-open connection limit before attempting
+    if (half_open_connections_.load() >= max_half_open_connections_) {
+        LOGWARN("connect_to_peer: rejecting {}: max half-open connections ({}) reached",
+                peer_addr, max_half_open_connections_);
+        co_return std::nullopt;
+    }
+
+    ++half_open_connections_;
+
     try {
         size_t colon_pos = peer_addr.find(':');
-        if (colon_pos == std::string::npos) co_return std::nullopt;
+        if (colon_pos == std::string::npos) {
+            // Will fall through to decrement half-open below
+        } else {
+            std::string ip = peer_addr.substr(0, colon_pos);
+            int port = std::stoi(peer_addr.substr(colon_pos + 1));
 
-        std::string ip = peer_addr.substr(0, colon_pos);
-        int port = std::stoi(peer_addr.substr(colon_pos + 1));
-
-        AsyncSocket socket(asio::ip::tcp::socket{io_context_});
-        co_await socket.connect(ip, port);
-        LOGINFO("Successfully connected to peer {}", peer_addr);
-
-        co_return socket;
+            AsyncSocket socket(asio::ip::tcp::socket{io_context_});
+            co_await socket.connect(ip, port);
+            LOGINFO("Successfully connected to peer {}", peer_addr);
+            // Success - return socket, half-open will be decremented in add_connection
+            co_return socket;
+        }
     } catch (const boost::system::system_error& e) {
         if (e.code() == asio::error::eof ||
             e.code() == asio::error::connection_reset ||
@@ -34,6 +112,10 @@ asio::awaitable<std::optional<AsyncSocket>> PeerManager::connect_to_peer(const s
         LOGERR("Failed to connect to peer {}: {}", peer_addr, e.what());
     }
 
+    // Decrement half-open on failure (success path returned socket above)
+    if (half_open_connections_.load() > 0) {
+        --half_open_connections_;
+    }
     co_return std::nullopt;
 }
 
