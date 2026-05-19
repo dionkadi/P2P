@@ -14,6 +14,23 @@
 #include "PeerConnection.hpp"
 #include "SessionState.hpp"
 
+struct BannedPeer {
+    std::string ip;
+    TimePoint ban_time;
+    TimePoint expiry_time;
+};
+
+struct PeerMisbehavior {
+    uint32_t corrupt_pieces{0};
+    uint32_t protocol_violations{0};
+    uint32_t timeouts{0};
+    uint32_t connection_failures{0};
+
+    bool has_exceeded_thresholds() const noexcept {
+        return corrupt_pieces >= 3 || protocol_violations >= 5 || timeouts >= 10 || connection_failures >= 5;
+    }
+};
+
 class PeerManager : public std::enable_shared_from_this<PeerManager> {
 public:
     PeerManager(asio::io_context& io_context, std::shared_ptr<SessionState> state, std::chrono::seconds choke_interval = 10s) noexcept;
@@ -132,8 +149,18 @@ public:
         choke_timer_.cancel();
         LOGDBG("PeerManager: choke_timer_ cancelled. Cancelling backoff_retry_timer_...");
         backoff_retry_timer_.cancel();
-        LOGDBG("PeerManager: backoff_retry_timer_ cancelled.");
+        LOGDBG("PeerManager: backoff_retry_timer_ cancelled. Cancelling ban_cleanup_timer_...");
+        ban_cleanup_timer_.cancel();
+        LOGDBG("PeerManager: ban_cleanup_timer_ cancelled.");
     }
+
+    // --- Ban management ---
+    bool is_banned(const std::string& ip) const;
+    void ban_peer_by_ip(const std::string& ip);
+    void report_corrupt_piece(const std::string& peer_addr);
+    void report_protocol_violation(const std::string& peer_addr);
+    void report_timeout(const std::string& peer_addr);
+    asio::awaitable<void> ban_cleanup_loop();
 
     void report_connection_success(const std::string& peer_addr);
     void report_connection_failure(const std::string& peer_addr);
@@ -175,4 +202,10 @@ private:
     std::unordered_map<std::string, BackoffState> backoff_states_;
     mutable std::mutex backoff_mutex_;
     asio::steady_timer backoff_retry_timer_;
+
+    // Ban state (mutable for const method read + lazy expiry cleanup)
+    mutable std::unordered_map<std::string, BannedPeer> banned_peers_;
+    mutable std::unordered_map<std::string, PeerMisbehavior> peer_misbehavior_;
+    mutable std::mutex ban_mutex_;
+    asio::steady_timer ban_cleanup_timer_;
 };

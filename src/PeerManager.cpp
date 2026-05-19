@@ -7,7 +7,7 @@
 
 PeerManager::PeerManager(asio::io_context& io_context, std::shared_ptr<SessionState> state, std::chrono::seconds choke_interval) noexcept
     : io_context_(io_context), strand_(asio::make_strand(io_context)), pex_timer_(io_context_), choke_timer_(io_context_),
-    state_(state), choke_interval_(choke_interval), backoff_retry_timer_(io_context_)
+    state_(state), choke_interval_(choke_interval), backoff_retry_timer_(io_context_), ban_cleanup_timer_(io_context_)
 {}
 
 bool PeerManager::add_connection(const PeerId& id, std::shared_ptr<PeerConnection> conn) {
@@ -19,8 +19,15 @@ bool PeerManager::add_connection(const PeerId& id, std::shared_ptr<PeerConnectio
         --half_open_connections_;
     }
 
-    // Enforce per-IP connection limit
+    // Reject banned peers
     std::string ip = extract_ip_from_addr(conn->peer_addr());
+    if (is_banned(ip)) {
+        LOGWARN("add_connection: rejecting {} ({}): IP {} is banned", id, conn->peer_addr(), ip);
+        conn->close();
+        return false;
+    }
+
+    // Enforce per-IP connection limit
     size_t ip_count = 0;
     for (const auto& [pid, existing] : active_connections_) {
         if (extract_ip_from_addr(existing->peer_addr()) == ip) {
@@ -92,6 +99,15 @@ asio::awaitable<std::optional<AsyncSocket>> PeerManager::connect_to_peer(const s
         }
     }
 
+    // Check if peer is banned before attempting
+    {
+        std::string ip = extract_ip_from_addr(peer_addr);
+        if (is_banned(ip)) {
+            LOGDBG("connect_to_peer: skipping {}: IP {} is banned", peer_addr, ip);
+            co_return std::nullopt;
+        }
+    }
+
     // Check half-open connection limit before attempting
     if (half_open_connections_.load() >= max_half_open_connections_) {
         LOGWARN("connect_to_peer: rejecting {}: max half-open connections ({}) reached",
@@ -147,6 +163,23 @@ void PeerManager::report_connection_failure(const std::string& peer_addr) {
     std::lock_guard lock(backoff_mutex_);
     auto& state = backoff_states_[peer_addr];
     state.on_failure();
+
+    // Track connection failures for ban purposes
+    bool should_ban = false;
+    std::string banned_ip;
+    {
+        std::lock_guard ban_lock(ban_mutex_);
+        auto& m = peer_misbehavior_[extract_ip_from_addr(peer_addr)];
+        m.connection_failures++;
+        LOGDBG("PeerManager: peer {} reported {} connection failures", peer_addr, m.connection_failures);
+        if (m.has_exceeded_thresholds()) {
+            should_ban = true;
+            banned_ip = extract_ip_from_addr(peer_addr);
+        }
+    }
+    if (should_ban) {
+        ban_peer_by_ip(banned_ip);
+    }
 
     // Schedule the backoff retry timer for the earliest expiry
     TimePoint earliest = state.next_retry_at_;
@@ -361,4 +394,125 @@ std::string PeerManager::populate_dropped() {
         dropped.append(reinterpret_cast<char *>(&port), 2);
     }
     return dropped;
+}
+
+// ---- Ban implementation ----
+
+bool PeerManager::is_banned(const std::string& ip) const {
+    std::lock_guard lock(ban_mutex_);
+    auto it = banned_peers_.find(ip);
+    if (it == banned_peers_.end()) {
+        return false;
+    }
+    // Check if ban has expired
+    auto now = std::chrono::steady_clock::now();
+    if (now >= it->second.expiry_time) {
+        banned_peers_.erase(it);
+        return false;
+    }
+    return true;
+}
+
+void PeerManager::ban_peer_by_ip(const std::string& ip) {
+    auto now = std::chrono::steady_clock::now();
+    BannedPeer bp;
+    bp.ip = ip;
+    bp.ban_time = now;
+    bp.expiry_time = now + 1h;
+
+    {
+        std::lock_guard lock(ban_mutex_);
+        banned_peers_[ip] = bp;
+        // Clear misbehavior counters for this IP
+        peer_misbehavior_.erase(ip);
+    }
+
+    LOGINFO("PeerManager: Banned IP {} for 1 hour", ip);
+
+    // Close any existing connections from this IP
+    std::lock_guard lock(mutex_);
+    std::vector<PeerId> to_remove;
+    for (const auto& [pid, conn] : active_connections_) {
+        if (extract_ip_from_addr(conn->peer_addr()) == ip) {
+            conn->close();
+            to_remove.push_back(pid);
+        }
+    }
+    for (const auto& pid : to_remove) {
+        active_connections_.erase(pid);
+        LOGINFO("PeerManager: Closed connection to banned peer {} (IP {})", pid, ip);
+    }
+}
+
+void PeerManager::report_corrupt_piece(const std::string& peer_addr) {
+    std::string ip = extract_ip_from_addr(peer_addr);
+    bool should_ban = false;
+    {
+        std::lock_guard lock(ban_mutex_);
+        auto& m = peer_misbehavior_[ip];
+        m.corrupt_pieces++;
+        LOGDBG("PeerManager: peer {} reported {} corrupt pieces", peer_addr, m.corrupt_pieces);
+        if (m.has_exceeded_thresholds()) {
+            should_ban = true;
+        }
+    }
+    if (should_ban) {
+        ban_peer_by_ip(ip);
+    }
+}
+
+void PeerManager::report_protocol_violation(const std::string& peer_addr) {
+    std::string ip = extract_ip_from_addr(peer_addr);
+    bool should_ban = false;
+    {
+        std::lock_guard lock(ban_mutex_);
+        auto& m = peer_misbehavior_[ip];
+        m.protocol_violations++;
+        LOGDBG("PeerManager: peer {} reported {} protocol violations", peer_addr, m.protocol_violations);
+        if (m.has_exceeded_thresholds()) {
+            should_ban = true;
+        }
+    }
+    if (should_ban) {
+        ban_peer_by_ip(ip);
+    }
+}
+
+void PeerManager::report_timeout(const std::string& peer_addr) {
+    std::string ip = extract_ip_from_addr(peer_addr);
+    bool should_ban = false;
+    {
+        std::lock_guard lock(ban_mutex_);
+        auto& m = peer_misbehavior_[ip];
+        m.timeouts++;
+        LOGDBG("PeerManager: peer {} reported {} timeouts", peer_addr, m.timeouts);
+        if (m.has_exceeded_thresholds()) {
+            should_ban = true;
+        }
+    }
+    if (should_ban) {
+        ban_peer_by_ip(ip);
+    }
+}
+
+asio::awaitable<void> PeerManager::ban_cleanup_loop() {
+    auto self = shared_from_this();
+
+    while (true) {
+        ban_cleanup_timer_.expires_after(5min);
+        boost::system::error_code ec;
+        co_await ban_cleanup_timer_.async_wait(asio::redirect_error(asio::use_awaitable, ec));
+
+        if (ec == asio::error::operation_aborted) {
+            LOGDBG("Ban cleanup loop aborted");
+            co_return;
+        }
+
+        auto now = std::chrono::steady_clock::now();
+        std::lock_guard lock(ban_mutex_);
+        std::erase_if(banned_peers_, [&](const auto& pair) {
+            return now >= pair.second.expiry_time;
+        });
+        LOGDBG("Ban cleanup: {} active bans", banned_peers_.size());
+    }
 }

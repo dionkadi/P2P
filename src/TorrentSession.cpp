@@ -224,6 +224,8 @@ asio::awaitable<void> TorrentSession::run() {
         asio::co_spawn(strand_, discovered_peers_loop(), asio::detached);
     }
 
+    asio::co_spawn(io_context_, peer_manager_->ban_cleanup_loop(), asio::detached);
+
     try {
         co_await completion_timer_.async_wait(asio::use_awaitable);
     } catch (const boost::system::system_error& e) {
@@ -588,6 +590,7 @@ asio::awaitable<void> TorrentSession::on_piece_block(std::shared_ptr<PeerConnect
         auto actual_hash = Crypto::calculate_sha1_hash_data(progress->data);
         if (actual_hash != expected_hash) {
             LOGERR("Hash mismatch for piece {}. Returning to queue.", piece_index);
+            peer_manager_->report_corrupt_piece(conn->peer_addr());
             co_await piece_manager_->return_piece_to_queue(piece_index);
             co_return;
         }
@@ -681,6 +684,7 @@ asio::awaitable<void> TorrentSession::on_peer_bitfield(std::shared_ptr<PeerConne
         LOGWARN("Received bitfield of incorrect size. Expected {}, got {}. Dropping connection.",
             expected_bitfield_size, bitfield.size()
         );
+        peer_manager_->report_protocol_violation(conn->peer_addr());
         conn->close();
         co_return ;
     }
@@ -769,6 +773,7 @@ asio::awaitable<void> TorrentSession::on_disconnect(std::shared_ptr<PeerConnecti
 asio::awaitable<void> TorrentSession::on_extended_message(std::shared_ptr<PeerConnection> conn, std::span<const std::byte> payload) {
     if (payload.empty()) {
         LOGWARN("Received empty extended message payload from peer {}. Disconnecting.", conn->peer_id());
+        peer_manager_->report_protocol_violation(conn->peer_addr());
         conn->close(); // Disconnect on malformed message
         co_return;
     }
@@ -840,6 +845,7 @@ asio::awaitable<void> TorrentSession::on_extended_message(std::shared_ptr<PeerCo
                 for (size_t i = 0; i < added.size(); i += 6) {
                     if (i + 6 > added.size()) { // Bounds check for IP:Port pair
                         LOGERR("Malformed PEX 'added' payload from peer {}. Not enough bytes for an IP:Port pair. Disconnecting.", conn->peer_id());
+                        peer_manager_->report_protocol_violation(conn->peer_addr());
                         conn->close(); 
                         co_return;
                     }
@@ -865,6 +871,7 @@ asio::awaitable<void> TorrentSession::on_extended_message(std::shared_ptr<PeerCo
                 for (size_t i = 0; i < dropped.size(); i += 6) {
                     if (i + 6 > dropped.size()) { // Bounds check
                         LOGERR("Malformed PEX 'dropped' payload from peer {}. Not enough bytes for an IP:Port pair. Disconnecting.", conn->peer_id());
+                        peer_manager_->report_protocol_violation(conn->peer_addr());
                         conn->close(); 
                         co_return;
                     }
@@ -1346,6 +1353,7 @@ asio::awaitable<void> TorrentSession::on_metadata_complete() {
             asio::co_spawn(io_context_, piece_manager_->downloader(), asio::detached);
             asio::co_spawn(strand_, periodically_save(), asio::detached);
             asio::co_spawn(strand_, discovered_peers_loop(), asio::detached);
+            asio::co_spawn(io_context_, peer_manager_->ban_cleanup_loop(), asio::detached);
         }
 
         metadata_download_active_ = false;

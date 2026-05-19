@@ -979,3 +979,58 @@ TEST_F(IntegrationTest, TorrentSessionFromMagnet) {
     run_done.get_future().wait_for(10s);
     EXPECT_EQ(session->get_info_hash().size(), HASH_SIZE);
 }
+
+TEST(BanUnitTest, PeerBanning) {
+    asio::io_context io;
+    InfoHash dummy_hash{};
+    auto state = std::make_shared<SessionState>(
+        dummy_hash,
+        std::vector<std::vector<std::string>>{},
+        std::filesystem::temp_directory_path()
+    );
+    auto pm = std::make_shared<PeerManager>(io, state);
+
+    // Initially no IP is banned
+    EXPECT_FALSE(pm->is_banned("1.2.3.4"));
+
+    // Manually ban an IP
+    pm->ban_peer_by_ip("1.2.3.4");
+    EXPECT_TRUE(pm->is_banned("1.2.3.4"));
+
+    // Test misbehavior tracking: ban after 3 corrupt pieces
+    EXPECT_FALSE(pm->is_banned("5.6.7.8"));
+    pm->report_corrupt_piece("5.6.7.8:6881");
+    EXPECT_FALSE(pm->is_banned("5.6.7.8"));
+    pm->report_corrupt_piece("5.6.7.8:6881");
+    EXPECT_FALSE(pm->is_banned("5.6.7.8"));
+    pm->report_corrupt_piece("5.6.7.8:6881");
+    EXPECT_TRUE(pm->is_banned("5.6.7.8"));
+
+    // Test protocol violation tracking: ban after 5 violations
+    EXPECT_FALSE(pm->is_banned("9.10.11.12"));
+    for (int i = 0; i < 4; ++i) {
+        pm->report_protocol_violation("9.10.11.12:6881");
+        EXPECT_FALSE(pm->is_banned("9.10.11.12"));
+    }
+    pm->report_protocol_violation("9.10.11.12:6881");
+    EXPECT_TRUE(pm->is_banned("9.10.11.12"));
+
+    // Test timeout tracking: ban after 10 timeouts
+    EXPECT_FALSE(pm->is_banned("13.14.15.16"));
+    for (int i = 0; i < 9; ++i) {
+        pm->report_timeout("13.14.15.16:6881");
+        EXPECT_FALSE(pm->is_banned("13.14.15.16"));
+    }
+    pm->report_timeout("13.14.15.16:6881");
+    EXPECT_TRUE(pm->is_banned("13.14.15.16"));
+
+    // Test connection failure threshold
+    EXPECT_FALSE(pm->is_banned("17.18.19.20"));
+    for (int i = 0; i < 4; ++i) {
+        pm->report_connection_failure("17.18.19.20:6881");
+        EXPECT_FALSE(pm->is_banned("17.18.19.20"));
+    }
+    pm->report_connection_failure("17.18.19.20:6881");
+    EXPECT_TRUE(pm->is_banned("17.18.19.20"));
+}
+
