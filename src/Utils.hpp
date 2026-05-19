@@ -29,7 +29,7 @@
 using namespace std::chrono_literals;
 
 // constants
-constexpr std::string_view PROTOCOL_STRING = "MIT-P2P-V1.0";
+constexpr std::string_view PROTOCOL_STRING = "BitTorrent protocol";
 constexpr size_t HASH_SIZE = 20;
 constexpr size_t PEER_ID_SIZE = 20;
 constexpr size_t HANDSHAKE_RESERVED_BYTES = 8;
@@ -69,8 +69,8 @@ inline std::pair<std::string, uint16_t> decode_address(const std::string& addr) 
     return {ip, port};
 }
 
-static constexpr std::string_view PEER_ID_PREFIX = "-MI0001-";
-static constexpr std::string_view NODE_ID_PREFIX = "-NODE-";
+static constexpr std::string_view PEER_ID_PREFIX = "-PU0001-";
+static constexpr std::string_view NODE_ID_PREFIX = "-PU0001-";
 static constexpr std::string_view ALPHANUM = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
 constexpr std::array<std::byte, 20> generate_id(std::string_view prefix = "") {
@@ -755,9 +755,10 @@ struct Handshake {
         writer.write_raw(PROTOCOL_STRING);
 
         std::vector<std::byte> reserved(HANDSHAKE_RESERVED_BYTES, std::byte{0});
-        if (extended) {
-            reserved[5] |= static_cast<std::byte>(0x10);
-        }
+        // BEP-10: extended messaging
+        reserved[5] |= static_cast<std::byte>(0x10);
+        // BEP-5: DHT support
+        reserved[7] |= static_cast<std::byte>(0x01);
         writer.write_bytes(reserved);
         writer.write_bytes(info_hash_bytes);
         writer.write_bytes(peer_id_bytes);
