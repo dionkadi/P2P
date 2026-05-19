@@ -756,7 +756,9 @@ struct Handshake {
 
         std::vector<std::byte> reserved(HANDSHAKE_RESERVED_BYTES, std::byte{0});
         // BEP-10: extended messaging
-        reserved[5] |= static_cast<std::byte>(0x10);
+        if (extended) {
+            reserved[5] |= static_cast<std::byte>(0x10);
+        }
         // BEP-5: DHT support
         reserved[7] |= static_cast<std::byte>(0x01);
         writer.write_bytes(reserved);

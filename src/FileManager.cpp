@@ -434,8 +434,9 @@ asio::awaitable<bool> FileManager::preallocate_files() {
 
         // selective downloading
         std::optional<bool> download_all_decision;
-        
-        download_all_decision.emplace(true);
+        if (auto_approve_all_) {
+            download_all_decision.emplace(true);
+        }
 
         for (size_t i = 0; i < info.files.size(); ++i) {
             const auto& file = info.files[i];

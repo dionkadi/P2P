@@ -59,6 +59,14 @@ inline PeerId generate_peer_id() {
     return generate_id(PEER_ID_PREFIX);
 }
 
+// Helper to convert hex string to InfoHash (std::array<std::byte, 20>)
+inline InfoHash hex_string_to_info_hash(const std::string& hex) {
+    auto bytes = Crypto::hex_to_bytes(hex);
+    InfoHash hash{};
+    std::copy_n(bytes.begin(), std::min(bytes.size(), hash.size()), hash.begin());
+    return hash;
+}
+
 template <typename Awaitable>
 void RunAsync(asio::io_context& io, Awaitable&& awaitable) {
     asio::co_spawn(io, std::forward<Awaitable>(awaitable),

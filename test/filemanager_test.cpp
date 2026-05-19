@@ -9,7 +9,9 @@ public:
     }
 
     TestFileManager(std::shared_ptr<SessionState> state)
-        : FileManager(state) {}
+        : FileManager(state) {
+        auto_approve_all_ = false;
+    }
 
 protected:
     // Override the async_prompt method

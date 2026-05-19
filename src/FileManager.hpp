@@ -61,6 +61,7 @@ public:
 
 protected:
     virtual asio::awaitable<int> async_prompt(const std::string& question);
+    bool auto_approve_all_{true};
 
 private:
     static ThreadPool& get_file_io_pool();
