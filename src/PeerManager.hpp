@@ -6,6 +6,7 @@
 #include <boost/asio/steady_timer.hpp>
 #include <cstddef>
 #include <map>
+#include <unordered_map>
 #include <unordered_set>
 #include <memory>
 #include <mutex>
@@ -129,8 +130,13 @@ public:
         pex_timer_.cancel();
         LOGDBG("PeerManager: pex_timer_ cancelled. Cancelling choke_timer_...");
         choke_timer_.cancel();
-        LOGDBG("PeerManager: choke_timer_ cancelled.");
+        LOGDBG("PeerManager: choke_timer_ cancelled. Cancelling backoff_retry_timer_...");
+        backoff_retry_timer_.cancel();
+        LOGDBG("PeerManager: backoff_retry_timer_ cancelled.");
     }
+
+    void report_connection_success(const std::string& peer_addr);
+    void report_connection_failure(const std::string& peer_addr);
 
     asio::awaitable<std::optional<AsyncSocket>> connect_to_peer(const std::string& peer_addr);
     asio::awaitable<std::vector<std::shared_ptr<PeerConnection>>> available_peers(size_t piece_index) const;
@@ -164,4 +170,9 @@ private:
 
     std::string populate_added(size_t max_peers = 50);
     std::string populate_dropped();
+
+    // Backoff state for peer connection retries
+    std::unordered_map<std::string, BackoffState> backoff_states_;
+    mutable std::mutex backoff_mutex_;
+    asio::steady_timer backoff_retry_timer_;
 };

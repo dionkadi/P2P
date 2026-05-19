@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <unordered_map>
 #include <vector>
 
 static constexpr size_t METADATA_PIECE_SIZE = 16384; // 16 KiB metadata pieces (BEP-10)
@@ -111,6 +112,8 @@ private:
     uint16_t peer_port_;
     Mode mode_;
     std::vector<std::vector<std::shared_ptr<ITrackerClient>>> tracker_clients_by_tier_;
+    std::unordered_map<std::string, BackoffState> tracker_backoff_states_;
+    mutable std::mutex tracker_backoff_mutex_;
 
     std::shared_ptr<SessionState> state_;
     std::shared_ptr<PieceManager> piece_manager_;

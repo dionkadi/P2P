@@ -49,6 +49,60 @@ using IPv4 = asio::ip::address_v4;
 using TimePoint = std::chrono::time_point<std::chrono::steady_clock>;
 using udp = asio::ip::udp;
 
+inline std::chrono::seconds calculate_backoff_delay(int attempt_count, std::chrono::seconds initial_delay = 30s, std::chrono::seconds max_delay = 30min);
+
+// ------------ BackoffState ----------------
+struct BackoffState {
+    int attempt_count_{0};
+    TimePoint next_retry_at_{};
+    TimePoint last_success_at_{};
+
+    static constexpr std::chrono::seconds kDefaultInitialDelay{30s};
+    static constexpr std::chrono::seconds kMaxDelay{30min};
+    static constexpr std::chrono::hours kResetAfterIdle{1h};
+
+    bool is_in_backoff() const {
+        auto now = std::chrono::steady_clock::now();
+        if (last_success_at_ != TimePoint{} && now - last_success_at_ > kResetAfterIdle) {
+            return false;
+        }
+        return attempt_count_ > 0 && now < next_retry_at_;
+    }
+
+    std::chrono::seconds get_delay(std::chrono::seconds initial_delay = kDefaultInitialDelay) const {
+        return calculate_backoff_delay(attempt_count_, initial_delay);
+    }
+
+    void on_success() {
+        attempt_count_ = 0;
+        last_success_at_ = std::chrono::steady_clock::now();
+        next_retry_at_ = TimePoint{};
+    }
+
+    void on_failure(std::chrono::seconds initial_delay = kDefaultInitialDelay) {
+        ++attempt_count_;
+        auto delay = calculate_backoff_delay(attempt_count_, initial_delay);
+        next_retry_at_ = std::chrono::steady_clock::now() + delay;
+    }
+
+    bool check_and_reset_if_idle() {
+        auto now = std::chrono::steady_clock::now();
+        if (attempt_count_ > 0 && last_success_at_ != TimePoint{} && now - last_success_at_ > kResetAfterIdle) {
+            attempt_count_ = 0;
+            next_retry_at_ = TimePoint{};
+            return true;
+        }
+        return false;
+    }
+};
+
+inline std::chrono::seconds calculate_backoff_delay(int attempt_count, std::chrono::seconds initial_delay, std::chrono::seconds max_delay) {
+    auto delay = initial_delay * (1 << attempt_count);
+    if (delay > max_delay) {
+        delay = max_delay;
+    }
+    return delay;
+}
 
 // -------------- HELPERS ---------------
 inline std::pair<std::string, uint16_t> decode_address(const std::string& addr) {

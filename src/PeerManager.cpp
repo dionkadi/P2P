@@ -7,7 +7,7 @@
 
 PeerManager::PeerManager(asio::io_context& io_context, std::shared_ptr<SessionState> state, std::chrono::seconds choke_interval) noexcept
     : io_context_(io_context), strand_(asio::make_strand(io_context)), pex_timer_(io_context_), choke_timer_(io_context_),
-    state_(state), choke_interval_(choke_interval)
+    state_(state), choke_interval_(choke_interval), backoff_retry_timer_(io_context_)
 {}
 
 bool PeerManager::add_connection(const PeerId& id, std::shared_ptr<PeerConnection> conn) {
@@ -76,6 +76,22 @@ std::string PeerManager::extract_ip_from_addr(const std::string& peer_addr) {
 }
 
 asio::awaitable<std::optional<AsyncSocket>> PeerManager::connect_to_peer(const std::string& peer_addr) {
+    // Check backoff state before attempting
+    {
+        std::lock_guard lock(backoff_mutex_);
+        auto it = backoff_states_.find(peer_addr);
+        if (it != backoff_states_.end()) {
+            it->second.check_and_reset_if_idle();
+            if (it->second.is_in_backoff()) {
+                auto remaining = std::chrono::duration_cast<std::chrono::seconds>(
+                    it->second.next_retry_at_ - std::chrono::steady_clock::now()).count();
+                LOGDBG("connect_to_peer: skipping {}: in backoff ({}s remaining, attempt {})",
+                       peer_addr, remaining, it->second.attempt_count_);
+                co_return std::nullopt;
+            }
+        }
+    }
+
     // Check half-open connection limit before attempting
     if (half_open_connections_.load() >= max_half_open_connections_) {
         LOGWARN("connect_to_peer: rejecting {}: max half-open connections ({}) reached",
@@ -96,6 +112,7 @@ asio::awaitable<std::optional<AsyncSocket>> PeerManager::connect_to_peer(const s
             AsyncSocket socket(asio::ip::tcp::socket{io_context_});
             co_await socket.connect(ip, port);
             LOGINFO("Successfully connected to peer {}", peer_addr);
+            report_connection_success(peer_addr);
             // Success - return socket, half-open will be decremented in add_connection
             co_return socket;
         }
@@ -116,7 +133,39 @@ asio::awaitable<std::optional<AsyncSocket>> PeerManager::connect_to_peer(const s
     if (half_open_connections_.load() > 0) {
         --half_open_connections_;
     }
+
+    report_connection_failure(peer_addr);
     co_return std::nullopt;
+}
+
+void PeerManager::report_connection_success(const std::string& peer_addr) {
+    std::lock_guard lock(backoff_mutex_);
+    backoff_states_[peer_addr].on_success();
+}
+
+void PeerManager::report_connection_failure(const std::string& peer_addr) {
+    std::lock_guard lock(backoff_mutex_);
+    auto& state = backoff_states_[peer_addr];
+    state.on_failure();
+
+    // Schedule the backoff retry timer for the earliest expiry
+    TimePoint earliest = state.next_retry_at_;
+    for (const auto& [addr, bs] : backoff_states_) {
+        if (bs.attempt_count_ > 0 && bs.next_retry_at_ != TimePoint{} && bs.next_retry_at_ < earliest) {
+            earliest = bs.next_retry_at_;
+        }
+    }
+    auto now = std::chrono::steady_clock::now();
+    if (earliest > now) {
+        backoff_retry_timer_.expires_at(earliest);
+        asio::co_spawn(io_context_, [this]() -> asio::awaitable<void> {
+            boost::system::error_code ec;
+            co_await backoff_retry_timer_.async_wait(asio::redirect_error(asio::use_awaitable, ec));
+            if (!ec) {
+                LOGDBG("Backoff retry timer fired, some peers may be eligible for retry.");
+            }
+        }, asio::detached);
+    }
 }
 
 asio::awaitable<void> PeerManager::choke_loop() {

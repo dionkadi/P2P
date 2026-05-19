@@ -53,6 +53,7 @@ target_link_libraries(client PRIVATE p2p_common)
 
 add_executable(p2p_test
     test/main.cpp
+    test/backoff_test.cpp
     test/bencode_test.cpp
     test/buffer_test.cpp
     test/crypto_test.cpp

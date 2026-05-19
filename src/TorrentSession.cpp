@@ -396,10 +396,31 @@ asio::awaitable<void> TorrentSession::announce_tracker_for(std::string event) {
     co_await asio::dispatch(strand_, asio::use_awaitable);
     for (auto& tier : tracker_clients_by_tier_) {
         for (const auto& tracker_client : tier) {
+            const auto& url = tracker_client->get_url();
+
+            // Check backoff for this tracker URL
+            {
+                std::lock_guard lock(tracker_backoff_mutex_);
+                auto it = tracker_backoff_states_.find(url);
+                if (it != tracker_backoff_states_.end()) {
+                    it->second.check_and_reset_if_idle();
+                    if (it->second.is_in_backoff()) {
+                        LOGDBG("announce_tracker_for: skipping tracker {} (in backoff, attempt {})",
+                               url, it->second.attempt_count_);
+                        continue;
+                    }
+                }
+            }
+
             try {
-                LOGINFO("Announcing to tracker {} (event: '{}')...", tracker_client->get_url(), event);
+                LOGINFO("Announcing to tracker {} (event: '{}')...", url, event);
                 auto result = co_await tracker_client->announce(params);
                 announce_successful = true;
+
+                {
+                    std::lock_guard lock(tracker_backoff_mutex_);
+                    tracker_backoff_states_[url].on_success();
+                }
                 
                 if (event == "started") {
                     tracker_announce_interval_ = std::chrono::seconds(result.interval_seconds);
@@ -422,6 +443,10 @@ asio::awaitable<void> TorrentSession::announce_tracker_for(std::string event) {
                 break;
             } catch (const std::exception& e) {
                 LOGERR("Failed to announce to tracker: {}.", e.what());
+                {
+                    std::lock_guard lock(tracker_backoff_mutex_);
+                    tracker_backoff_states_[url].on_failure(tracker_announce_interval_);
+                }
             }
         }
 
