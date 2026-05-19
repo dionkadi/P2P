@@ -9,7 +9,6 @@
 #include "IPeerEvents.hpp"
 #include "TrackerClient.hpp"
 #include "Kademlia.hpp"
-#include "Utils.hpp"
 
 #include <boost/asio/any_io_executor.hpp>
 #include <boost/asio/steady_timer.hpp>

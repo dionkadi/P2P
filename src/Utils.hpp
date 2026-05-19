@@ -325,7 +325,6 @@ inline std::array<std::byte, 20> from_string(std::string_view sv) {
 } // namespace Crypto
 
 // ------------ LOGGER -------------
-using PeerId = std::array<std::byte, 20>;
 
 namespace fmt {
 

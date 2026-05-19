@@ -13,7 +13,6 @@
 #include "HttpServer.hpp"
 #include "Bencode.hpp"
 #include "Utils.hpp"
-#include "Types.hpp"
 
 namespace asio = boost::asio;
 
