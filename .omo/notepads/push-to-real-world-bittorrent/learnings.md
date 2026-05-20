@@ -210,3 +210,47 @@
 
 ### Test Results
 - 148 tests pass (138 existing + 10 new LSD tests)
+
+## Task 6.x: Client Configuration System (2026-05-20)
+
+### Changes Made
+- **src/ClientConfig.hpp** (new): Header-only `ClientConfig` struct with:
+  - All configurable parameters (peer_port, upload/download rate limits, max connections, per-IP limit, half-open limit, block timeout, ban threshold/duration, download dir, DHT/LSD/PEX enable flags, DHT bootstrap nodes)
+  - `to_dict()` / `from_dict()` for Bencode serialization
+  - `load(path)`: Load from Bencoded config file with fallback chain (`--config` path → `./p2p.conf` → `~/.config/p2p/p2p.conf`); returns defaults if file not found
+  - `save(path)`: Save to Bencoded config file, creates parent directories automatically
+  - `from_cli(argc, argv)`: Full pipeline (defaults → config file → CLI overrides); handles `--port`, `--upload-rate`, `--download-rate`, `--max-connections`, `--max-connections-per-ip`, `--max-half-open`, `--block-timeout`, `--download-dir`, `--no-dht`, `--no-lsd`, `--no-pex`, `--config`
+  - `find_config_path()`: Search order for config file location
+
+- **src/main_client.cpp**:
+  - Integrated `ClientConfig::from_cli()` for full config pipeline at startup
+  - Added `--save-config` support: saves current merged config and exits
+  - Added `collect_positional()` helper to extract non-flag args (allows flags anywhere in argv)
+  - Seed/download commands now pass `cfg.upload_rate_limit` and `cfg.download_rate_limit` to TorrentSession constructor
+  - Positional peer_port (argv[4]) still overrides `--port` flag for backward compatibility
+  - Extended `print_usage()` with config flag documentation
+
+- **test/config_test.cpp** (new): 20 tests covering:
+  - Default values verification (all fields)
+  - Serialize/deserialize roundtrip (both explicit values and defaults)
+  - Every CLI flag individually (`--port`, `--upload-rate`, `--download-rate`, `--max-connections`, `--max-connections-per-ip`, `--max-half-open`, `--block-timeout`, `--download-dir`)
+  - Boolean flags (`--no-dht`, `--no-lsd`, `--no-pex`)
+  - Multiple flags combined
+  - Defaults preserved when CLI only overrides some fields
+  - Config file save & load roundtrip
+  - Bencode validity verification of saved config
+  - Nonexistent file returns defaults
+  - Parent directory creation on save
+
+- **CMakeLists.txt**: Added `test/config_test.cpp` to build
+
+### Key Design Decisions
+- `from_cli()` handles the entire pipeline internally: starts with defaults, loads config file (using `--config` path or search), applies CLI overrides
+- `--save-config` is handled in `main()` rather than `from_cli()` — keeps the function focused on config construction
+- CLI flags are position-independent: `collect_positional()` extracts them from anywhere in argv, so flags can appear before or after the command verb
+- `std::vector<std::byte>` file reading uses explicit `static_cast<std::byte>(char)` loop to avoid C++23 `construct_at` issue (cannot construct `std::byte` from `char` implicitly)
+- Config file load never throws — silently returns defaults on any error (missing file, malformed Bencode, etc.)
+
+### Test Results
+- 168 tests pass (148 existing + 20 new config tests)
+- All 20 config tests complete in ~3ms total

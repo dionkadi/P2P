@@ -61,7 +61,7 @@ Ship a production-quality CLI BitTorrent client that can seed/download via `.tor
 - [x] 3.2. Implement Fast Extension (BEP 6)
 - [x] 3.3. Implement Local Peer Discovery (BEP 14)
 
-- [ ] 4.1. Create Configuration System
+- [x] 4.1. Create Configuration System
 - [ ] 4.2. Create Multi-Torrent ClientApp Manager
 
 - [ ] 5.1. Refine Choking Algorithm (BEP 3 Tit-for-Tat)
