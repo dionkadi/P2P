@@ -55,6 +55,15 @@ public:
         );
     }
 
+    void set_rate(uint64_t bps) noexcept {
+        rate_bytes_per_second_ = bps;
+        capacity_ = bps;  // Reset capacity to match new rate
+        tokens_ = std::min(tokens_, capacity_);
+        if (rate_bytes_per_second_ > 0) {
+            asio::post(strand_, [this] { refill_tokens(); });
+        }
+    }
+
 private:
     void refill_tokens() {
         timer_.expires_after(refill_interval);
@@ -92,8 +101,8 @@ private:
 
     asio::strand<asio::io_context::executor_type> strand_;
     asio::steady_timer timer_;
-    const TokenCountType rate_bytes_per_second_;
-    const TokenCountType capacity_;
+    TokenCountType rate_bytes_per_second_;
+    TokenCountType capacity_;
     TokenCountType tokens_;
 
     // The queue stores {amount_needed, completion_handler}

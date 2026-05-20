@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "Utils.hpp"
+#include "AsyncRateLimiter.hpp"
 #include "AsyncSocket.hpp"
 #include "SessionState.hpp"
 #include "IPeerEvents.hpp"
@@ -121,6 +122,9 @@ public:
     asio::awaitable<void> send_extended_message(uint8_t type_id, std::span<const std::byte> payload);
     asio::awaitable<void> send_metadata_request(uint8_t ext_id, int piece);
 
+    void set_upload_rate(uint64_t bps) noexcept;
+    void set_download_rate(uint64_t bps) noexcept;
+
     bool supports_metadata() const noexcept { return metadata_ext_id_ != 0; }
     uint8_t metadata_ext_id() const noexcept { return metadata_ext_id_; }
     void metadata_ext_id(uint8_t id) noexcept { metadata_ext_id_ = id; }
@@ -139,6 +143,9 @@ protected:
     AsyncSocket socket_;
     std::string peer_addr_;
     PeerId peer_id_{};
+
+    std::shared_ptr<AsyncRateLimiter<>> upload_limiter_;
+    std::shared_ptr<AsyncRateLimiter<>> download_limiter_;
 
 private:
     asio::awaitable<bool> perform_handshake(const PeerId& my_peer_id);

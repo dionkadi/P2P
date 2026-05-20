@@ -156,6 +156,15 @@ struct TestPeerConn : public PeerConnection {
     {
         peer_id_ = pid;
     }
+
+    void set_upload_limiter(std::shared_ptr<AsyncRateLimiter<>> limiter) {
+        upload_limiter_ = std::move(limiter);
+    }
+    void set_download_limiter(std::shared_ptr<AsyncRateLimiter<>> limiter) {
+        download_limiter_ = std::move(limiter);
+    }
+    std::shared_ptr<AsyncRateLimiter<>>& upload_limiter() { return upload_limiter_; }
+    std::shared_ptr<AsyncRateLimiter<>>& download_limiter() { return download_limiter_; }
 };
 
 // Factory helper to create test peer connections with transfer rates
@@ -457,4 +466,83 @@ TEST(PieceManagerTimeoutTest, ReceivedBlockDoesNotTrigger) {
     RunAsync(io, pm->check_block_timeouts());
 
     EXPECT_FALSE(timeout_fired) << "Timeout callback should not fire for a block already received";
+}
+
+// ============================================================
+// Per-Peer Rate Limiting Tests
+// ============================================================
+
+TEST(PerPeerRateLimitTest, UploadRateLimiterCreatedAndSettable) {
+    asio::io_context io;
+    PeerId pid = test_peer_id("rateUL");
+    auto conn = std::make_shared<TestPeerConn>(io, "1.2.3.4:6881", pid);
+
+    // Create and assign limiters (normally done by PeerConnection::create)
+    conn->set_upload_limiter(std::make_shared<AsyncRateLimiter<>>(io, 10 * 1024 * 1024));
+    conn->set_download_limiter(std::make_shared<AsyncRateLimiter<>>(io, 10 * 1024 * 1024));
+
+    // Verify limiters are non-null
+    ASSERT_NE(conn->upload_limiter(), nullptr);
+    ASSERT_NE(conn->download_limiter(), nullptr);
+
+    // Verify set_rate works via the public interface
+    EXPECT_NO_THROW(conn->set_upload_rate(5 * 1024 * 1024));
+    EXPECT_NO_THROW(conn->set_download_rate(5 * 1024 * 1024));
+
+    // Setting to 0 disables rate limiting
+    EXPECT_NO_THROW(conn->set_upload_rate(0));
+    EXPECT_NO_THROW(conn->set_download_rate(0));
+}
+
+TEST(PerPeerRateLimitTest, UploadRateLimitingAppliesBackpressure) {
+    asio::io_context io;
+    PeerId pid = test_peer_id("rateBP");
+    auto conn = std::make_shared<TestPeerConn>(io, "1.2.3.4:6881", pid);
+
+    // Very low rate: 100 bytes/s, capacity factor 1 = 100 bytes capacity
+    conn->set_upload_limiter(std::make_shared<AsyncRateLimiter<>>(io, 100, 1));
+    conn->set_download_limiter(std::make_shared<AsyncRateLimiter<>>(io, 100 * 1024 * 1024));
+
+    auto start = std::chrono::steady_clock::now();
+
+    // Request 1000 bytes through the upload limiter
+    // Initial 100 are instant from capacity, remaining 900 need refill
+    // At 100 bytes/s, need ~9 seconds
+    RunAsyncFor(io, 15s, [&]() -> asio::awaitable<void> {
+        co_await conn->upload_limiter()->await_tokens(1000);
+    });
+
+    auto elapsed = std::chrono::steady_clock::now() - start;
+    auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
+
+    // Should have taken at least 9 seconds for 1000 bytes at 100 bps
+    // (100 from initial capacity, 900 at 10 bytes per 100ms = 9000ms)
+    EXPECT_GE(elapsed_ms, 8000) << "Upload rate limiting should apply backpressure";
+    EXPECT_LE(elapsed_ms, 16000) << "Upload rate limiting should not take excessively long";
+}
+
+TEST(PerPeerRateLimitTest, DownloadRateLimitingAppliesBackpressure) {
+    asio::io_context io;
+    PeerId pid = test_peer_id("rateBP2");
+    auto conn = std::make_shared<TestPeerConn>(io, "1.2.3.4:6881", pid);
+
+    // Very low rate: 200 bytes/s, capacity factor 1 = 200 bytes capacity
+    conn->set_upload_limiter(std::make_shared<AsyncRateLimiter<>>(io, 100 * 1024 * 1024));
+    conn->set_download_limiter(std::make_shared<AsyncRateLimiter<>>(io, 200, 1));
+
+    auto start = std::chrono::steady_clock::now();
+
+    // Request 2000 bytes through the download limiter
+    // Initial 200 are instant, remaining 1800 need refill
+    // At 200 bytes/s, need ~9 seconds
+    RunAsyncFor(io, 15s, [&]() -> asio::awaitable<void> {
+        co_await conn->download_limiter()->await_tokens(2000);
+    });
+
+    auto elapsed = std::chrono::steady_clock::now() - start;
+    auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
+
+    // Should have taken at least 9 seconds for 2000 bytes at 200 bps
+    EXPECT_GE(elapsed_ms, 8000) << "Download rate limiting should apply backpressure";
+    EXPECT_LE(elapsed_ms, 16000) << "Download rate limiting should not take excessively long";
 }

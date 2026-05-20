@@ -36,6 +36,9 @@ PeerConnection::create(
     conn->start_loops();
     LOGDBG("Message and keep-alive loops started for {}", conn->peer_id());
 
+    conn->upload_limiter_ = std::make_shared<AsyncRateLimiter<>>(io_context, 10 * 1024 * 1024);
+    conn->download_limiter_ = std::make_shared<AsyncRateLimiter<>>(io_context, 10 * 1024 * 1024);
+
     co_return conn;
 }
 
@@ -194,6 +197,7 @@ asio::awaitable<void> PeerConnection::message_loop() {
                                block_length, block_data.size(), piece_index, piece_begin);
                         break;
                     }
+                    co_await download_limiter_->await_tokens(block_length);
                     co_await events_->on_piece_block(self, piece_index, piece_begin, block_data);
                     break;
                 }
@@ -282,6 +286,7 @@ asio::awaitable<void> PeerConnection::send_request(size_t index, uint32_t begin,
 }
 
 asio::awaitable<void> PeerConnection::send_piece(size_t index, uint32_t begin, std::span<const std::byte> block_data) {
+    co_await upload_limiter_->await_tokens(block_data.size());
     std::vector<std::byte> msg_body(1, static_cast<std::byte>(MessageType::Piece));
     auto payload = RequestPayload::serialize(index, begin, block_data.size());
     msg_body.insert(msg_body.end(), payload.begin(), payload.end());
@@ -323,4 +328,16 @@ asio::awaitable<void> PeerConnection::send_metadata_request(uint8_t ext_id, int 
     msg_dict["piece"] = Value(static_cast<Integer>(piece));
     auto encoded = encode(Value(std::move(msg_dict)));
     co_await send_extended_message(ext_id, encoded);
+}
+
+void PeerConnection::set_upload_rate(uint64_t bps) noexcept {
+    if (upload_limiter_) {
+        upload_limiter_->set_rate(bps);
+    }
+}
+
+void PeerConnection::set_download_rate(uint64_t bps) noexcept {
+    if (download_limiter_) {
+        download_limiter_->set_rate(bps);
+    }
 }
