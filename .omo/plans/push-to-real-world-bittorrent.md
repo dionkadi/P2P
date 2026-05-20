@@ -57,7 +57,7 @@ Ship a production-quality CLI BitTorrent client that can seed/download via `.tor
 - [x] 2.3. Implement Peer Banning Mechanism
 - [x] 2.4. Implement Per-Peer Rate Limiting
 
-- [ ] 3.1. Implement Disk Cache in FileManager
+- [x] 3.1. Implement Disk Cache in FileManager
 - [ ] 3.2. Implement Fast Extension (BEP 6)
 - [ ] 3.3. Implement Local Peer Discovery (BEP 14)
 

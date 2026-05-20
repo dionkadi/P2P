@@ -1,9 +1,14 @@
 #pragma once
 
+#include <atomic>
 #include <cassert>
 #include <cstddef>
+#include <list>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <set>
+#include <unordered_map>
 #include <filesystem>
 #include <vector>
 #include <boost/asio.hpp>
@@ -27,8 +32,11 @@ private:
 
 class FileManager {
 public:
+    /// Disk cache size constant: 32 MB
+    static constexpr size_t DISK_CACHE_SIZE = 32 * 1024 * 1024;
+
     explicit FileManager(std::shared_ptr<SessionState> state);
-    virtual ~FileManager() = default;
+    virtual ~FileManager();
 
     FileManager(const FileManager&) = delete;
     FileManager& operator=(const FileManager&) = delete;
@@ -72,9 +80,39 @@ private:
     void build_maps();
 
     std::shared_ptr<SessionState> state_;
+    // -- Disk cache types --
+    using CacheKey = std::pair<size_t, uint32_t>;
+    struct CacheKeyHash {
+        size_t operator()(const CacheKey& p) const noexcept {
+            auto h1 = std::hash<size_t>{}(p.first);
+            auto h2 = std::hash<uint32_t>{}(p.second);
+            return h1 ^ (h2 << 1);
+        }
+    };
+    using LRUList = std::list<CacheKey>;
+
     ThreadPool& file_io_pool_;
     std::shared_ptr<FileLocker> file_locker_;
     std::vector<std::shared_ptr<std::vector<PieceFileOverlap>>> piece_to_files_map_;
     std::vector<std::shared_ptr<std::vector<size_t>>> file_to_pieces_map_;
     mutable std::mutex m_;
+
+    // -- Disk cache (write-back) --
+    std::map<CacheKey, std::vector<std::byte>> cache_;
+    LRUList lru_order_;
+    std::unordered_map<CacheKey, LRUList::iterator, CacheKeyHash> lru_index_;
+    std::set<CacheKey> dirty_blocks_;
+    mutable std::mutex cache_mutex_;
+    size_t cache_current_size_ = 0;
+    std::unique_ptr<asio::steady_timer> flush_timer_;
+    bool flush_timer_started_ = false;
+    std::atomic<bool> shutting_down_{false};
+
+    // -- Cache helpers --
+    void touch_cache(const CacheKey& key);
+    void evict_if_needed();
+    void sync_write_block(const CacheKey& key, const std::vector<std::byte>& data);
+    void sync_flush_all_dirty();
+    asio::awaitable<void> flush_all_dirty();
+    asio::awaitable<void> periodic_flush();
 };

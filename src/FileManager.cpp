@@ -1,5 +1,6 @@
 #include "FileManager.hpp"
 #include <iostream>
+#include <fstream>
 #include <boost/asio/experimental/awaitable_operators.hpp>
 
 FileManager::FileManager(std::shared_ptr<SessionState> state)
@@ -22,7 +23,28 @@ FileManager::FileManager(std::shared_ptr<SessionState> state)
     build_maps();
 }
 
+FileManager::~FileManager() {
+    shutting_down_.store(true);
+    if (flush_timer_) {
+        flush_timer_->cancel();
+    }
+    sync_flush_all_dirty();
+}
+
 asio::awaitable<std::vector<std::byte>> FileManager::read_block(size_t piece_index, uint32_t begin, uint32_t length) {
+    CacheKey key(piece_index, begin);
+
+    // Check cache first
+    {
+        std::lock_guard lock(cache_mutex_);
+        auto it = cache_.find(key);
+        if (it != cache_.end() && it->second.size() >= length) {
+            touch_cache(key);
+            co_return std::vector<std::byte>(it->second.begin(), it->second.begin() + length);
+        }
+    }
+
+    // Cache miss — read from disk
     const auto& info = state_->torrent_info();
     std::vector<std::byte> block_data(length);
     uint64_t global_offset = static_cast<uint64_t>(piece_index) * info.piece_size + begin;
@@ -60,18 +82,48 @@ asio::awaitable<std::vector<std::byte>> FileManager::read_block(size_t piece_ind
         throw std::runtime_error("Failed to read full block from storage.");
     }
 
+    // Populate cache
+    {
+        std::lock_guard lock(cache_mutex_);
+        evict_if_needed();
+        cache_[key] = block_data;
+        touch_cache(key);
+        cache_current_size_ += block_data.size();
+        dirty_blocks_.erase(key);  // Fresh read — not dirty
+    }
+
     co_return block_data;
 }
 
 asio::awaitable<void> FileManager::write_piece(size_t piece_index, std::span<const std::byte> piece_data) {
-    const auto& overlaps = *get_piece_to_files_map(piece_index);
-    for (const auto& overlap : overlaps) {
-        const auto& file_info = state_->torrent_info().files.at(overlap.file_index);
-        if (file_info.download) {
-            auto full_path = get_full_path_for_file(file_info);
-            auto data_to_write = piece_data.subspan(overlap.offset_in_piece, overlap.length);
-            co_await async_write_to_file(full_path, overlap.offset_in_file, data_to_write);
+    uint32_t offset = 0;
+    while (offset < piece_data.size()) {
+        uint32_t block_size = std::min(static_cast<uint32_t>(BLOCK_SIZE), static_cast<uint32_t>(piece_data.size() - offset));
+        CacheKey key(piece_index, offset);
+        std::vector<std::byte> block_data(piece_data.subspan(offset, block_size).begin(),
+                                           piece_data.subspan(offset, block_size).end());
+
+        {
+            std::lock_guard lock(cache_mutex_);
+            evict_if_needed();
+            auto existing = cache_.find(key);
+            if (existing != cache_.end()) {
+                cache_current_size_ -= existing->second.size();
+            }
+            cache_[key] = std::move(block_data);
+            touch_cache(key);
+            cache_current_size_ += block_size;
+            dirty_blocks_.insert(key);
         }
+
+        offset += BLOCK_SIZE;
+    }
+
+    if (!flush_timer_started_) {
+        flush_timer_started_ = true;
+        auto executor = co_await asio::this_coro::executor;
+        flush_timer_ = std::make_unique<asio::steady_timer>(executor);
+        asio::co_spawn(executor, periodic_flush(), asio::detached);
     }
 }
 
@@ -588,4 +640,163 @@ asio::awaitable<std::map<std::string, int64_t>> FileManager::async_get_file_mtim
         throw boost::system::system_error(ec, "async_get_file_mtimes");
     }
     co_return mtimes_map;
+}
+
+// -- Disk cache helpers --
+
+void FileManager::touch_cache(const CacheKey& key) {
+    auto it = lru_index_.find(key);
+    if (it != lru_index_.end()) {
+        lru_order_.erase(it->second);
+    }
+    lru_order_.push_front(key);
+    lru_index_[key] = lru_order_.begin();
+}
+
+void FileManager::evict_if_needed() {
+    while (cache_current_size_ > DISK_CACHE_SIZE && !lru_order_.empty()) {
+        CacheKey evict_key = lru_order_.back();
+        lru_order_.pop_back();
+        lru_index_.erase(evict_key);
+
+        auto cache_it = cache_.find(evict_key);
+        if (cache_it == cache_.end()) {
+            dirty_blocks_.erase(evict_key);
+            continue;
+        }
+
+        if (dirty_blocks_.contains(evict_key)) {
+            sync_write_block(evict_key, cache_it->second);
+            dirty_blocks_.erase(evict_key);
+        }
+
+        cache_current_size_ -= cache_it->second.size();
+        cache_.erase(cache_it);
+    }
+}
+
+void FileManager::sync_write_block(const CacheKey& key, const std::vector<std::byte>& data) {
+    auto [piece_index, offset] = key;
+    if (data.empty()) return;
+    try {
+        auto overlaps_ptr = get_piece_to_files_map(piece_index);
+        const auto& overlaps = *overlaps_ptr;
+        uint32_t block_end = offset + static_cast<uint32_t>(data.size());
+
+        for (const auto& overlap : overlaps) {
+            const auto& file_info = state_->torrent_info().files.at(overlap.file_index);
+            if (!file_info.download) continue;
+
+            uint32_t overlap_start = overlap.offset_in_piece;
+            uint32_t overlap_end = overlap_start + overlap.length;
+
+            uint32_t intersect_start = std::max(offset, overlap_start);
+            uint32_t intersect_end = std::min(block_end, overlap_end);
+
+            if (intersect_end > intersect_start) {
+                uint32_t data_offset = intersect_start - offset;
+                uint32_t file_off_in_overlap = intersect_start - overlap_start;
+                uint64_t file_offset = overlap.offset_in_file + file_off_in_overlap;
+                uint32_t write_len = intersect_end - intersect_start;
+
+                auto full_path = get_full_path_for_file(file_info);
+                std::filesystem::create_directories(full_path.parent_path());
+
+                std::lock_guard file_lock(file_locker_->get_lock(full_path));
+                std::fstream output_file(full_path, std::ios::binary | std::ios::in | std::ios::out);
+                if (!output_file.is_open()) {
+                    throw std::runtime_error("Failed to open file for sync write: " + full_path.string());
+                }
+                output_file.clear();
+                output_file.seekp(static_cast<std::streamoff>(file_offset), std::ios::beg);
+                if (output_file.fail()) {
+                    throw std::runtime_error("Failed to seek in file: " + full_path.string());
+                }
+                output_file.write(reinterpret_cast<const char*>(data.data() + data_offset),
+                                  static_cast<std::streamsize>(write_len));
+                if (!output_file) {
+                    throw std::runtime_error("Failed to sync write to file: " + full_path.string());
+                }
+                output_file.flush();
+            }
+        }
+    } catch (const std::exception& e) {
+        LOGERR("Sync write-back error for piece {} offset {}: {}", piece_index, offset, e.what());
+    }
+}
+
+void FileManager::sync_flush_all_dirty() {
+    std::vector<std::pair<CacheKey, std::vector<std::byte>>> to_flush;
+    {
+        std::lock_guard lock(cache_mutex_);
+        for (const auto& key : dirty_blocks_) {
+            auto it = cache_.find(key);
+            if (it != cache_.end()) {
+                to_flush.emplace_back(key, it->second);
+            }
+        }
+        dirty_blocks_.clear();
+    }
+
+    for (auto& [key, data] : to_flush) {
+        sync_write_block(key, data);
+    }
+}
+
+asio::awaitable<void> FileManager::flush_all_dirty() {
+    std::vector<std::pair<CacheKey, std::vector<std::byte>>> to_flush;
+    {
+        std::lock_guard lock(cache_mutex_);
+        for (const auto& key : dirty_blocks_) {
+            auto it = cache_.find(key);
+            if (it != cache_.end()) {
+                to_flush.emplace_back(key, it->second);
+            }
+        }
+        dirty_blocks_.clear();
+    }
+
+    for (auto& [key, data] : to_flush) {
+        auto [piece_index, offset] = key;
+        try {
+            const auto& overlaps = *get_piece_to_files_map(piece_index);
+            uint32_t block_end = offset + static_cast<uint32_t>(data.size());
+
+            for (const auto& overlap : overlaps) {
+                const auto& file_info = state_->torrent_info().files.at(overlap.file_index);
+                if (!file_info.download) continue;
+
+                uint32_t overlap_start = overlap.offset_in_piece;
+                uint32_t overlap_end = overlap_start + overlap.length;
+
+                uint32_t intersect_start = std::max(offset, overlap_start);
+                uint32_t intersect_end = std::min(block_end, overlap_end);
+
+                if (intersect_end > intersect_start) {
+                    uint32_t data_offset = intersect_start - offset;
+                    uint32_t file_off_in_overlap = intersect_start - overlap_start;
+                    uint64_t file_offset = overlap.offset_in_file + file_off_in_overlap;
+                    uint32_t write_len = intersect_end - intersect_start;
+
+                    auto full_path = get_full_path_for_file(file_info);
+                    co_await async_write_to_file(full_path, file_offset,
+                        std::span<const std::byte>(data.data() + data_offset, write_len));
+                }
+            }
+        } catch (const std::exception& e) {
+            LOGERR("Async flush error for piece {} offset {}: {}", piece_index, offset, e.what());
+        }
+    }
+}
+
+asio::awaitable<void> FileManager::periodic_flush() {
+    while (!shutting_down_.load()) {
+        flush_timer_->expires_after(std::chrono::seconds(5));
+        boost::system::error_code ec;
+        co_await flush_timer_->async_wait(asio::redirect_error(asio::use_awaitable, ec));
+        if (ec == asio::error::operation_aborted || shutting_down_.load()) {
+            co_return;
+        }
+        co_await flush_all_dirty();
+    }
 }

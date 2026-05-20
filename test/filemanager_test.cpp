@@ -439,3 +439,108 @@ TEST_F(FileManagerTest, LoadResumeDataNonExistent) {
         EXPECT_FALSE(loaded_resume_opt.has_value());
     });
 }
+
+TEST_F(FileManagerTest, CacheHitOnReRead) {
+    std::string torrent_name = "cache_hit";
+    uint64_t total_size = BLOCK_SIZE;
+    uint32_t piece_length = BLOCK_SIZE;
+    init_session(torrent_name, total_size, piece_length);
+
+    TestFileManager::mock() = [](const std::string& q) -> asio::awaitable<int> { co_return 3; };
+    bool prealloc_ok = false;
+    RunAsync(io_context, [&]() -> asio::awaitable<void> {
+        prealloc_ok = co_await file_manager->preallocate_files();
+    });
+    ASSERT_TRUE(prealloc_ok);
+
+    std::vector<std::byte> original_data = create_dummy_data(BLOCK_SIZE, 'X');
+    {
+        std::filesystem::path file_path = save_path_base / torrent_name;
+        std::ofstream ofs(file_path, std::ios::binary);
+        ASSERT_TRUE(ofs.is_open());
+        ofs.write(reinterpret_cast<const char*>(original_data.data()), original_data.size());
+        ofs.close();
+    }
+
+    RunAsync(io_context, [&]() -> asio::awaitable<void> {
+        auto first_read = co_await file_manager->read_block(0, 0, BLOCK_SIZE);
+        EXPECT_EQ(first_read, original_data);
+    });
+
+    std::vector<std::byte> modified_data = create_dummy_data(BLOCK_SIZE, 'Z');
+    {
+        std::filesystem::path file_path = save_path_base / torrent_name;
+        std::ofstream ofs(file_path, std::ios::binary);
+        ASSERT_TRUE(ofs.is_open());
+        ofs.write(reinterpret_cast<const char*>(modified_data.data()), modified_data.size());
+        ofs.close();
+    }
+
+    RunAsync(io_context, [&]() -> asio::awaitable<void> {
+        auto second_read = co_await file_manager->read_block(0, 0, BLOCK_SIZE);
+        EXPECT_EQ(second_read, original_data);
+        EXPECT_NE(second_read, modified_data);
+    });
+}
+
+TEST_F(FileManagerTest, WriteThenReadFromCache) {
+    std::string torrent_name = "write_read_cache";
+    uint64_t total_size = BLOCK_SIZE;
+    uint32_t piece_length = BLOCK_SIZE;
+    init_session(torrent_name, total_size, piece_length);
+
+    TestFileManager::mock() = [](const std::string& q) -> asio::awaitable<int> { co_return 3; };
+    bool prealloc_ok = false;
+    RunAsync(io_context, [&]() -> asio::awaitable<void> {
+        prealloc_ok = co_await file_manager->preallocate_files();
+    });
+    ASSERT_TRUE(prealloc_ok);
+
+    std::vector<std::byte> piece_data = create_dummy_data(BLOCK_SIZE, 'D');
+
+    RunAsync(io_context, [&]() -> asio::awaitable<void> {
+        co_await file_manager->write_piece(0, piece_data);
+    });
+
+    std::filesystem::path file_path = save_path_base / torrent_name;
+    std::vector<std::byte> disk_before = read_file_content(file_path);
+    bool all_zeros = std::ranges::all_of(disk_before, [](std::byte b) { return b == std::byte{0}; });
+    EXPECT_TRUE(all_zeros) << "Data should still be in cache, not on disk";
+
+    RunAsync(io_context, [&]() -> asio::awaitable<void> {
+        auto read_data = co_await file_manager->read_block(0, 0, BLOCK_SIZE);
+        EXPECT_EQ(read_data, piece_data);
+    });
+}
+
+TEST_F(FileManagerTest, LruEvictionUnderLoad) {
+    std::string torrent_name = "lru_eviction";
+    uint32_t piece_length = BLOCK_SIZE;
+    uint64_t total_size = static_cast<uint64_t>(BLOCK_SIZE) * 2500;
+    init_session(torrent_name, total_size, piece_length);
+
+    TestFileManager::mock() = [](const std::string& q) -> asio::awaitable<int> { co_return 3; };
+    bool prealloc_ok = false;
+    RunAsync(io_context, [&]() -> asio::awaitable<void> {
+        prealloc_ok = co_await file_manager->preallocate_files();
+    });
+    ASSERT_TRUE(prealloc_ok);
+
+    size_t num_pieces = session_state->num_pieces();
+    ASSERT_EQ(num_pieces, 2500);
+
+    for (size_t i = 0; i < num_pieces; ++i) {
+        std::vector<std::byte> piece_data = create_dummy_data(BLOCK_SIZE, static_cast<char>('A' + (i % 26)));
+        RunAsync(io_context, [i, piece_data, this]() -> asio::awaitable<void> {
+            co_await file_manager->write_piece(i, piece_data);
+        });
+    }
+
+    for (size_t i = 0; i < num_pieces; ++i) {
+        std::vector<std::byte> expected_data = create_dummy_data(BLOCK_SIZE, static_cast<char>('A' + (i % 26)));
+        RunAsync(io_context, [i, expected_data, this]() -> asio::awaitable<void> {
+            auto read_data = co_await file_manager->read_block(i, 0, BLOCK_SIZE);
+            EXPECT_EQ(read_data, expected_data) << "Mismatch for piece " << i;
+        });
+    }
+}
