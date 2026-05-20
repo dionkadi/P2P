@@ -23,6 +23,7 @@ TorrentSession::TorrentSession(
     peer_manager_(std::make_shared<PeerManager>(io_context, state_)),
     file_manager_(std::make_unique<FileManager>(state_)),
     dht_node_(std::make_shared<DHTNode>(io_context, peer_port)),
+    lsd_discovery_(std::make_shared<LsdDiscovery>(io_context, peer_port, peer_manager_, state_)),
     dht_announce_timer_(io_context),
     dht_bootstrap_nodes_({
         "router.bittorrent.com:6881",
@@ -77,6 +78,7 @@ TorrentSession::TorrentSession(
     peer_manager_(std::make_shared<PeerManager>(io_context, state_)),
     file_manager_(std::make_unique<FileManager>(state_)),
     dht_node_(std::make_shared<DHTNode>(io_context, peer_port)),
+    lsd_discovery_(std::make_shared<LsdDiscovery>(io_context, peer_port, peer_manager_, state_)),
     dht_announce_timer_(io_context),
     dht_bootstrap_nodes_({
         "router.bittorrent.com:6881",
@@ -207,7 +209,7 @@ asio::awaitable<void> TorrentSession::run() {
         co_await self->dht_node_->bootstrap(self->dht_bootstrap_nodes_);
     }, asio::detached);
     asio::co_spawn(strand_, dht_announce_loop(), asio::detached);
-    
+    lsd_discovery_->start();
     if (mode_ == Mode::Leech) {
         asio::co_spawn(io_context_, peer_manager_->choke_loop(), asio::detached);
         piece_manager_->set_callback([this] (size_t piece_index) 
@@ -252,6 +254,7 @@ asio::awaitable<void> TorrentSession::stop() {
     }
 
     dht_node_->stop();
+    lsd_discovery_->stop();
     dht_announce_timer_.cancel();
 
     completion_timer_.cancel();

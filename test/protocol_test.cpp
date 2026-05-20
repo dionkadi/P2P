@@ -655,3 +655,124 @@ TEST(BEP6FastExtensionTest, RejectPayloadWireFormatMatchesRequestPayload) {
 
     EXPECT_EQ(reject_bytes, request_bytes);
 }
+
+// ============================================================
+// LSD (Local Service Discovery) BEP 14 Tests
+// ============================================================
+
+TEST(LsdDiscoveryTest, Base32EncodeKnownValue) {
+    // Test vector: SHA1 of empty string = da39a3ee5e6b4b0d3255bfef95601890afd80709
+    // RFC 4648 base32 (no padding): 3I42H3S6NNFQ2MSVX7XZKYAYSCX5QBYJ
+    std::vector<std::byte> input(20);
+    std::string hex = "da39a3ee5e6b4b0d3255bfef95601890afd80709";
+    for (size_t i = 0; i < 20; ++i) {
+        unsigned int val;
+        std::from_chars(hex.data() + i * 2, hex.data() + i * 2 + 2, val, 16);
+        input[i] = static_cast<std::byte>(val);
+    }
+
+    std::string encoded = LsdCrypto::base32_encode(input);
+    EXPECT_EQ(encoded, "3I42H3S6NNFQ2MSVX7XZKYAYSCX5QBYJ");
+}
+
+TEST(LsdDiscoveryTest, Base32EncodeEmpty) {
+    std::vector<std::byte> empty;
+    EXPECT_TRUE(LsdCrypto::base32_encode(empty).empty());
+}
+
+TEST(LsdDiscoveryTest, Base32Roundtrip) {
+    std::vector<std::byte> original(20);
+    for (size_t i = 0; i < 20; ++i) {
+        original[i] = static_cast<std::byte>(i * 17 + 13);
+    }
+
+    std::string encoded = LsdCrypto::base32_encode(original);
+    std::vector<std::byte> decoded = LsdCrypto::base32_decode(encoded);
+
+    EXPECT_EQ(original, decoded);
+}
+
+TEST(LsdDiscoveryTest, AnnounceMessageFormat) {
+    std::vector<std::byte> info_hash(20);
+    for (size_t i = 0; i < 20; ++i) {
+        info_hash[i] = static_cast<std::byte>(i);
+    }
+
+    std::string msg = LsdDiscovery::build_announce_message(info_hash, 6881);
+
+    // Must start with BT-SEARCH
+    EXPECT_TRUE(msg.starts_with("BT-SEARCH * HTTP/1.1\r\n"));
+    // Must contain Host
+    EXPECT_NE(msg.find("Host: 239.192.152.143:6771\r\n"), std::string::npos);
+    // Must contain Port
+    EXPECT_NE(msg.find("Port: 6881\r\n"), std::string::npos);
+    // Must contain Infohash (base32 encoded)
+    std::string expected_b32 = LsdCrypto::base32_encode(info_hash);
+    EXPECT_NE(msg.find("Infohash: " + expected_b32 + "\r\n"), std::string::npos);
+    // Must end with \r\n\r\n
+    EXPECT_TRUE(msg.ends_with("\r\n\r\n"));
+}
+
+TEST(LsdDiscoveryTest, ParseValidAnnouncement) {
+    std::vector<std::byte> info_hash(20);
+    for (size_t i = 0; i < 20; ++i) {
+        info_hash[i] = static_cast<std::byte>(i);
+    }
+    std::string b32 = LsdCrypto::base32_encode(info_hash);
+
+    std::string announce = std::format(
+        "BT-SEARCH * HTTP/1.1\r\n"
+        "Host: 239.192.152.143:6771\r\n"
+        "Port: 6881\r\n"
+        "Infohash: {}\r\n"
+        "\r\n",
+        b32
+    );
+
+    auto parsed = LsdDiscovery::parse_announcement(announce);
+    ASSERT_TRUE(parsed.has_value());
+    EXPECT_EQ(parsed->infohash_b32, b32);
+    EXPECT_EQ(parsed->port, 6881);
+}
+
+TEST(LsdDiscoveryTest, ParseAnnouncementMissingBtSearch) {
+    std::string invalid = "NOT_BT_SEARCH * HTTP/1.1\r\n\r\n";
+    auto parsed = LsdDiscovery::parse_announcement(invalid);
+    EXPECT_FALSE(parsed.has_value());
+}
+
+TEST(LsdDiscoveryTest, ParseAnnouncementMissingInfohash) {
+    std::string invalid = "BT-SEARCH * HTTP/1.1\r\nPort: 6881\r\n\r\n";
+    auto parsed = LsdDiscovery::parse_announcement(invalid);
+    EXPECT_FALSE(parsed.has_value());
+}
+
+TEST(LsdDiscoveryTest, ParseAnnouncementMissingPort) {
+    std::string invalid = "BT-SEARCH * HTTP/1.1\r\nInfohash: ABCDEF\r\n\r\n";
+    auto parsed = LsdDiscovery::parse_announcement(invalid);
+    EXPECT_FALSE(parsed.has_value());
+}
+
+TEST(LsdDiscoveryTest, ParseAnnouncementNonNumericPort) {
+    std::string invalid = "BT-SEARCH * HTTP/1.1\r\nPort: notanumber\r\nInfohash: ABCDEF\r\n\r\n";
+    auto parsed = LsdDiscovery::parse_announcement(invalid);
+    EXPECT_FALSE(parsed.has_value());
+}
+
+TEST(LsdDiscoveryTest, ParseAnnouncementDifferentPort) {
+    std::vector<std::byte> info_hash(20);
+    std::string b32 = LsdCrypto::base32_encode(info_hash);
+
+    std::string announce = std::format(
+        "BT-SEARCH * HTTP/1.1\r\n"
+        "Host: 239.192.152.143:6771\r\n"
+        "Port: 9999\r\n"
+        "Infohash: {}\r\n"
+        "\r\n",
+        b32
+    );
+
+    auto parsed = LsdDiscovery::parse_announcement(announce);
+    ASSERT_TRUE(parsed.has_value());
+    EXPECT_EQ(parsed->port, 9999);
+}

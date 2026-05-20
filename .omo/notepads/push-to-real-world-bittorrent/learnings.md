@@ -153,3 +153,60 @@
 
 ### Test Results
 - 138 tests pass (129 existing + 9 new BEP-6 tests)
+
+## Task 5.x: Local Peer Discovery BEP 14 (2026-05-20)
+
+### Changes Made
+- **src/LsdDiscovery.hpp**: New header-only file implementing `LsdDiscovery` class with:
+  - `LsdCrypto::base32_encode()` / `base32_decode()` (RFC 4648, no padding) — constexpr reverse lookup table for decoding
+  - UDP multicast socket setup: `reuse_address(true)`, bind to port 6771, `join_group(239.192.152.143)`, `hops(1)`
+  - `start()`: Opens/binds UDP socket, joins multicast group, spawns `announce_loop()` and `listen_loop()` on strand
+  - `stop()`: Leaves multicast group, closes socket, cancels timer
+  - `announce_loop()`: Sends `BT-SEARCH * HTTP/1.1` announcement every 5 minutes via `co_await socket_.async_send_to()`
+  - `listen_loop()`: Receives announcements via `co_await socket_.async_receive_from()`, parses HTTP-like header, extracts Infohash (base32) and Port, matches against local info_hash, calls `peer_manager_->add_discovered_peer()`
+  - Static `build_announce_message()` and `parse_announcement()` exposed for unit testing
+  - Follows existing header-only pattern from `Kademlia.hpp` (all inline, `enable_shared_from_this`, strand)
+
+- **src/TorrentSession.hpp**: Added `#include "LsdDiscovery.hpp"`, `std::shared_ptr<LsdDiscovery> lsd_discovery_` member
+
+- **src/TorrentSession.cpp**: Both constructors initialize `lsd_discovery_` with `io_context`, `peer_port_`, `peer_manager_`, `state_`; `run()` calls `lsd_discovery_->start()`; `stop()` calls `lsd_discovery_->stop()`
+
+- **test/protocol_test.cpp**: 10 new LSD tests covering:
+  - Base32 encode known SHA1 value
+  - Base32 empty input
+  - Base32 roundtrip encode/decode
+  - Announce message format (BT-SEARCH header, Host, Port, Infohash fields)
+  - Parse valid announcement
+  - Parse missing BT-SEARCH
+  - Parse missing Infohash
+  - Parse missing Port
+  - Parse non-numeric port
+  - Parse different port value
+
+### Key Design Decisions
+- `start()` is a void method (not coroutine) matching DHTNode pattern — it internally spawns the announce and listen coroutines
+- Uses `strand_` for both loops to avoid data races with `running_` flag and peer_manager_ access
+- Self-announcement filtering: skips if sender IP is 127.0.0.1 and port matches listening_port_
+- Only processes announcements for info_hashes matching the local session (filters by base32 comparison)
+- `std::tolower` is NOT constexpr in C++23/clang — using separate `upper`/`lower` string literals for reverse lookup table instead
+
+### Test Results
+- 148 tests pass (138 existing + 10 new LSD tests)
+
+## Task 3.3: Local Peer Discovery BEP 14 (2026-05-20)
+
+### Changes Made
+- **src/LsdDiscovery.hpp** (new): Header-only LsdDiscovery class with LsdCrypto::base32_encode/decode, UDP multicast socket (239.192.152.143:6771), periodic announce every 5min, listen loop for incoming announcements
+- **src/TorrentSession.hpp**: Added LsdDiscovery include + member
+- **src/TorrentSession.cpp**: Initialize lsd_discovery_ in constructors; start() in run(); stop() on shutdown
+- **test/protocol_test.cpp**: 10 LsdDiscoveryTest tests covering base32, announce format, parsing
+
+### Key Design
+- Multicast group: 239.192.152.143:6771, link-local hops(1)
+- Self-announcements filtered (127.0.0.1 + matching port)
+- Base32 encoding for infohash per BEP 14 spec
+- Announce format: `BT-SEARCH * HTTP/1.1\r\n...`
+- Parsing handles missing fields, non-numeric port gracefully
+
+### Test Results
+- 148 tests pass (138 existing + 10 new LSD tests)

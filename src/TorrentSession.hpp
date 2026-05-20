@@ -9,6 +9,7 @@
 #include "IPeerEvents.hpp"
 #include "TrackerClient.hpp"
 #include "Kademlia.hpp"
+#include "LsdDiscovery.hpp"
 
 #include <boost/asio/any_io_executor.hpp>
 #include <boost/asio/steady_timer.hpp>
@@ -122,6 +123,7 @@ private:
     std::unique_ptr<AsyncServerSocket> peer_server_;
     std::unique_ptr<FileManager> file_manager_;
     std::shared_ptr<DHTNode> dht_node_;
+    std::shared_ptr<LsdDiscovery> lsd_discovery_;
     asio::steady_timer dht_announce_timer_;
     std::vector<std::string> dht_bootstrap_nodes_;
 
