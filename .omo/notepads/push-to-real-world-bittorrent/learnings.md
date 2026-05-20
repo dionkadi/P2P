@@ -254,3 +254,25 @@
 ### Test Results
 - 168 tests pass (148 existing + 20 new config tests)
 - All 20 config tests complete in ~3ms total
+
+## Task 7.x: ClientApp — Multi-Session Manager (2026-05-20)
+
+### Changes Made
+- **src/ClientApp.hpp** (new): `ClientApp` class that owns a single `asio::io_context`, manages a `std::map<InfoHash, std::shared_ptr<TorrentSession>>` of active torrents, owns a `ClientConfig` for session creation, maintains a global peer cache for cross-torrent bootstrapping, and handles SIGINT/SIGTERM via `asio::signal_set`
+- **src/ClientApp.cpp** (new): Implementation of `add_torrent()` (creates TorrentSession, keys by InfoHash, injects cached peers), `run()` (setup signals → spawn session coroutines → multi-threaded io_context run), `stop_all()` (harvest peers into cache → spawn stop on all sessions with double-stop prevention), peer cache helpers (`add_to_peer_cache`, `add_peers_to_cache`, `seed_session_from_cache`)
+- **src/main_client.cpp**: Refactored to use `ClientApp` — seed and download commands now create a `ClientApp`, call `add_torrent()`, then `app.run()`. Removed inline `TorrentSession`/`signal_set`/io_context management. `create` command kept unchanged.
+- **CMakeLists.txt**: Added `src/ClientApp.cpp` to the `p2p_common` library
+
+### Key Design Decisions
+- **InfoHash map key**: `std::map<InfoHash, std::shared_ptr<TorrentSession>>` where `InfoHash = std::array<std::byte, 20>`. TorrentSession exposes `get_info_hash()` as `const std::vector<std::byte>&`, so conversion via `std::copy_n` is performed at insertion time.
+- **Signal handling**: `setup_signals()` registers `async_wait` on `signals_` (SIGINT, SIGTERM). The handler calls `stop_all()` which sets `stopping_` atomic (prevents double-stop) and spawns `session->stop()` coroutines for each session. As sessions unwind, the io_context naturally runs out of work.
+- **Peer cache**: `std::map<InfoHash, std::vector<EndPoint>> peer_cache_` stores known peers per info_hash. On `add_torrent()`, `seed_session_from_cache()` injects cached peers via `PeerManager::add_discovered_peer()`. On `stop_all()`, discovered peers are harvested from each session's PeerManager before stopping.
+- **Per-session PeerManager**: Each TorrentSession keeps its own PeerManager (not shared), as required.
+- **Threading**: `run()` spawns session coroutines before starting io_context threads (`std::jthread`), matching the existing pattern from `main_client.cpp`.
+- **Config propagation**: ClientConfig values (`upload_rate_limit`, `download_rate_limit`) are passed through to each TorrentSession constructor.
+- **Duplicates**: If a torrent with the same InfoHash is added twice, the old session is stopped and replaced (with a warning).
+
+### Test Results
+- 165 tests pass (0 new ClientApp unit tests yet; existing tests unchanged)
+- All 165 non-integration tests pass (filter: `-IntegrationTest.*:DHTNetworkTest.*`)
+- Build: zero warnings with `-Werror`
