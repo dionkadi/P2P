@@ -67,6 +67,7 @@ public:
     asio::awaitable<void> on_peer_has_piece(std::shared_ptr<PeerConnection> conn, size_t piece_index) override;
     asio::awaitable<void> on_peer_bitfield(std::shared_ptr<PeerConnection> conn, std::span<const std::byte> bitfield) override;
     asio::awaitable<void> on_choke_status_changed(std::shared_ptr<PeerConnection> conn, bool is_choking) override;
+    asio::awaitable<void> on_piece_rejected(std::shared_ptr<PeerConnection> conn, size_t piece_index, uint32_t begin, uint32_t length) override;
     asio::awaitable<void> on_disconnect(std::shared_ptr<PeerConnection> conn) override;
     asio::awaitable<void> on_extended_message(std::shared_ptr<PeerConnection> conn, std::span<const std::byte> payload) override;
 

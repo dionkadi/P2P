@@ -119,11 +119,15 @@ public:
     asio::awaitable<void> send_bitfield(const std::vector<uint8_t>& bitfield_data);
     asio::awaitable<void> send_cancel(size_t index, uint32_t begin, uint32_t length);
     asio::awaitable<void> send_have(size_t index);
+    asio::awaitable<void> send_reject(size_t index, uint32_t begin, uint32_t length);
     asio::awaitable<void> send_extended_message(uint8_t type_id, std::span<const std::byte> payload);
     asio::awaitable<void> send_metadata_request(uint8_t ext_id, int piece);
 
     void set_upload_rate(uint64_t bps) noexcept;
     void set_download_rate(uint64_t bps) noexcept;
+
+    bool fast_extension_supported() const noexcept { return fast_extension_supported_; }
+    void fast_extension_supported(bool val) noexcept { fast_extension_supported_ = val; }
 
     bool supports_metadata() const noexcept { return metadata_ext_id_ != 0; }
     uint8_t metadata_ext_id() const noexcept { return metadata_ext_id_; }
@@ -167,6 +171,7 @@ private:
 
     std::once_flag pex_flag_;
     bool supported_pex_;
+    bool fast_extension_supported_{false};
     uint8_t metadata_ext_id_{0};  // 0 = not supported
     int32_t metadata_size_{0};    // -1 = unknown, 0+ = bytes
 

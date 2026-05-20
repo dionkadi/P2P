@@ -64,7 +64,8 @@ asio::awaitable<bool> PeerConnection::perform_handshake(const PeerId& my_id) {
         Handshake my_handshake {
             .info_hash_bytes = info_hash_arr,
             .peer_id_bytes = my_id,
-            .extended = true
+            .extended = true,
+            .fast_extension = true
         };
 
         co_await socket_.send_raw(my_handshake.serialize());
@@ -86,6 +87,12 @@ asio::awaitable<bool> PeerConnection::perform_handshake(const PeerId& my_id) {
         }
         
         LOGDBG("Peer {} handshake successful. Peer ID: {}. Checking for extended handshake support.", peer_addr_, peer_id_);
+        
+        if (peer_handshake.fast_extension) {
+            LOGINFO("Peer {} supports fast extension (BEP-6).", peer_id_);
+            fast_extension_supported_ = true;
+        }
+        
         if (peer_handshake.extended) {
             LOGINFO("Peer {} supports extended plugins. Sending extended handshake.", peer_id_);
 
@@ -105,6 +112,25 @@ asio::awaitable<bool> PeerConnection::perform_handshake(const PeerId& my_id) {
             
             co_await socket_.send_message(message);
             LOGDBG("Extended handshake sent to {}", peer_id_);
+        }
+
+        // Send have-none, have-all, or bitfield based on our state
+        {
+            size_t completed = state_->completed_pieces();
+            size_t total = state_->num_pieces();
+            if (total == 0) {
+                // Metadata not yet available; send have-none
+                co_await send_simple_message(MessageType::HaveNone);
+            } else if (completed == 0) {
+                co_await send_simple_message(MessageType::HaveNone);
+            } else if (completed == total) {
+                co_await send_simple_message(MessageType::HaveAll);
+            } else {
+                std::vector<uint8_t> bitfield((total + 7) / 8, 0);
+                std::string have_bitfield_str = state_->get_have_bitfield_str();
+                std::ranges::copy(have_bitfield_str, bitfield.begin());
+                co_await send_bitfield(bitfield);
+            }
         }
 
         co_return true;
@@ -219,6 +245,14 @@ asio::awaitable<void> PeerConnection::message_loop() {
                     co_await events_->on_block_request(self, req.index, req.begin, req.length);
                     break;
                 }
+                case MessageType::Reject: {
+                    if (payload.size() < 12) {
+                        break;
+                    }
+                    RequestPayload req = RequestPayload::deserialize(payload);
+                    co_await events_->on_piece_rejected(self, req.index, req.begin, req.length);
+                    break;
+                }
                 default:
                     LOGWARN("Received unhandled message type: {}", static_cast<int>(type));
             }
@@ -302,6 +336,13 @@ asio::awaitable<void> PeerConnection::send_bitfield(const std::vector<uint8_t>& 
 
 asio::awaitable<void> PeerConnection::send_cancel(size_t index, uint32_t begin, uint32_t length) {
     std::vector<std::byte> msg_body(1, static_cast<std::byte>(MessageType::Cancel));
+    auto payload = RequestPayload::serialize(index, begin, length);
+    msg_body.insert(msg_body.end(), payload.begin(), payload.end());
+    co_await socket_.send_message(msg_body);
+}
+
+asio::awaitable<void> PeerConnection::send_reject(size_t index, uint32_t begin, uint32_t length) {
+    std::vector<std::byte> msg_body(1, static_cast<std::byte>(MessageType::Reject));
     auto payload = RequestPayload::serialize(index, begin, length);
     msg_body.insert(msg_body.end(), payload.begin(), payload.end());
     co_await socket_.send_message(msg_body);

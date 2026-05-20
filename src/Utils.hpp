@@ -565,6 +565,10 @@ enum class MessageType: uint8_t {
     Piece = 7,
     Cancel = 8,
     Port = 9,
+    Reject = 16,
+    HaveNone = 17,
+    HaveAll = 18,
+    AllowedFast = 19,
     ExtendedMessage = 20,
 };
 
@@ -800,6 +804,7 @@ struct Handshake {
     InfoHash info_hash_bytes;
     PeerId peer_id_bytes;
     bool extended{false};
+    bool fast_extension{false};
 
     std::vector<std::byte> serialize() const {
         std::vector<std::byte> buffer;
@@ -816,6 +821,10 @@ struct Handshake {
         }
         // BEP-5: DHT support
         reserved[7] |= static_cast<std::byte>(0x01);
+        // BEP-6: fast extension
+        if (fast_extension) {
+            reserved[7] |= static_cast<std::byte>(0x04);
+        }
         writer.write_bytes(reserved);
         writer.write_bytes(info_hash_bytes);
         writer.write_bytes(peer_id_bytes);
@@ -844,6 +853,7 @@ struct Handshake {
 
         auto reserved = reader.read_bytes(HANDSHAKE_RESERVED_BYTES);
         hs.extended = (reserved[5] & static_cast<std::byte>(0x10)) != static_cast<std::byte>(0);
+        hs.fast_extension = (reserved[7] & static_cast<std::byte>(0x04)) != static_cast<std::byte>(0);
         
         auto info_hash_span = reader.read_bytes(HASH_SIZE);
         std::ranges::copy(info_hash_span, hs.info_hash_bytes.begin());
@@ -880,6 +890,28 @@ struct RequestPayload {
         req.begin = asio::detail::socket_ops::network_to_host_long(reader.read<uint32_t>());
         req.length = asio::detail::socket_ops::network_to_host_long(reader.read<uint32_t>());
         return req;
+    }
+};
+
+struct RejectPayload {
+    uint32_t index;
+    uint32_t begin;
+    uint32_t length;
+
+    static std::vector<std::byte> serialize(uint32_t index, uint32_t begin, uint32_t length) {
+        return RequestPayload::serialize(index, begin, length);
+    }
+
+    static RejectPayload deserialize(std::span<const std::byte> payload) {
+        if (payload.size() < 12) {
+            throw std::runtime_error("Invalid Reject payload size");
+        }
+        auto req = RequestPayload::deserialize(payload);
+        RejectPayload reject;
+        reject.index = req.index;
+        reject.begin = req.begin;
+        reject.length = req.length;
+        return reject;
     }
 };
 

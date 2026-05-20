@@ -90,3 +90,66 @@
 ### Test Results
 - 129 tests pass (126 existing + 3 new disk cache tests)
 - LruEvictionUnderLoad: 2500 pieces (~39 MB), LRU eviction with dirty write-back
+
+## Task 4.x: BEP-6 Fast Extension (2026-05-20)
+
+### Changes Made
+- **src/Utils.hpp**:
+  - Added `Reject = 16`, `HaveNone = 17`, `HaveAll = 18`, `AllowedFast = 19` to `MessageType` enum
+  - Added `bool fast_extension{false}` to `Handshake` struct
+  - In `Handshake::serialize()`: set `reserved[7] |= 0x04` when `fast_extension` is true (same byte as DHT but different bit)
+  - In `Handshake::deserialize()`: read fast extension flag from `reserved[7] & 0x04`
+  - Added `RejectPayload` struct (same wire format as `RequestPayload`)
+
+- **src/PeerConnection.hpp**:
+  - Added `bool fast_extension_supported_` member + getter/setter
+  - Added `send_reject()` method declaration
+
+- **src/PeerConnection.cpp**:
+  - Set `fast_extension = true` in outgoing handshake
+  - After receiving peer handshake, detect and store `fast_extension_supported_` flag
+  - After handshake completes, send `have-none` (when 0 pieces) or `have-all` (when all pieces) or normal bitfield based on state
+  - `message_loop()`: Added `MessageType::Reject` case that parses payload and calls `events_->on_piece_rejected()`
+  - Implemented `send_reject()` (same wire format as send_request but with Reject type)
+
+- **src/IPeerEvents.hpp**:
+  - Added `on_piece_rejected()` virtual method for BEP-6 reject handling
+
+- **src/TorrentSession.hpp**:
+  - Added `on_piece_rejected()` override
+
+- **src/TorrentSession.cpp**:
+  - `on_block_request()`: When choked and peer supports fast extension, sends `reject` instead of silently ignoring
+  - `on_piece_rejected()`: Removes peer from outstanding requests, re-requests block from another unchoked peer
+  - Removed bitfield sending from `handle_new_connection()` (now done in `perform_handshake()` which also handles have-none/have-all)
+
+### Key Design Decisions
+- BEP-6 reserved bit: `reserved[7]` bit `0x04` — same byte as DHT (`0x01`) but different bit; both can be set simultaneously
+- `RejectPayload` reuses `RequestPayload` serialization since wire format is identical (4B index + 4B begin + 4B length)
+- Have-none replaces empty bitfield when peer has no pieces (leecher with no data)
+- Have-all replaces full bitfield when peer is a seeder (all pieces complete)
+- On receiving Reject: immediately re-request from another peer (do NOT wait for timeout), similar to timeout handling
+- Bitfield/have-all/have-none sending moved from `TorrentSession::handle_new_connection` to `PeerConnection::perform_handshake` so all connection paths are covered
+
+### Test Results
+- 138 tests pass (129 existing + 9 new BEP-6 tests)
+- New tests cover: message type values, handshake serialization/deserialization with fast extension flag, reject payload serialize/deserialize, reject wire format matches request payload
+
+## Task 3.2: Fast Extension BEP 6 (2026-05-20)
+
+### Changes Made
+- **src/Utils.hpp**: Added Reject=16, HaveNone=17, HaveAll=18, AllowedFast=19 to MessageType enum; added `fast_extension` bool to Handshake struct with serialize/deserialize (reserved[7] |= 0x04); added RejectPayload struct
+- **src/IPeerEvents.hpp**: Added `on_piece_rejected()` virtual method
+- **src/PeerConnection.hpp/cpp**: Added `fast_extension_supported_` member, detection in handshake, have-none/have-all/bitfield sending in handshake based on piece state, Reject handling in message_loop, send_reject() implementation
+- **src/TorrentSession.hpp/cpp**: on_block_request sends Reject when choked (if peer supports fast ext); on_piece_rejected removes from outstanding and re-requests from another peer
+- **test/protocol_test.cpp**: 9 new BEP6FastExtensionTest tests covering flag, payloads, deserialization
+
+### Key Design
+- have-none sent when metadata unavailable or 0 completed pieces
+- have-all sent when all pieces completed (seeder)
+- Normal bitfield sent for partial state
+- Reject payload uses same wire format as RequestPayload (12 bytes: index+begin+length)
+- Re-request skips the rejecting peer and picks another non-choking peer with the piece
+
+### Test Results
+- 138 tests pass (129 existing + 9 new BEP-6 tests)

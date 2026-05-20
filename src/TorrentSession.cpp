@@ -343,11 +343,6 @@ asio::awaitable<void> TorrentSession::handle_new_connection(AsyncSocket socket, 
         LOGWARN("Failed to add know peer {}: {}", peer_addr, e.what());
     }
 
-    std::vector<uint8_t> bitfield((state_->num_pieces() + 7) / 8, 0);
-    std::string have_bitfield_str = state_->get_have_bitfield_str();
-    std::ranges::copy(have_bitfield_str, bitfield.begin());
-    asio::co_spawn(io_context_, conn->send_bitfield(bitfield), asio::detached);
-
     LOGDBG("PeerConnection created and handshake finished for {}", conn->peer_addr());
 }
 
@@ -632,9 +627,15 @@ asio::awaitable<void> TorrentSession::on_block_request(std::shared_ptr<PeerConne
     }
  
     if (!should_respond) {
-        LOGWARN("Ignoring REQUEST from peer {} because state is not met (am_choking: {}, peer_is_interested: {})",
-                conn->peer_id(), conn->am_choking(), conn->peer_is_interested()
-        );
+        if (conn->fast_extension_supported()) {
+            LOGDBG("Sending REJECT to peer {} for piece {} begin {} length {} (choked).",
+                    conn->peer_id(), piece_index, begin, length);
+            co_await conn->send_reject(piece_index, begin, length);
+        } else {
+            LOGWARN("Ignoring REQUEST from peer {} because state is not met (am_choking: {}, peer_is_interested: {})",
+                    conn->peer_id(), conn->am_choking(), conn->peer_is_interested()
+            );
+        }
         co_return;
     }
 
@@ -654,6 +655,36 @@ asio::awaitable<void> TorrentSession::on_block_request(std::shared_ptr<PeerConne
         // conn->close(); 
         throw; // Re-throw to propagate the error up to the message_loop's catch block
     }
+}
+
+asio::awaitable<void> TorrentSession::on_piece_rejected(std::shared_ptr<PeerConnection> conn, size_t piece_index, uint32_t begin, uint32_t length) {
+    LOGDBG("Peer {} rejected our request for piece {} begin {} length {}. Re-requesting from another peer.",
+            conn->peer_id(), piece_index, begin, length);
+
+    auto progress = piece_manager_->in_progress_piece(piece_index);
+    if (!progress) {
+        co_return;
+    }
+
+    uint32_t block_index = begin / BLOCK_SIZE;
+    if (block_index >= progress->total_blocks) {
+        co_return;
+    }
+
+    auto& outstanding = progress->outstanding_requests[block_index];
+    std::erase(outstanding, conn->peer_id());
+
+    auto available_peers = co_await peer_manager_->available_peers(piece_index);
+    for (const auto& peer : available_peers) {
+        if (peer->peer_id() != conn->peer_id() && !peer->peer_is_choking()) {
+            co_await peer->send_request(piece_index, begin, length);
+            progress->outstanding_requests[block_index].push_back(peer->peer_id());
+            progress->request_times[block_index] = std::chrono::steady_clock::now();
+            break;
+        }
+    }
+
+    piece_manager_->notify_one();
 }
 
 asio::awaitable<void> TorrentSession::on_peer_has_piece(std::shared_ptr<PeerConnection> conn, size_t piece_index) {

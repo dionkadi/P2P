@@ -546,3 +546,112 @@ TEST(PerPeerRateLimitTest, DownloadRateLimitingAppliesBackpressure) {
     EXPECT_GE(elapsed_ms, 8000) << "Download rate limiting should apply backpressure";
     EXPECT_LE(elapsed_ms, 16000) << "Download rate limiting should not take excessively long";
 }
+
+// ============================================================
+// BEP-6 Fast Extension Tests
+// ============================================================
+
+TEST(BEP6FastExtensionTest, MessageTypeValues) {
+    EXPECT_EQ(static_cast<uint8_t>(MessageType::Reject), 16);
+    EXPECT_EQ(static_cast<uint8_t>(MessageType::HaveNone), 17);
+    EXPECT_EQ(static_cast<uint8_t>(MessageType::HaveAll), 18);
+    EXPECT_EQ(static_cast<uint8_t>(MessageType::AllowedFast), 19);
+}
+
+TEST(BEP6FastExtensionTest, HandshakeSerializeFastExtensionFlag) {
+    Handshake hs;
+    hs.info_hash_bytes = hex_string_to_info_hash("e29fc0e5dceeefea80401e32723796c0a86a8695");
+    hs.peer_id_bytes = string_to_peer_id("-PU0001-FASTEXT-TEST");
+    hs.extended = true;
+    hs.fast_extension = true;
+
+    std::vector<std::byte> serialized = hs.serialize();
+    ASSERT_EQ(serialized.size(), HANDSHAKE_BASE_LEN);
+
+    // reserved[7] is at byte offset: 1 (pstrlen) + 19 (protocol) + 7 = 27
+    // Check both DHT (0x01) and fast extension (0x04) bits are set
+    EXPECT_NE(serialized[27] & static_cast<std::byte>(0x04), static_cast<std::byte>(0));
+    EXPECT_NE(serialized[27] & static_cast<std::byte>(0x01), static_cast<std::byte>(0));
+}
+
+TEST(BEP6FastExtensionTest, HandshakeSerializeDeserializeFastExtension) {
+    Handshake original_hs;
+    original_hs.info_hash_bytes = hex_string_to_info_hash("e29fc0e5dceeefea80401e32723796c0a86a8695");
+    original_hs.peer_id_bytes = string_to_peer_id("-PU0001-FASTEXT-TEST");
+    original_hs.extended = true;
+    original_hs.fast_extension = true;
+
+    std::vector<std::byte> serialized = original_hs.serialize();
+    Handshake deserialized_hs = Handshake::deserialize(serialized);
+
+    EXPECT_EQ(deserialized_hs.info_hash_bytes, original_hs.info_hash_bytes);
+    EXPECT_EQ(deserialized_hs.peer_id_bytes, original_hs.peer_id_bytes);
+    EXPECT_TRUE(deserialized_hs.extended);
+    EXPECT_TRUE(deserialized_hs.fast_extension);
+}
+
+TEST(BEP6FastExtensionTest, HandshakeFastExtensionDefaultsToFalse) {
+    Handshake hs;
+    EXPECT_FALSE(hs.fast_extension);
+}
+
+TEST(BEP6FastExtensionTest, HandshakeFastExtensionFalseSerialize) {
+    Handshake hs;
+    hs.info_hash_bytes = hex_string_to_info_hash("e29fc0e5dceeefea80401e32723796c0a86a8695");
+    hs.peer_id_bytes = string_to_peer_id("-PU0001-FASTEXT-TEST");
+    hs.extended = true;
+    hs.fast_extension = false;
+
+    std::vector<std::byte> serialized = hs.serialize();
+    // reserved[7] should have DHT (0x01) but NOT fast extension (0x04)
+    EXPECT_EQ(serialized[27] & static_cast<std::byte>(0x04), static_cast<std::byte>(0));
+    EXPECT_NE(serialized[27] & static_cast<std::byte>(0x01), static_cast<std::byte>(0));
+}
+
+TEST(BEP6FastExtensionTest, HandshakeDeserializeWithoutFastExtension) {
+    Handshake original_hs;
+    original_hs.info_hash_bytes = hex_string_to_info_hash("e29fc0e5dceeefea80401e32723796c0a86a8695");
+    original_hs.peer_id_bytes = string_to_peer_id("-PU0001-FASTEXT-TEST");
+    original_hs.extended = true;
+    original_hs.fast_extension = false;
+
+    std::vector<std::byte> serialized = original_hs.serialize();
+    Handshake deserialized_hs = Handshake::deserialize(serialized);
+
+    EXPECT_TRUE(deserialized_hs.extended);
+    EXPECT_FALSE(deserialized_hs.fast_extension);
+}
+
+TEST(BEP6FastExtensionTest, RejectPayloadSerializeDeserialize) {
+    uint32_t index = 5;
+    uint32_t begin = 16384;
+    uint32_t length = BLOCK_SIZE;
+
+    std::vector<std::byte> serialized = RejectPayload::serialize(index, begin, length);
+    ASSERT_EQ(serialized.size(), 12);
+
+    RejectPayload deserialized = RejectPayload::deserialize(serialized);
+
+    EXPECT_EQ(deserialized.index, index);
+    EXPECT_EQ(deserialized.begin, begin);
+    EXPECT_EQ(deserialized.length, length);
+}
+
+TEST(BEP6FastExtensionTest, RejectPayloadDeserializeInvalidSize) {
+    std::vector<std::byte> too_small(11);
+    EXPECT_THROW(RejectPayload::deserialize(too_small), std::runtime_error);
+
+    std::vector<std::byte> just_right_empty(12);
+    EXPECT_NO_THROW(RejectPayload::deserialize(just_right_empty));
+}
+
+TEST(BEP6FastExtensionTest, RejectPayloadWireFormatMatchesRequestPayload) {
+    uint32_t index = 42;
+    uint32_t begin = 0;
+    uint32_t length = 16384;
+
+    auto reject_bytes = RejectPayload::serialize(index, begin, length);
+    auto request_bytes = RequestPayload::serialize(index, begin, length);
+
+    EXPECT_EQ(reject_bytes, request_bytes);
+}

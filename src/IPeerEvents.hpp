@@ -46,6 +46,14 @@ public:
         bool is_choking
     ) = 0;
 
+    // Called when a peer rejects our block request (BEP-6)
+    virtual asio::awaitable<void> on_piece_rejected(
+        std::shared_ptr<PeerConnection> conn,
+        size_t piece_index,
+        uint32_t begin,
+        uint32_t length
+    ) = 0;
+
     // Called when a connection is terminated or fails
     virtual asio::awaitable<void> on_disconnect(std::shared_ptr<PeerConnection> conn) = 0;
     
