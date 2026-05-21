@@ -196,26 +196,36 @@ asio::awaitable<void> PieceManager::broadcast_outstanding_requests() {
 
     for (auto& [piece_idx, piece_progress] : *in_progress_pieces()) {
         for (uint32_t block_idx = 0; block_idx < piece_progress->total_blocks; ++block_idx) {
-            if (!piece_progress->blocks_received[block_idx]) {
-                uint32_t offset = block_idx * BLOCK_SIZE;
-                uint64_t current_piece_size;
-                 if (static_cast<uint64_t>(piece_idx) == num_pieces - 1) {
-                    current_piece_size = info.total_size - (static_cast<uint64_t>(piece_idx) * info.piece_size);
-                } else {
-                    current_piece_size = info.piece_size;
-                }
- 
-                uint32_t length = (offset + BLOCK_SIZE > current_piece_size)
-                                ? (current_piece_size - offset)
-                                : BLOCK_SIZE;
-                
+            uint32_t offset = block_idx * BLOCK_SIZE;
+            uint64_t current_piece_size;
+            if (static_cast<uint64_t>(piece_idx) == num_pieces - 1) {
+                current_piece_size = info.total_size - (static_cast<uint64_t>(piece_idx) * info.piece_size);
+            } else {
+                current_piece_size = info.piece_size;
+            }
 
+            uint32_t length = (offset + BLOCK_SIZE > current_piece_size)
+                            ? (current_piece_size - offset)
+                            : BLOCK_SIZE;
+
+            // Snapshot which peers we need to re-request from under the piece lock,
+            // but do the actual co_await sends outside the lock.
+            std::vector<std::shared_ptr<PeerConnection>> target_peers;
+            {
+                std::lock_guard lock(piece_progress->piece_mutex_);
+                if (piece_progress->blocks_received[block_idx]) {
+                    continue;
+                }
                 auto unchoked_peers_with_piece = co_await get_available_peers_(piece_idx);
                 for (const auto& peer_conn : unchoked_peers_with_piece) {
-                    co_await peer_conn->send_request(piece_idx, offset, length);
                     piece_progress->outstanding_requests[block_idx].push_back(peer_conn->peer_id());
                 }
+                target_peers = unchoked_peers_with_piece;
                 piece_progress->request_times[block_idx] = std::chrono::steady_clock::now();
+            }
+
+            for (const auto& peer_conn : target_peers) {
+                co_await peer_conn->send_request(piece_idx, offset, length);
             }
         }
     }
@@ -289,85 +299,81 @@ asio::awaitable<void> PieceManager::build_piece_rarity() {
 asio::awaitable<void> PieceManager::resume_piece_download(size_t piece_index) {
     asio::steady_timer timer(io_context_);
 
-    // Loop until successfully re-request all missing blocks
     while (true) {
-        // Wait for a short period to allow peer connections to be established
+        if (shutting_down_.load()) {
+            LOGDBG("Resumer for piece {}: shutting down, exiting.", piece_index);
+            co_return;
+        }
+
         timer.expires_after(std::chrono::seconds(1));
-        co_await timer.async_wait(asio::use_awaitable);
+        try {
+            co_await timer.async_wait(asio::use_awaitable);
+        } catch (const boost::system::system_error& e) {
+            if (e.code() == asio::error::operation_aborted) {
+                co_return;
+            }
+            throw;
+        }
 
         co_await asio::dispatch(strand_, asio::use_awaitable);
-        // Check if the piece is still in progress (it might have been completed or cancelled)
         auto piece_it = in_progress_pieces_->find(piece_index);
         if (piece_it == in_progress_pieces_->end()) {
-            // The piece is no longer in progress, our job here is done.
             co_return;
         }
 
         auto piece_progress = piece_it->second;
-        // Find peers that have this piece and are not choking us
 
         auto available_peers = co_await get_available_peers_(piece_index);
         if (available_peers.empty()) {
             LOGDBG("Resumer for piece {}: No available peers yet, will retry...", piece_index);
-            continue; // Go back to the start of the loop and wait again
+            continue;
         }
 
         LOGINFO("Resuming download for piece {}. Requesting missing blocks.", piece_index);
-        
-        if (state_->is_in_endgame_mode()) {
-            // In endgame mode, request from all available peers
+
+        // Collect missing block info under lock, spawn sends outside lock
+        struct MissingBlock {
+            uint32_t offset;
+            uint32_t length;
+            size_t peer_idx;
+        };
+        std::vector<MissingBlock> missing;
+        {
+            std::lock_guard lock(piece_progress->piece_mutex_);
             for (uint32_t block_idx = 0; block_idx < piece_progress->total_blocks; ++block_idx) {
-                if (!piece_progress->blocks_received[block_idx]) {
-                    uint32_t offset = block_idx * BLOCK_SIZE;
-                    uint32_t length = (block_idx == piece_progress->total_blocks - 1) 
-                        ? (piece_progress->data.size() - offset)
-                        : BLOCK_SIZE;
-                    
-                    // Request from all available peers for this block
-                    std::vector<std::shared_ptr<PeerConnection>> unchoked_peers;
-                    std::ranges::copy(
-                        available_peers
-                            | std::views::filter([](const std::shared_ptr<PeerConnection>& peer_conn){ 
-                                return !peer_conn->peer_is_choking(); 
-                            }),
-                        std::back_inserter(unchoked_peers)
-                    );
-                    for (const auto& peer_conn : unchoked_peers) {
+                if (piece_progress->blocks_received[block_idx]) continue;
+                uint32_t offset = block_idx * BLOCK_SIZE;
+                uint32_t length = (block_idx == piece_progress->total_blocks - 1)
+                    ? (piece_progress->data.size() - offset)
+                    : BLOCK_SIZE;
+
+                if (state_->is_in_endgame_mode()) {
+                    // In endgame mode, request from all unchoked peers
+                    for (const auto& peer_conn : available_peers) {
+                        if (peer_conn->peer_is_choking()) continue;
+                        piece_progress->outstanding_requests[block_idx].push_back(peer_conn->peer_id());
                         asio::co_spawn(io_context_,
                             [peer_conn, piece_index, offset, length]() -> asio::awaitable<void> {
                                 co_await peer_conn->send_request(piece_index, offset, length);
                             },
                             asio::detached
                         );
-                        piece_progress->outstanding_requests[block_idx].push_back(peer_conn->peer_id());
                     }
-                    piece_progress->request_times[block_idx] = std::chrono::steady_clock::now();
-                }
-            }
-        } else {
-            // Request all missing blocks for this piece
-            for (uint32_t block_idx = 0; block_idx < piece_progress->total_blocks; ++block_idx) {
-                if (!piece_progress->blocks_received[block_idx]) {
-                    uint32_t offset = block_idx * BLOCK_SIZE;
-                    uint32_t length = (block_idx == piece_progress->total_blocks - 1) 
-                        ? (piece_progress->data.size() - offset)
-                        : BLOCK_SIZE;
-                    // Pick a peer to request from (round-robin)
-                    auto& peer_conn = available_peers[block_idx % available_peers.size()];
-                    
+                } else {
+                    size_t peer_idx = block_idx % available_peers.size();
+                    auto& peer_conn = available_peers[peer_idx];
+                    piece_progress->outstanding_requests[block_idx].push_back(peer_conn->peer_id());
                     asio::co_spawn(io_context_,
                         [peer_conn, piece_index, offset, length]() -> asio::awaitable<void> {
                             co_await peer_conn->send_request(piece_index, offset, length);
                         },
                         asio::detached
                     );
-                    
-                    // Track that we made a request for this block
-                    piece_progress->outstanding_requests[block_idx].push_back(peer_conn->peer_id());
-                    piece_progress->request_times[block_idx] = std::chrono::steady_clock::now();
                 }
+                piece_progress->request_times[block_idx] = std::chrono::steady_clock::now();
             }
         }
+
         co_return;
     }
 }
@@ -385,38 +391,50 @@ asio::awaitable<void> PieceManager::check_block_timeouts() {
 
     for (const auto& [piece_idx, piece_progress] : *pieces) {
         for (uint32_t block_idx = 0; block_idx < piece_progress->total_blocks; ++block_idx) {
-            if (piece_progress->blocks_received[block_idx]) {
-                continue;
+            // Read request_time under lock to check for timeout
+            TimePoint request_time;
+            bool already_received = false;
+            bool timed_out = false;
+            {
+                std::lock_guard lock(piece_progress->piece_mutex_);
+                already_received = piece_progress->blocks_received[block_idx];
+                request_time = piece_progress->request_times[block_idx];
             }
 
-            auto request_time = piece_progress->request_times[block_idx];
-            if (request_time == TimePoint{}) {
-                continue;
-            }
+            if (already_received) continue;
+            if (request_time == TimePoint{}) continue;
 
             if (now - request_time > BLOCK_REQUEST_TIMEOUT) {
-                LOGWARN("Block {}/{} timed out after {}s. Cancelling and re-requesting.",
-                        piece_idx, block_idx, BLOCK_REQUEST_TIMEOUT.count());
+                timed_out = true;
+            }
 
-                if (block_timeout_callback_) {
-                    co_await block_timeout_callback_(static_cast<uint32_t>(piece_idx), block_idx);
-                }
+            if (!timed_out) continue;
 
-                auto available_peers = co_await get_available_peers_(piece_idx);
-                if (!available_peers.empty()) {
-                    uint32_t offset = block_idx * BLOCK_SIZE;
-                    uint32_t length = (block_idx == piece_progress->total_blocks - 1)
-                        ? (piece_progress->data.size() - offset)
-                        : BLOCK_SIZE;
+            LOGWARN("Block {}/{} timed out after {}s. Cancelling and re-requesting.",
+                    piece_idx, block_idx, BLOCK_REQUEST_TIMEOUT.count());
 
-                    auto& new_peer = available_peers[block_idx % available_peers.size()];
-                    asio::co_spawn(io_context_,
-                        [new_peer, piece_idx, offset, length]() -> asio::awaitable<void> {
-                            co_await new_peer->send_request(piece_idx, offset, length);
-                        },
-                        asio::detached
-                    );
+            if (block_timeout_callback_) {
+                co_await block_timeout_callback_(static_cast<uint32_t>(piece_idx), block_idx);
+            }
 
+            auto available_peers = co_await get_available_peers_(piece_idx);
+            if (!available_peers.empty()) {
+                uint32_t offset = block_idx * BLOCK_SIZE;
+                uint32_t length = (block_idx == piece_progress->total_blocks - 1)
+                    ? (piece_progress->data.size() - offset)
+                    : BLOCK_SIZE;
+
+                auto& new_peer = available_peers[block_idx % available_peers.size()];
+                asio::co_spawn(io_context_,
+                    [new_peer, piece_idx, offset, length]() -> asio::awaitable<void> {
+                        co_await new_peer->send_request(piece_idx, offset, length);
+                    },
+                    asio::detached
+                );
+
+                // Re-lock to update outstanding requests
+                {
+                    std::lock_guard lock(piece_progress->piece_mutex_);
                     piece_progress->outstanding_requests[block_idx].push_back(new_peer->peer_id());
                     piece_progress->request_times[block_idx] = now;
                 }

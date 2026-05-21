@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/dispatch.hpp>
 #include <boost/asio/io_context.hpp>
@@ -117,6 +118,9 @@ public:
     // On timeout: calls the timeout callback (cancel) and re-requests from another peer.
     asio::awaitable<void> check_block_timeouts();
 
+    // Signal that shutdown is in progress (called by TorrentSession::stop())
+    void signal_shutdown() noexcept { shutting_down_ = true; }
+
 private:
 
     asio::awaitable<bool> try_piece_download(size_t piece_index);
@@ -134,4 +138,5 @@ private:
     mutable std::mutex mutex_;
     GetAvailableCallback get_available_peers_;
     BlockTimeoutCallback block_timeout_callback_;
+    std::atomic<bool> shutting_down_{false};
 };

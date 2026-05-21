@@ -11,6 +11,14 @@ PeerManager::PeerManager(asio::io_context& io_context, std::shared_ptr<SessionSt
 {}
 
 bool PeerManager::add_connection(const PeerId& id, std::shared_ptr<PeerConnection> conn) {
+    // Reject banned peers (must check BEFORE locking mutex_ to avoid ABBA deadlock
+    // with ban_peer_by_ip which locks ban_mutex_ then mutex_)
+    std::string ip = extract_ip_from_addr(conn->peer_addr());
+    if (is_banned(ip)) {
+        conn->close();
+        return false;
+    }
+
     std::lock_guard lock(mutex_);
 
     // Decrement half-open count since the handshake completed (for outgoing connections).
@@ -19,8 +27,8 @@ bool PeerManager::add_connection(const PeerId& id, std::shared_ptr<PeerConnectio
         --half_open_connections_;
     }
 
-    // Reject banned peers
-    std::string ip = extract_ip_from_addr(conn->peer_addr());
+    // Re-check banned status in case it changed between the unlocked check and now
+    // (unlikely race window, but safe to double-check under lock)
     if (is_banned(ip)) {
         LOGWARN("add_connection: rejecting {} ({}): IP {} is banned", id, conn->peer_addr(), ip);
         conn->close();

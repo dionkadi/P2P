@@ -139,10 +139,22 @@ public:
 
     // Pipeline state introspection (for testing/monitoring)
     size_t max_outstanding_requests() const noexcept { return max_outstanding_requests_; }
-    size_t outstanding_request_count() const noexcept { return outstanding_request_count_; }
-    uint64_t total_bytes_requested() const noexcept { return total_bytes_requested_; }
-    uint64_t total_bytes_received() const noexcept { return total_bytes_received_; }
-    size_t pending_request_count() const noexcept { return pending_requests_.size(); }
+    size_t outstanding_request_count() const noexcept {
+        std::lock_guard lock(pipeline_mutex_);
+        return outstanding_request_count_;
+    }
+    uint64_t total_bytes_requested() const noexcept {
+        std::lock_guard lock(pipeline_mutex_);
+        return total_bytes_requested_;
+    }
+    uint64_t total_bytes_received() const noexcept {
+        std::lock_guard lock(pipeline_mutex_);
+        return total_bytes_received_;
+    }
+    size_t pending_request_count() const noexcept {
+        std::lock_guard lock(pipeline_mutex_);
+        return pending_requests_.size();
+    }
 
     static constexpr uint64_t MAX_PIPELINE_BUFFER = 256 * 1024;
 
@@ -208,4 +220,8 @@ private:
     int32_t metadata_size_{0};
 
     mutable std::mutex mutex_;
+
+    // Protects pipeline state: pending_requests_, outstanding_request_count_,
+    // total_bytes_requested_, total_bytes_received_
+    mutable std::mutex pipeline_mutex_;
 };

@@ -397,3 +397,30 @@
 - 185 tests pass (180 existing + 5 new tracker tests)
 - All 5 TrackerDirectTest tests pass (SeederLeecherCounts 105ms, CompactPeerListFormat 105ms, PeerExpiration 4103ms, PersistenceRoundTrip 204ms, ErrorResponse 102ms)
 - Build: zero warnings with `-Werror`
+
+## Code Quality Fixes (F2 Review)
+
+### Fix 1: ABBA deadlock — PeerManager (CRITICAL)
+- **Problem:** `add_connection()` locked `mutex_` then `is_banned()` → `ban_mutex_`. `ban_peer_by_ip()` locked `ban_mutex_` then `mutex_`. Classic deadlock.
+- **Fix:** Move the ban check BEFORE `mutex_` lock in `add_connection()`. Add a double-check under lock for safety (TOCTOU race window).
+- **Files:** `PeerManager.cpp`
+
+### Fix 2: Pipeline state data races — PeerConnection (CRITICAL)
+- **Problem:** `pending_requests_`, `outstanding_request_count_`, `total_bytes_requested_`, `total_bytes_received_` accessed from multiple coroutines without synchronization.
+- **Fix:** Added `pipeline_mutex_` to PeerConnection, locked in `send_request()`, `on_request_completed()`, `on_request_rejected()`, `send_cancel()`, `flush_pending_requests()`, and all getter functions. `flush_pending_requests()` uses caller-owns pattern (called from lock-holding contexts).
+- **Files:** `PeerConnection.hpp`, `PeerConnection.cpp`
+
+### Fix 3: InProgressPiece data races (CRITICAL)
+- **Problem:** `InProgressPiece` struct members accessed concurrently from `on_piece_block`, `check_block_timeouts`, `send_cancel_for_block`, `broadcast_outstanding_requests` without any synchronization.
+- **Fix:** Added `piece_mutex_` to `InProgressPiece` struct. Lock in all accessor functions. No `co_await` while holding lock — data is copied out under lock, async operations happen outside.
+- **Files:** `Utils.hpp`, `PieceManager.cpp`, `TorrentSession.cpp`
+
+### Fix 4: Unhandled exception in `resume_piece_download` (HIGH)
+- **Problem:** Local steady_timer `async_wait` without try-catch — `operation_aborted` during shutdown would crash via `std::terminate()`. Also loop had no shutdown awareness.
+- **Fix:** Added try-catch for `operation_aborted`. Added `shutting_down_` atomic + `signal_shutdown()` to PieceManager, set by `TorrentSession::stop()`. Loop checks flag before each iteration.
+- **Files:** `PieceManager.hpp`, `PieceManager.cpp`, `TorrentSession.cpp`
+
+### Fix 5: `generate_id()` static RNG not thread-safe (MEDIUM)
+- **Problem:** `static std::mt19937 rng` shared across all threads without synchronization.
+- **Fix:** Changed to `static thread_local std::mt19937 rng` — each thread gets its own RNG instance.
+- **Files:** `Utils.hpp`

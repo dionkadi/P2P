@@ -319,6 +319,8 @@ asio::awaitable<void> PeerConnection::send_simple_message(MessageType type) {
 }
 
 asio::awaitable<bool> PeerConnection::send_request(size_t index, uint32_t begin, uint32_t length) {
+    std::lock_guard lock(pipeline_mutex_);
+
     // Check pipeline limits
     uint64_t pipeline_bytes = total_bytes_requested_ - total_bytes_received_;
     if (outstanding_request_count_ >= max_outstanding_requests_ ||
@@ -340,6 +342,10 @@ asio::awaitable<bool> PeerConnection::send_request(size_t index, uint32_t begin,
 }
 
 void PeerConnection::flush_pending_requests() {
+    // Caller MUST hold pipeline_mutex_ — this is called from
+    // on_request_completed/on_request_rejected which already hold it.
+    // Do NOT lock here.
+
     while (!pending_requests_.empty()) {
         uint64_t pipeline_bytes = total_bytes_requested_ - total_bytes_received_;
         if (outstanding_request_count_ >= max_outstanding_requests_ ||
@@ -368,6 +374,8 @@ void PeerConnection::flush_pending_requests() {
 }
 
 void PeerConnection::on_request_completed(uint32_t length) {
+    std::lock_guard lock(pipeline_mutex_);
+
     total_bytes_received_ += length;
     if (outstanding_request_count_ > 0) {
         --outstanding_request_count_;
@@ -376,6 +384,8 @@ void PeerConnection::on_request_completed(uint32_t length) {
 }
 
 void PeerConnection::on_request_rejected(uint32_t length) {
+    std::lock_guard lock(pipeline_mutex_);
+
     // A rejected request never fulfilled — remove from requested bytes
     if (total_bytes_requested_ >= length) {
         total_bytes_requested_ -= length;
@@ -404,6 +414,8 @@ asio::awaitable<void> PeerConnection::send_bitfield(const std::vector<uint8_t>& 
 }
 
 asio::awaitable<void> PeerConnection::send_cancel(size_t index, uint32_t begin, uint32_t length) {
+    std::lock_guard lock(pipeline_mutex_);
+
     auto it = std::ranges::find_if(pending_requests_, [&](const RequestPayload& r) {
         return r.index == index && r.begin == begin && r.length == length;
     });

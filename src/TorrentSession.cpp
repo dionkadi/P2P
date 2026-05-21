@@ -262,6 +262,7 @@ asio::awaitable<void> TorrentSession::stop() {
     tracker_announce_timer_.cancel();
     discovered_peers_timer_.cancel();
     peer_manager_->cancel();
+    piece_manager_->signal_shutdown();
     piece_manager_->notify_one();
 
     asio::steady_timer announce_timeout_timer(io_context_);
@@ -570,24 +571,39 @@ asio::awaitable<void> TorrentSession::on_piece_block(std::shared_ptr<PeerConnect
         co_return;
     }
     uint32_t block_index = begin / BLOCK_SIZE;
-    if (block_index >= progress->blocks_received.size() || progress->blocks_received[block_index]) {
-        co_return; // Invalid or Duplicate
-    }
 
-    if (state_->is_in_endgame_mode()) {
-        co_await send_cancel_for_block(piece_index, block_index, conn->peer_id());
-    }
+    // Fast path: check duplicate and write block data under the piece mutex.
+    // Hold is brief — no co_await while locked.
+    bool piece_complete = false;
+    {
+        std::lock_guard lock(progress->piece_mutex_);
+        if (block_index >= progress->blocks_received.size() || progress->blocks_received[block_index]) {
+            co_return; // Invalid or Duplicate
+        }
 
-    std::ranges::copy(block_data, progress->data.begin() + begin);
-    progress->blocks_received[block_index] = true;
-    ++progress->received_count;
+        if (state_->is_in_endgame_mode()) {
+            co_await send_cancel_for_block(piece_index, block_index, conn->peer_id());
+        }
+
+        std::ranges::copy(block_data, progress->data.begin() + begin);
+        progress->blocks_received[block_index] = true;
+        ++progress->received_count;
+
+        piece_complete = (progress->received_count == progress->total_blocks);
+    }
 
     state_->add_total_bytes_downloaded(block_data.size());
     conn->add_bytes_downloaded(block_data.size());
 
-    if (progress->received_count == progress->total_blocks) {
+    if (piece_complete) {
         auto expected_hash = std::vector<std::byte>(state_->torrent_info().pieces.begin() + piece_index * 20, state_->torrent_info().pieces.begin() + (piece_index * 20 + 20));
-        auto actual_hash = Crypto::calculate_sha1_hash_data(progress->data);
+        // Lock just for reading progress->data during hash calculation (co_await-free)
+        std::vector<std::byte> piece_data;
+        {
+            std::lock_guard lock(progress->piece_mutex_);
+            piece_data = progress->data;
+        }
+        auto actual_hash = Crypto::calculate_sha1_hash_data(piece_data);
         if (actual_hash != expected_hash) {
             LOGERR("Hash mismatch for piece {}. Returning to queue.", piece_index);
             peer_manager_->report_corrupt_piece(conn->peer_addr());
@@ -595,7 +611,7 @@ asio::awaitable<void> TorrentSession::on_piece_block(std::shared_ptr<PeerConnect
             co_return;
         }
 
-        co_await file_manager_->write_piece(piece_index, progress->data);
+        co_await file_manager_->write_piece(piece_index, piece_data);
         state_->piece_status(piece_index, PieceStatus::Have);
         state_->add_completed_pieces(1);
         piece_manager_->notify_one();
@@ -1282,9 +1298,16 @@ asio::awaitable<void> TorrentSession::send_cancel_for_block(uint32_t piece_index
         co_return ;
     }
 
-    auto& requests_for_block = it->second->outstanding_requests[block_index];
-    std::vector<PeerId> peer_ids_to_cancel = requests_for_block;
-    requests_for_block.clear();
+    auto progress = it->second;
+    std::vector<PeerId> peer_ids_to_cancel;
+    {
+        std::lock_guard lock(progress->piece_mutex_);
+        if (block_index >= progress->outstanding_requests.size()) {
+            co_return;
+        }
+        peer_ids_to_cancel = progress->outstanding_requests[block_index];
+        progress->outstanding_requests[block_index].clear();
+    }
 
     const auto& info = state_->torrent_info();
     const size_t num_pieces = state_->num_pieces();

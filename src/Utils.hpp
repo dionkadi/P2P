@@ -15,6 +15,7 @@
 #include <random>
 #include <string>
 #include <map>
+#include <mutex>
 #include <set>
 #include <queue>
 #include <deque>
@@ -135,7 +136,7 @@ constexpr std::array<std::byte, 20> generate_id(std::string_view prefix = "") {
         [](char c) { return static_cast<std::byte>(c); }
     );
     
-    static std::mt19937 rng = []{
+    static thread_local std::mt19937 rng = []{
         std::random_device rd;
         return std::mt19937(rd());
     }();
@@ -680,6 +681,7 @@ struct TrackerAnnounceResult {
 };
 
 struct InProgressPiece {
+    std::mutex piece_mutex_;
     std::vector<std::byte> data;
     std::vector<bool> blocks_received;
     uint32_t received_count = 0;
