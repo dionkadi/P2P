@@ -1,6 +1,8 @@
 #include "helper.hpp"
 #include "MagnetUri.hpp"
+#include "Bencode.hpp"
 #include <boost/asio/strand.hpp>
+#include <boost/beast.hpp>
 #include <iostream>
 
 // Simple tracker that can be run in a separate thread
@@ -1032,5 +1034,232 @@ TEST(BanUnitTest, PeerBanning) {
     }
     pm->report_connection_failure("17.18.19.20:6881");
     EXPECT_TRUE(pm->is_banned("17.18.19.20"));
+}
+
+// ==================== Tracker Direct Tests ====================
+
+class TrackerDirectTest : public ::testing::Test {
+protected:
+    static constexpr int TRACKER_PORT = 6790;
+    static constexpr int PEER_PORT_BASE = 6900;
+
+    asio::io_context test_io;
+    std::optional<asio::executor_work_guard<asio::io_context::executor_type>> work_guard;
+    std::vector<std::jthread> worker_threads;
+    std::unique_ptr<Tracker> tracker_;
+    TempDir temp_dir;
+
+    void SetUp() override {
+        work_guard.emplace(asio::make_work_guard(test_io));
+        for (int i = 0; i < 2; ++i) {
+            worker_threads.emplace_back([this] {
+                try { test_io.run(); }
+                catch (const std::exception& e) { LOGCRITICAL("TrackerTest worker failed: {}", e.what()); }
+            });
+        }
+    }
+
+    void TearDown() override {
+        tracker_.reset();
+        work_guard->reset();
+        test_io.stop();
+        for (auto& t : worker_threads) {
+            if (t.joinable()) t.join();
+        }
+        test_io.restart();
+    }
+
+    void start_tracker(int interval_secs = 1800) {
+        tracker_ = std::make_unique<Tracker>(test_io);
+        tracker_->set_interval(interval_secs);
+        tracker_->listen_http(TRACKER_PORT);
+        std::this_thread::sleep_for(100ms);
+    }
+
+    asio::awaitable<Value> do_announce(
+        const std::vector<std::byte>& info_hash,
+        int64_t left, int peer_port,
+        const std::string& event = "")
+    {
+        namespace beast = boost::beast;
+        namespace http = beast::http;
+
+        std::ostringstream escaped;
+        escaped.fill('0');
+        escaped << std::hex;
+        for (auto b : info_hash) {
+            unsigned char c = static_cast<unsigned char>(b);
+            if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+                escaped << c;
+            } else {
+                escaped << '%' << std::setw(2) << static_cast<int>(c);
+            }
+        }
+        std::string encoded_hash = escaped.str();
+
+        std::string target = "/announce?info_hash=" + encoded_hash
+                            + "&port=" + std::to_string(peer_port)
+                            + "&left=" + std::to_string(left)
+                            + "&compact=1";
+        if (!event.empty()) {
+            target += "&event=" + event;
+        }
+
+        tcp::resolver resolver(test_io);
+        beast::tcp_stream stream(test_io);
+        auto results = co_await resolver.async_resolve("127.0.0.1", std::to_string(TRACKER_PORT), asio::use_awaitable);
+        stream.expires_after(std::chrono::seconds(5));
+        co_await stream.async_connect(results, asio::use_awaitable);
+
+        http::request<http::string_body> req{http::verb::get, target, 11};
+        req.set(http::field::host, "127.0.0.1");
+
+        co_await http::async_write(stream, req, asio::use_awaitable);
+
+        beast::flat_buffer buffer;
+        http::response<http::string_body> res;
+        co_await http::async_read(stream, buffer, res, asio::use_awaitable);
+
+        beast::error_code ec;
+        stream.socket().shutdown(tcp::socket::shutdown_both, ec);
+
+        auto body = res.body();
+        std::vector<std::byte> bencode_data(body.size());
+        for (size_t i = 0; i < body.size(); ++i) {
+            bencode_data[i] = static_cast<std::byte>(body[i]);
+        }
+
+        co_return decode(std::span<const std::byte>(bencode_data));
+    }
+
+    Value announce(const std::vector<std::byte>& info_hash,
+                   int64_t left, int peer_port,
+                   const std::string& event = "")
+    {
+        std::promise<Value> promise;
+        asio::co_spawn(test_io,
+            [&]() -> asio::awaitable<void> {
+                try {
+                    auto val = co_await do_announce(info_hash, left, peer_port, event);
+                    promise.set_value(std::move(val));
+                } catch (...) {
+                    promise.set_exception(std::current_exception());
+                }
+            },
+            asio::detached);
+        return promise.get_future().get();
+    }
+
+    static std::vector<std::byte> make_info_hash(int seed = 0) {
+        std::vector<std::byte> hash(20);
+        std::mt19937 rng(seed);
+        for (auto& b : hash) {
+            b = static_cast<std::byte>(rng() & 0xFF);
+        }
+        return hash;
+    }
+};
+
+TEST_F(TrackerDirectTest, SeederLeecherCounts) {
+    start_tracker();
+    auto hash = make_info_hash(42);
+
+    auto r1 = announce(hash, 0, PEER_PORT_BASE);
+    auto& r1d = *std::get<std::unique_ptr<Dict>>(r1.get_variant());
+    EXPECT_EQ(std::get<Integer>(r1d.at("complete").get_variant()), 1);
+    EXPECT_EQ(std::get<Integer>(r1d.at("incomplete").get_variant()), 0);
+
+    auto r2 = announce(hash, 1, PEER_PORT_BASE + 1);
+    auto& r2d = *std::get<std::unique_ptr<Dict>>(r2.get_variant());
+    EXPECT_EQ(std::get<Integer>(r2d.at("complete").get_variant()), 1);
+    EXPECT_EQ(std::get<Integer>(r2d.at("incomplete").get_variant()), 1);
+
+    auto r3 = announce(hash, 0, PEER_PORT_BASE + 2);
+    auto& r3d = *std::get<std::unique_ptr<Dict>>(r3.get_variant());
+    EXPECT_EQ(std::get<Integer>(r3d.at("complete").get_variant()), 2);
+    EXPECT_EQ(std::get<Integer>(r3d.at("incomplete").get_variant()), 1);
+}
+
+TEST_F(TrackerDirectTest, CompactPeerListFormat) {
+    start_tracker();
+    auto hash = make_info_hash(43);
+    int base_port = PEER_PORT_BASE + 10;
+
+    announce(hash, 0, base_port);
+    announce(hash, 100, base_port + 1);
+    announce(hash, 0, base_port + 2);
+
+    auto res = announce(hash, 0, base_port + 3);
+    auto& resd = *std::get<std::unique_ptr<Dict>>(res.get_variant());
+    auto& peers_str = std::get<String>(resd.at("peers").get_variant());
+
+    EXPECT_GE(peers_str.size() / 6, static_cast<size_t>(3));
+    EXPECT_EQ(peers_str.size() % 6, static_cast<size_t>(0));
+
+    for (size_t i = 0; i < peers_str.size(); i += 6) {
+        asio::ip::address_v4::bytes_type ip_bytes;
+        std::copy_n(peers_str.data() + i, 4, ip_bytes.begin());
+        auto ip = asio::ip::address_v4(ip_bytes);
+        EXPECT_EQ(ip.to_string(), "127.0.0.1");
+
+        uint16_t port_net;
+        std::memcpy(&port_net, peers_str.data() + i + 4, 2);
+        uint16_t port_host = ntohs(port_net);
+        EXPECT_GE(port_host, static_cast<uint16_t>(base_port));
+        EXPECT_LE(port_host, static_cast<uint16_t>(base_port + 3));
+    }
+}
+
+TEST_F(TrackerDirectTest, PeerExpiration) {
+    int interval_secs = 1;
+    start_tracker(interval_secs);
+    tracker_->start_background_tasks(*temp_dir);
+
+    auto hash = make_info_hash(44);
+    announce(hash, 0, PEER_PORT_BASE + 20);
+
+    auto [seeders, leechers] = tracker_->count_seeders_leechers(hash);
+    EXPECT_EQ(seeders + leechers, 1);
+
+    std::this_thread::sleep_for(std::chrono::seconds(interval_secs * 2 + 2));
+
+    auto [seeders2, leechers2] = tracker_->count_seeders_leechers(hash);
+    EXPECT_EQ(seeders2 + leechers2, 0);
+}
+
+TEST_F(TrackerDirectTest, PersistenceRoundTrip) {
+    auto hash = make_info_hash(45);
+    auto data_dir = *temp_dir / "tracker_persistence_test";
+
+    {
+        start_tracker();
+        tracker_->load_state(data_dir);
+        tracker_->start_background_tasks(data_dir);
+        announce(hash, 0, PEER_PORT_BASE + 30);
+        auto [s, l] = tracker_->count_seeders_leechers(hash);
+        EXPECT_EQ(s, 1);
+        tracker_->save_state();
+    }
+
+    {
+        start_tracker();
+        tracker_->load_state(data_dir);
+
+        auto [s, l] = tracker_->count_seeders_leechers(hash);
+        EXPECT_EQ(s, 1);
+        EXPECT_EQ(l, 0);
+    }
+}
+
+TEST_F(TrackerDirectTest, ErrorResponse) {
+    start_tracker();
+    auto hash = make_info_hash(46);
+
+    auto res = announce(hash, 0, PEER_PORT_BASE + 40, "stopped");
+    auto& resd = *std::get<std::unique_ptr<Dict>>(res.get_variant());
+    EXPECT_EQ(std::get<Integer>(resd.at("complete").get_variant()), 0);
+    EXPECT_EQ(std::get<Integer>(resd.at("incomplete").get_variant()), 0);
+    auto& peers_str = std::get<String>(resd.at("peers").get_variant());
+    EXPECT_TRUE(peers_str.empty());
 }
 

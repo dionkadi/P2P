@@ -351,3 +351,49 @@
 - 180 tests pass (173 existing + 7 new request pipelining tests)
 - All 7 pipelining tests complete in ~2ms total (all synchronous, no timers or waits)
 - Build: zero warnings with `-Werror`
+
+## Task 11.x: Tracker Fixes & Enhancements (2026-05-21)
+
+### Changes Made
+- **src/Tracker.hpp**:
+  - Added `PeerEntry` struct tracking `left` (bytes left) and `last_announce` (system_clock time_point) per peer
+  - Changed `peers_` from `map<info_hash, flat_set<string>>` to `map<info_hash, map<compact_addr, PeerEntry>>` for metadata
+  - Fixed seeder/leecher counting: `left==0` = seeder, `left>0` = leecher
+  - HTTP announce handler now parses `left` and `event` query params; adds `complete`/`incomplete` to response dict
+  - UDP announce handler reads `left` from `UdpAnnounceRequest` struct; fills `seeders`/`leechers` in response
+  - Added `event=stopped` handling: removes peer from swarm gracefully
+  - Added `cleanup_loop()`: periodic timer that removes peers not re-announced within `interval * 2`
+  - Added `save_state()` / `load_state()`: Bencode-based persistence to `tracker_state.bencode`
+  - Exposed `PeerMap` type and `count_seeders_leechers()` / `get_peers()` for testing
+  - Compact peer list format (4 bytes IP + 2 bytes port big-endian) already partially implemented; extended to both HTTP and UDP paths
+  - Error responses return Bencode error dicts with `failure reason` key (already existed for HTTP, preserved)
+
+- **src/main_tracker.cpp**:
+  - Added CLI flags: `--port`, `--http-port`, `--udp-port`, `--data-dir`, `--help`
+  - `--port` overrides both HTTP and UDP ports to same value
+  - Calls `load_state()` on startup to restore previous peer state
+  - Calls `start_background_tasks()` to begin cleanup loop and periodic saves
+  - Default data dir: `./tracker_data`
+
+- **test/integration_test.cpp**:
+  - Added 5 new `TrackerDirectTest` tests:
+    - `SeederLeecherCounts`: verifies correct complete/incomplete counts for seeder (left=0) and leecher (left>0) combinations
+    - `CompactPeerListFormat`: verifies each peer entry is 6 bytes (4 IP + 2 port big-endian), all IPs resolve to 127.0.0.1
+    - `PeerExpiration`: starts tracker with 1s interval, verifies peer removed after interval*2 + margin
+    - `PersistenceRoundTrip`: saves peer state to temp dir, loads in new tracker, verifies peer count preserved
+    - `ErrorResponse`: tests stopped event on non-existent peer returns empty/safe response
+
+### Key Design Decisions
+- `PeerEntry.last_announce` uses `system_clock` (not `steady_clock`) for Unix timestamp persistence
+- `save_state()` Bencode format: `d5:peersd<20-byte-hash>ld6:compact<6bytes>4:lefti<left>e12:last_announcei<ts>e...`
+- `cleanup_loop()` runs on io_context with `steady_timer`, dispatches peer operations to strand
+- `load_state()` gracefully handles missing/corrupt files (logs warning, starts fresh)
+- `save_state()` called from cleanup_loop after each expiration sweep
+- `interval_` member (default 1800s) configurable via `set_interval()`
+- CLI uses simple string comparison (no new dependencies like Boost.ProgramOptions)
+- `start_background_tasks(data_dir)` replaces the old `run()` pattern — saves data_dir and spawns cleanup_loop
+
+### Test Results
+- 185 tests pass (180 existing + 5 new tracker tests)
+- All 5 TrackerDirectTest tests pass (SeederLeecherCounts 105ms, CompactPeerListFormat 105ms, PeerExpiration 4103ms, PersistenceRoundTrip 204ms, ErrorResponse 102ms)
+- Build: zero warnings with `-Werror`
