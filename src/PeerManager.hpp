@@ -33,7 +33,7 @@ struct PeerMisbehavior {
 
 class PeerManager : public std::enable_shared_from_this<PeerManager> {
 public:
-    PeerManager(asio::io_context& io_context, std::shared_ptr<SessionState> state, std::chrono::seconds choke_interval = 10s) noexcept;
+    PeerManager(asio::io_context& io_context, std::shared_ptr<SessionState> state, std::chrono::milliseconds choke_interval = 10s) noexcept;
 
     PeerManager(const PeerManager&) = delete;
     PeerManager& operator=(const PeerManager&) = delete;
@@ -181,7 +181,7 @@ private:
     std::unordered_set<EndPoint> discovered_peers_;
     std::deque<EndPoint> dropped_peers_;
     size_t choke_loop_counter_{0};
-    std::chrono::seconds choke_interval_;
+    std::chrono::milliseconds choke_interval_;
     mutable std::mutex mutex_;
     mutable std::mutex active_mutex_;
     mutable std::mutex discovered_mutex_;

@@ -776,3 +776,156 @@ TEST(LsdDiscoveryTest, ParseAnnouncementDifferentPort) {
     ASSERT_TRUE(parsed.has_value());
     EXPECT_EQ(parsed->port, 9999);
 }
+
+// ============================================================
+// Choking Algorithm (BEP 3 Tit-for-Tat) Tests
+// ============================================================
+
+TEST(ChokingAlgorithmTest, TopUploadersUnchoked) {
+    asio::io_context io;
+    auto state = make_test_state();
+    auto pm = std::make_shared<PeerManager>(io, state, std::chrono::milliseconds(50));
+    pm->set_max_total_connections(10);
+    pm->set_max_connections_per_ip(10);
+
+    auto p1 = make_test_conn(io, "1.2.3.1:6881", test_peer_id("p1"), 0, 1000);
+    auto p2 = make_test_conn(io, "1.2.3.2:6881", test_peer_id("p2"), 0, 800);
+    auto p3 = make_test_conn(io, "1.2.3.3:6881", test_peer_id("p3"), 0, 600);
+    auto p4 = make_test_conn(io, "1.2.3.4:6881", test_peer_id("p4"), 0, 400);
+    auto p5 = make_test_conn(io, "1.2.3.5:6881", test_peer_id("p5"), 0, 200);
+    auto p6 = make_test_conn(io, "1.2.3.6:6881", test_peer_id("p6"), 0, 50);
+
+    for (auto& p : {p1, p2, p3, p4, p5, p6}) {
+        p->peer_is_interested(true);
+    }
+
+    ASSERT_TRUE(pm->add_connection(p1->peer_id(), p1));
+    ASSERT_TRUE(pm->add_connection(p2->peer_id(), p2));
+    ASSERT_TRUE(pm->add_connection(p3->peer_id(), p3));
+    ASSERT_TRUE(pm->add_connection(p4->peer_id(), p4));
+    ASSERT_TRUE(pm->add_connection(p5->peer_id(), p5));
+    ASSERT_TRUE(pm->add_connection(p6->peer_id(), p6));
+    ASSERT_EQ(pm->connection_count(), 6);
+
+    asio::co_spawn(io, pm->choke_loop(), asio::detached);
+    io.run_for(std::chrono::milliseconds(70));
+    pm->cancel();
+    io.run_for(std::chrono::milliseconds(5));
+
+    EXPECT_FALSE(p1->am_choking()) << "p1 (top uploader 1000) should be unchoked";
+    EXPECT_FALSE(p2->am_choking()) << "p2 (top uploader 800) should be unchoked";
+    EXPECT_FALSE(p3->am_choking()) << "p3 (top uploader 600) should be unchoked";
+    EXPECT_TRUE(p6->am_choking()) << "p6 (lowest uploader 50) should remain choked";
+}
+
+TEST(ChokingAlgorithmTest, UninterestedPeersNeverUnchoked) {
+    asio::io_context io;
+    auto state = make_test_state();
+    auto pm = std::make_shared<PeerManager>(io, state, std::chrono::milliseconds(50));
+    pm->set_max_total_connections(10);
+    pm->set_max_connections_per_ip(10);
+
+    auto p1 = make_test_conn(io, "1.2.3.1:6881", test_peer_id("p1"), 0, 1000);
+    auto p2 = make_test_conn(io, "1.2.3.2:6881", test_peer_id("p2"), 0, 500);
+
+    p1->peer_is_interested(true);
+    p2->peer_is_interested(false);
+
+    ASSERT_TRUE(pm->add_connection(p1->peer_id(), p1));
+    ASSERT_TRUE(pm->add_connection(p2->peer_id(), p2));
+
+    asio::co_spawn(io, pm->choke_loop(), asio::detached);
+    io.run_for(std::chrono::milliseconds(70));
+    pm->cancel();
+    io.run_for(std::chrono::milliseconds(5));
+
+    EXPECT_FALSE(p1->am_choking()) << "Interested peer should be unchoked";
+    EXPECT_TRUE(p2->am_choking()) << "Uninterested peer should never be unchoked";
+}
+
+TEST(ChokingAlgorithmTest, SnubbedPeerGetsChoked) {
+    asio::io_context io;
+    auto state = make_test_state();
+    auto pm = std::make_shared<PeerManager>(io, state, std::chrono::milliseconds(50));
+    pm->set_max_total_connections(10);
+    pm->set_max_connections_per_ip(10);
+
+    auto p1 = make_test_conn(io, "1.2.3.1:6881", test_peer_id("p1"), 0, 500);
+    auto p2 = make_test_conn(io, "1.2.3.2:6881", test_peer_id("p2"), 0, 500);
+
+    p1->peer_is_interested(true);
+    p2->peer_is_interested(true);
+
+    p1->am_choking(false);
+    p2->am_choking(false);
+
+    p1->last_data_received(std::chrono::steady_clock::now() - std::chrono::seconds(90));
+    p2->last_data_received(std::chrono::steady_clock::now() - std::chrono::seconds(10));
+
+    ASSERT_TRUE(pm->add_connection(p1->peer_id(), p1));
+    ASSERT_TRUE(pm->add_connection(p2->peer_id(), p2));
+
+    asio::co_spawn(io, pm->choke_loop(), asio::detached);
+    io.run_for(std::chrono::milliseconds(70));
+    pm->cancel();
+    io.run_for(std::chrono::milliseconds(5));
+
+    EXPECT_TRUE(p1->am_choking()) << "Snubbed peer (no data 90s) should be choked";
+    EXPECT_FALSE(p2->am_choking()) << "Non-snubbed peer (data 10s ago) should remain unchoked";
+}
+
+TEST(ChokingAlgorithmTest, OptimisticRotationIncreasesUnchokeCount) {
+    asio::io_context io;
+    auto state = make_test_state();
+    auto pm = std::make_shared<PeerManager>(io, state, std::chrono::milliseconds(50));
+    pm->set_max_total_connections(10);
+    pm->set_max_connections_per_ip(10);
+
+    std::vector<std::shared_ptr<TestPeerConn>> peers;
+    for (int i = 1; i <= 6; ++i) {
+        std::string suffix = "p" + std::to_string(i);
+        std::string addr = "1.2.3." + std::to_string(i) + ":6881";
+        auto pid = test_peer_id(suffix);
+        auto conn = make_test_conn(io, addr, pid, 0, 100);
+        conn->peer_is_interested(true);
+        ASSERT_TRUE(pm->add_connection(conn->peer_id(), conn));
+        peers.push_back(conn);
+    }
+
+    asio::co_spawn(io, pm->choke_loop(), asio::detached);
+    io.run_for(std::chrono::milliseconds(200));
+    pm->cancel();
+    io.run_for(std::chrono::milliseconds(5));
+
+    auto unchoked = pm->get_unchoked_peers();
+    EXPECT_EQ(unchoked.size(), 4)
+        << "After optimistic rotation, should have 4 unchoked peers (3 regular + 1 optimistic)";
+}
+
+TEST(ChokingAlgorithmTest, PreviousOptimisticPeerIsChokedOnRotation) {
+    asio::io_context io;
+    auto state = make_test_state();
+    auto pm = std::make_shared<PeerManager>(io, state, std::chrono::milliseconds(50));
+    pm->set_max_total_connections(10);
+    pm->set_max_connections_per_ip(10);
+
+    std::vector<std::shared_ptr<TestPeerConn>> peers;
+    for (int i = 1; i <= 6; ++i) {
+        std::string suffix = "p" + std::to_string(i);
+        std::string addr = "1.2.3." + std::to_string(i) + ":6881";
+        auto pid = test_peer_id(suffix);
+        auto conn = make_test_conn(io, addr, pid, 0, 100);
+        conn->peer_is_interested(true);
+        ASSERT_TRUE(pm->add_connection(conn->peer_id(), conn));
+        peers.push_back(conn);
+    }
+
+    asio::co_spawn(io, pm->choke_loop(), asio::detached);
+    io.run_for(std::chrono::milliseconds(350));
+    pm->cancel();
+    io.run_for(std::chrono::milliseconds(5));
+
+    auto unchoked = pm->get_unchoked_peers();
+    EXPECT_EQ(unchoked.size(), 4)
+        << "After multiple rotations, exactly 4 peers should be unchoked";
+}

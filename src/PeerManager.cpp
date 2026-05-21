@@ -5,7 +5,7 @@
 #include <limits>
 #include <random>
 
-PeerManager::PeerManager(asio::io_context& io_context, std::shared_ptr<SessionState> state, std::chrono::seconds choke_interval) noexcept
+PeerManager::PeerManager(asio::io_context& io_context, std::shared_ptr<SessionState> state, std::chrono::milliseconds choke_interval) noexcept
     : io_context_(io_context), strand_(asio::make_strand(io_context)), pex_timer_(io_context_), choke_timer_(io_context_),
     state_(state), choke_interval_(choke_interval), backoff_retry_timer_(io_context_), ban_cleanup_timer_(io_context_)
 {}
@@ -203,98 +203,133 @@ void PeerManager::report_connection_failure(const std::string& peer_addr) {
 
 asio::awaitable<void> PeerManager::choke_loop() {
     auto self = shared_from_this();
-
-    std::mt19937 rng(std::chrono::high_resolution_clock::now().time_since_epoch().count());
-
+    std::mt19937 rng(std::random_device{}());
+    
+    static constexpr size_t unchoke_slots = 4;
     std::shared_ptr<PeerConnection> optimistically_unchoked_peer = nullptr;
-    while (!state_->is_download_complete()) {
+
+    auto send_async = [this](auto conn, MessageType type) {
+        asio::co_spawn(io_context_, conn->send_simple_message(type),
+            [type](std::exception_ptr e) {
+                if (!e) return;
+                try { std::rethrow_exception(e); }
+                catch (const std::exception& ex) {
+                    LOGDBG("Failed to send {} in choke loop: {}",
+                           static_cast<int>(type), ex.what());
+                }
+            });
+    };
+
+    while (true) {
         choke_timer_.expires_after(choke_interval_);
-        co_await choke_timer_.async_wait(asio::use_awaitable);
+        boost::system::error_code ec;
+        co_await choke_timer_.async_wait(asio::redirect_error(asio::use_awaitable, ec));
+        if (ec) {
+            break;
+        }
 
         co_await asio::dispatch(strand_, asio::use_awaitable);
         ++choke_loop_counter_;
 
-        std::vector<std::shared_ptr<PeerConnection>> interested_peers;
-        std::ranges::copy(
-            get_all_connections()
-                | std::views::filter([](const std::shared_ptr<PeerConnection>& conn) {
-                    return conn->peer_is_interested();
-                }),
-            std::back_inserter(interested_peers)
-        );
-        
-        std::sort(interested_peers.begin(), interested_peers.end(), 
-            [] (const auto& a, const auto& b) {
-                return a->bytes_uploaded() > b->bytes_uploaded();
-            }
-        );
+        auto now = std::chrono::steady_clock::now();
+        bool is_seed = state_->is_download_complete();
 
-        const int unchoke_slots = 4;
-        std::vector<std::shared_ptr<PeerConnection>> unchoked_this_round;
-        for (size_t i = 0; i < interested_peers.size() && unchoked_this_round.size() < unchoke_slots - 1; ++i) {
-            auto& conn = interested_peers[i];
-            if (conn->am_choking()) {
-                LOGDBG("Unchoking fast peer {} (uploaded {} bytes)", conn->peer_id(), conn->bytes_uploaded());
-                asio::co_spawn(io_context_, conn->send_simple_message(MessageType::Unchoke), asio::detached);
-                conn->am_choking(false);
+        auto all_peers = get_all_connections();
+
+        std::vector<std::shared_ptr<PeerConnection>> interested;
+        for (auto& conn : all_peers) {
+            if (!conn->peer_is_interested()) {
+                continue;
             }
-            unchoked_this_round.push_back(conn);
+
+            if (!conn->am_choking()) {
+                auto last_data = conn->last_data_received();
+                if (last_data != std::chrono::steady_clock::time_point{} &&
+                    now - last_data > std::chrono::seconds(60)) {
+                    LOGINFO("Anti-snub: choking snubbing peer {} ({}s since last data)",
+                            conn->peer_id(),
+                            static_cast<int>(std::chrono::duration_cast<std::chrono::seconds>(now - last_data).count()));
+                    send_async(conn, MessageType::Choke);
+                    conn->am_choking(true);
+                    continue;
+                }
+            }
+
+            interested.push_back(conn);
+        }
+
+        if (interested.empty()) {
+            continue;
+        }
+
+        if (is_seed) {
+            std::sort(interested.begin(), interested.end(),
+                [](const auto& a, const auto& b) {
+                    return a->bytes_downloaded() > b->bytes_downloaded();
+                });
+        } else {
+            std::sort(interested.begin(), interested.end(),
+                [](const auto& a, const auto& b) {
+                    return a->bytes_uploaded() > b->bytes_uploaded();
+                });
+        }
+
+        std::vector<std::shared_ptr<PeerConnection>> to_unchoke;
+        size_t regular_slots = unchoke_slots - 1;
+        for (size_t i = 0; i < interested.size() && to_unchoke.size() < regular_slots; ++i) {
+            to_unchoke.push_back(interested[i]);
         }
 
         if (choke_loop_counter_ % 3 == 0) {
-            if (optimistically_unchoked_peer && optimistically_unchoked_peer->am_choking() == false) {
-                bool is_top_peer = std::ranges::any_of(unchoked_this_round, 
-                                                       [&optimistically_unchoked_peer](const std::shared_ptr<PeerConnection>& top_peer) {
-                                                           return top_peer->peer_id() == optimistically_unchoked_peer->peer_id();
-                                                       });
-
-                if (!is_top_peer) {
-                    LOGINFO("Re-choking previous optimistic peer {}", optimistically_unchoked_peer->peer_id());
-                    asio::co_spawn(io_context_, optimistically_unchoked_peer->send_simple_message(MessageType::Choke), asio::detached);
+            if (optimistically_unchoked_peer) {
+                bool still_in_top = std::ranges::any_of(to_unchoke,
+                    [&](const auto& p) { return p->peer_id() == optimistically_unchoked_peer->peer_id(); });
+                if (!still_in_top && !optimistically_unchoked_peer->am_choking()) {
+                    LOGINFO("Rotating optimistic unchoke: choking previous peer {}",
+                            optimistically_unchoked_peer->peer_id());
+                    send_async(optimistically_unchoked_peer, MessageType::Choke);
                     optimistically_unchoked_peer->am_choking(true);
                 }
             }
 
             std::vector<std::shared_ptr<PeerConnection>> candidates;
-            std::ranges::copy(
-                interested_peers
-                    | std::views::filter([](const std::shared_ptr<PeerConnection>& peer) {
-                        return peer->am_choking();
-                    }),
-                std::back_inserter(candidates)
-            );
+            std::ranges::copy_if(interested, std::back_inserter(candidates),
+                [](const auto& p) { return p->am_choking(); });
 
             if (!candidates.empty()) {
                 std::uniform_int_distribution<size_t> dist(0, candidates.size() - 1);
-                auto& new_optimistic_peer = candidates[dist(rng)];
-
-                LOGINFO("Optimistically unchoking peer {}", new_optimistic_peer->peer_id());
-                asio::co_spawn(io_context_, new_optimistic_peer->send_simple_message(MessageType::Unchoke), asio::detached);
-                new_optimistic_peer->am_choking(false);
-
-                optimistically_unchoked_peer = new_optimistic_peer;
-                unchoked_this_round.push_back(new_optimistic_peer);
+                optimistically_unchoked_peer = candidates[dist(rng)];
+                LOGINFO("Optimistically unchoking peer {}", optimistically_unchoked_peer->peer_id());
+                to_unchoke.push_back(optimistically_unchoked_peer);
             }
         } else if (optimistically_unchoked_peer) {
-            unchoked_this_round.push_back(optimistically_unchoked_peer);
-        }
-
-        for (const auto& peer : interested_peers) {
-            bool should_be_unchoked = std::ranges::any_of(unchoked_this_round, 
-                                                         [&peer](const std::shared_ptr<PeerConnection>& unchoked_peer) {
-                                                             return unchoked_peer->peer_id() == peer->peer_id();
-                                                         });
-
-            if (!should_be_unchoked && !peer->am_choking()) {
-                LOGDBG("Choking slow/non-optimistic peer {}", peer->peer_id());
-                asio::co_spawn(io_context_, peer->send_simple_message(MessageType::Choke), asio::detached);
-                peer->am_choking(true);
+            bool still_interested = std::ranges::any_of(interested,
+                [&](const auto& p) { return p->peer_id() == optimistically_unchoked_peer->peer_id(); });
+            if (still_interested) {
+                to_unchoke.push_back(optimistically_unchoked_peer);
+            } else {
+                optimistically_unchoked_peer = nullptr;
             }
         }
 
-        std::ranges::for_each(get_all_connections(), 
-            [] (const auto& conn) {
-                conn->bytes_uploaded(0);
+        for (auto& conn : interested) {
+            bool should_unchoke = std::ranges::any_of(to_unchoke,
+                [&](const auto& p) { return p->peer_id() == conn->peer_id(); });
+
+            if (should_unchoke && conn->am_choking()) {
+                LOGDBG("Unchoking peer {} (mode: {})", conn->peer_id(), is_seed ? "seed" : "leech");
+                send_async(conn, MessageType::Unchoke);
+                conn->am_choking(false);
+            } else if (!should_unchoke && !conn->am_choking()) {
+                LOGDBG("Choking peer {}", conn->peer_id());
+                send_async(conn, MessageType::Choke);
+                conn->am_choking(true);
+            }
+        }
+
+        std::ranges::for_each(all_peers, [](auto& conn) {
+            conn->bytes_uploaded(0);
+            conn->bytes_downloaded(0);
         });
     }
 }

@@ -4,6 +4,7 @@
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/steady_timer.hpp>
 #include <boost/asio/strand.hpp>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -75,6 +76,9 @@ public:
     void bytes_uploaded(uint64_t val) noexcept { bytes_uploaded_.store(val, std::memory_order_relaxed); }
     void add_bytes_downloaded(uint64_t val) noexcept { bytes_downloaded_.fetch_add(val, std::memory_order_relaxed); } 
     void add_bytes_uploaded(uint64_t val) noexcept { bytes_uploaded_.fetch_add(val, std::memory_order_relaxed); }
+
+    std::chrono::steady_clock::time_point last_data_received() const noexcept { return last_data_received_; }
+    void last_data_received(std::chrono::steady_clock::time_point tp) noexcept { last_data_received_ = tp; }
     
     ExtendedMessageType extension_type(uint8_t index) const noexcept {
         std::lock_guard lock(mutex_);
@@ -177,6 +181,8 @@ private:
 
     std::atomic_uint64_t bytes_downloaded_{0};
     std::atomic_uint64_t bytes_uploaded_{0};
+
+    std::chrono::steady_clock::time_point last_data_received_{};
 
     mutable std::mutex mutex_;
 };

@@ -276,3 +276,37 @@
 - 165 tests pass (0 new ClientApp unit tests yet; existing tests unchanged)
 - All 165 non-integration tests pass (filter: `-IntegrationTest.*:DHTNetworkTest.*`)
 - Build: zero warnings with `-Werror`
+
+## Task 8.x: BEP 3 Tit-for-Tat Choking Algorithm (2026-05-21)
+
+### Changes Made
+- **src/PeerConnection.hpp**: Added `#include <chrono>`, `last_data_received_` field (`std::chrono::steady_clock::time_point`), `last_data_received()` getter/setter pair
+- **src/PeerManager.hpp**: Changed `choke_interval` constructor parameter from `std::chrono::seconds` to `std::chrono::milliseconds` (allows sub-second intervals for tests), changed `choke_interval_` member type accordingly
+- **src/PeerManager.cpp**: Rewrote `choke_loop()` with full BEP 3 tit-for-tat:
+  - Rate-based unchoking: sort interested peers by `bytes_uploaded()` (leech) or `bytes_downloaded()` (seed), unchoke top N (4 slots, 3 regular + 1 optimistic)
+  - Optimistic unchoke: every 3rd round (30s at 10s interval), pick a random choked-and-interested peer; track and rotate the previous one
+  - Anti-snubbing: unchoked peers with `last_data_received > 60s` in the past get choked and excluded from the round
+  - Seed mode: when `state_->is_download_complete()`, sort by `bytes_downloaded()` instead of `bytes_uploaded()`
+  - Reciprocation: only unchoke peers where `peer_is_interested() == true`
+  - Infinite loop (was `while(!is_download_complete)`), exits on timer cancel during shutdown
+  - Error-safe sends: `send_async` lambda catches/ignores send failures (needed for tests with unconnected sockets)
+- **src/TorrentSession.cpp**: `on_piece_block()` now calls `conn->last_data_received(now())` for anti-snubbing tracking; choke_loop also spawned for seed mode (moved outside `if(mode_ == Leech)` block)
+- **test/protocol_test.cpp**: 5 new `ChokingAlgorithmTest` tests:
+  - TopUploadersUnchoked: top 3 uploaders unchoked, lowest remains choked
+  - UninterestedPeersNeverUnchoked: uninterested peer stays choked regardless of upload rate
+  - SnubbedPeerGetsChoked: peer with 90s-old `last_data_received` gets choked, peer with 10s-old stays unchoked
+  - OptimisticRotationIncreasesUnchokeCount: after 3 rounds, 4 peers unchoked (3 regular + 1 optimistic)
+  - PreviousOptimisticPeerIsChokedOnRotation: after 6 rounds, invariant of exactly 4 unchoked peers holds
+
+### Key Design Decisions
+- `send_async` helper with std::exception_ptr handler used instead of `asio::detached` — prevents test crashes from unconnected test sockets while logging errors in production
+- Anti-snubbing check happens early in the loop (before rate sorting), so snubbed peers are choked and excluded before the unchoke decision
+- Rate counters (`bytes_uploaded`/`bytes_downloaded`) reset every round after decisions are applied (same as before)
+- Optimistic candidate pool is `interested ∩ choked` — avoids selecting a peer already in the regular top-N
+- In non-rotation rounds, the current optimistic peer is re-added to the unchoke set (unless it was snubbed/disconnected)
+- `last_data_received` initialized to default `TimePoint{}` (epoch) — peers with never-set timestamp are NOT considered snubbed (they may be newly connected)
+
+### Test Results
+- 173 tests pass (168 existing + 5 new choking algorithm tests)
+- ChokingAlgorithmTest timing: ~71ms per fast test (50ms interval + 20ms margin), ~200-351ms for multi-round tests
+- Build: zero warnings with `-Werror`

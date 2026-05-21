@@ -210,8 +210,8 @@ asio::awaitable<void> TorrentSession::run() {
     }, asio::detached);
     asio::co_spawn(strand_, dht_announce_loop(), asio::detached);
     lsd_discovery_->start();
+    asio::co_spawn(io_context_, peer_manager_->choke_loop(), asio::detached);
     if (mode_ == Mode::Leech) {
-        asio::co_spawn(io_context_, peer_manager_->choke_loop(), asio::detached);
         piece_manager_->set_callback([this] (size_t piece_index) 
                                             -> asio::awaitable<std::vector<std::shared_ptr<PeerConnection>>> 
                                         { co_return co_await peer_manager_->available_peers(piece_index); }
@@ -554,6 +554,8 @@ asio::awaitable<void> TorrentSession::await_download_tokens(size_t amount) {
 
 asio::awaitable<void> TorrentSession::on_piece_block(std::shared_ptr<PeerConnection> conn, size_t piece_index, uint32_t begin, std::span<const std::byte> block_data) {
     co_await await_download_tokens(block_data.size());
+
+    conn->last_data_received(std::chrono::steady_clock::now());
 
     if (state_->piece_status(piece_index) == PieceStatus::Have) {
         LOGINFO("Received block for piece {} which is already complete. Sending CANCEL.", piece_index);
