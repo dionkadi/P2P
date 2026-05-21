@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -118,7 +119,8 @@ public:
     }
     
     asio::awaitable<void> send_simple_message(MessageType type);
-    asio::awaitable<void> send_request(size_t index, uint32_t begin, uint32_t length);
+    // Returns true if sent immediately, false if queued due to pipeline limit
+    asio::awaitable<bool> send_request(size_t index, uint32_t begin, uint32_t length);
     asio::awaitable<void> send_piece(size_t index, uint32_t begin, std::span<const std::byte> block_data);
     asio::awaitable<void> send_bitfield(const std::vector<uint8_t>& bitfield_data);
     asio::awaitable<void> send_cancel(size_t index, uint32_t begin, uint32_t length);
@@ -127,8 +129,22 @@ public:
     asio::awaitable<void> send_extended_message(uint8_t type_id, std::span<const std::byte> payload);
     asio::awaitable<void> send_metadata_request(uint8_t ext_id, int piece);
 
+    void flush_pending_requests();
+    void on_request_completed(uint32_t length);
+    void on_request_rejected(uint32_t length);
+    const std::deque<RequestPayload>& pending_requests() const noexcept { return pending_requests_; }
+
     void set_upload_rate(uint64_t bps) noexcept;
     void set_download_rate(uint64_t bps) noexcept;
+
+    // Pipeline state introspection (for testing/monitoring)
+    size_t max_outstanding_requests() const noexcept { return max_outstanding_requests_; }
+    size_t outstanding_request_count() const noexcept { return outstanding_request_count_; }
+    uint64_t total_bytes_requested() const noexcept { return total_bytes_requested_; }
+    uint64_t total_bytes_received() const noexcept { return total_bytes_received_; }
+    size_t pending_request_count() const noexcept { return pending_requests_.size(); }
+
+    static constexpr uint64_t MAX_PIPELINE_BUFFER = 256 * 1024;
 
     bool fast_extension_supported() const noexcept { return fast_extension_supported_; }
     void fast_extension_supported(bool val) noexcept { fast_extension_supported_ = val; }
@@ -155,6 +171,18 @@ protected:
     std::shared_ptr<AsyncRateLimiter<>> upload_limiter_;
     std::shared_ptr<AsyncRateLimiter<>> download_limiter_;
 
+    std::atomic_uint64_t bytes_downloaded_{0};
+    std::atomic_uint64_t bytes_uploaded_{0};
+
+    std::chrono::steady_clock::time_point last_data_received_{};
+
+    // Request pipelining
+    std::deque<RequestPayload> pending_requests_;
+    size_t max_outstanding_requests_ = 5;
+    size_t outstanding_request_count_ = 0;
+    uint64_t total_bytes_requested_ = 0;
+    uint64_t total_bytes_received_ = 0;
+
 private:
     asio::awaitable<bool> perform_handshake(const PeerId& my_peer_id);
     asio::awaitable<void> message_loop();
@@ -176,13 +204,8 @@ private:
     std::once_flag pex_flag_;
     bool supported_pex_;
     bool fast_extension_supported_{false};
-    uint8_t metadata_ext_id_{0};  // 0 = not supported
-    int32_t metadata_size_{0};    // -1 = unknown, 0+ = bytes
-
-    std::atomic_uint64_t bytes_downloaded_{0};
-    std::atomic_uint64_t bytes_uploaded_{0};
-
-    std::chrono::steady_clock::time_point last_data_received_{};
+    uint8_t metadata_ext_id_{0};
+    int32_t metadata_size_{0};
 
     mutable std::mutex mutex_;
 };

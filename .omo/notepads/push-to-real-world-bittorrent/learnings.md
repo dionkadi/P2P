@@ -310,3 +310,44 @@
 - 173 tests pass (168 existing + 5 new choking algorithm tests)
 - ChokingAlgorithmTest timing: ~71ms per fast test (50ms interval + 20ms margin), ~200-351ms for multi-round tests
 - Build: zero warnings with `-Werror`
+
+## Task 9.x: Per-Peer Request Pipelining (2026-05-21)
+
+### Changes Made
+- **src/PeerConnection.hpp**:
+  - Added `#include <deque>` for `std::deque<RequestPayload> pending_requests_`
+  - Changed `send_request()` return type from `void` to `bool` (true=sent, false=queued)
+  - Added `flush_pending_requests()`, `on_request_completed()`, `on_request_rejected()` helper methods
+  - Added `pending_requests()` const getter for disconnect re-queue
+  - Added public pipeline state accessors (`max_outstanding_requests()`, `outstanding_request_count()`, `total_bytes_requested()`, `total_bytes_received()`, `pending_request_count()`)
+  - Made `MAX_PIPELINE_BUFFER` public (256 KB constant)
+  - Made pipeline members (`pending_requests_`, `max_outstanding_requests_`, `outstanding_request_count_`, `total_bytes_requested_`, `total_bytes_received_`) protected instead of private (for TestPeerConn testing)
+
+- **src/PeerConnection.cpp**:
+  - `send_request()`: Checks pipeline limits first (outstanding count >= max_outstanding_requests_ OR pipeline bytes >= MAX_PIPELINE_BUFFER). At limit: pushes to `pending_requests_` deque and returns false. Under limit: sends on wire, increments counters, returns true.
+  - `flush_pending_requests()`: Drains pending queue while slots available, spawns each send as detached coroutine on strand.
+  - `on_request_completed(length)`: Increments `total_bytes_received_`, decrements outstanding count, calls `flush_pending_requests()`.
+  - `on_request_rejected(length)`: Decrements `total_bytes_requested_` (rejected bytes never consumed), decrements outstanding count, calls `flush_pending_requests()`.
+  - PIECE handler in `message_loop()`: Calls `on_request_completed(block_length)` before calling `events_->on_piece_block()` — this frees a pipeline slot before the event handler processes the data.
+  - REJECT handler in `message_loop()`: Calls `on_request_rejected(req.length)` before calling `events_->on_piece_rejected()`.
+  - `send_cancel()`: Checks pending queue first. If found (was never sent), erases and returns without wire cancel. If not found (was already sent), decrements pipeline counters and sends CANCEL on wire.
+
+- **src/TorrentSession.cpp**:
+  - `on_disconnect()`: After cleaning outstanding requests, iterates over `conn->pending_requests()` and re-requests each from another unchoked peer (via `peer_manager_->available_peers()`), tracking in PieceManager's outstanding_requests.
+
+- **test/protocol_test.cpp**:
+  - Added `TestPeerConn::queue_request()`, `TestPeerConn::cancel_and_count()` helpers for synchronous pipeline testing.
+  - 7 new `RequestPipeliningTest` tests: RequestsAreQueuedAtOutstandingLimit, RequestsAreQueuedAtPipelineBufferLimit, QueuedRequestFlushedOnPieceReceived, QueuedRequestFlushedOnRejectReceived, CancelRemovesFromPendingQueue, MultipleRequestsQueuedAndFlushedInOrder, SlotAvailableRequestNotQueued.
+
+### Key Design Decisions
+- Pipeline has TWO limits: outstanding request COUNT (default 5) and pipeline BUFFER (256 KB). Both must be satisfied for a request to go through. This prevents both excessive small requests and large pending data volumes.
+- `on_request_completed`/`on_request_rejected` are called in message_loop BEFORE the event handler — this ensures the slot is freed before any cascading logic.
+- `send_cancel` short-circuits for pending (unsent) requests: no need to send CANCEL on the wire for something that was never sent.
+- `flush_pending_requests()` is a synchronous (non-coroutine) method that spawns detached coroutines for each actual send. This allows it to be called from `on_request_completed`/`on_request_rejected` which are themselves called from the message_loop coroutine.
+- On disconnect, pending requests are re-queued to other unchoked peers via `available_peers()`, matching the same pattern used for REJECT handling and timeout re-requests.
+- `TestPeerConn` gets protected access to pipeline members, plus dedicated `queue_request`/`cancel_and_count` helpers for synchronous testing without socket I/O.
+
+### Test Results
+- 180 tests pass (173 existing + 7 new request pipelining tests)
+- All 7 pipelining tests complete in ~2ms total (all synchronous, no timers or waits)
+- Build: zero warnings with `-Werror`

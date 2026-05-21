@@ -2,6 +2,8 @@
 #include "Bencode.hpp"
 #include "Utils.hpp"
 
+#include <algorithm>
+
 asio::awaitable<std::shared_ptr<PeerConnection>> 
 PeerConnection::create(
     asio::io_context& io_context, AsyncSocket socket, std::string peer_addr,
@@ -223,6 +225,8 @@ asio::awaitable<void> PeerConnection::message_loop() {
                                block_length, block_data.size(), piece_index, piece_begin);
                         break;
                     }
+                    // PIECE received — a request slot just freed up
+                    on_request_completed(block_length);
                     co_await download_limiter_->await_tokens(block_length);
                     co_await events_->on_piece_block(self, piece_index, piece_begin, block_data);
                     break;
@@ -250,6 +254,8 @@ asio::awaitable<void> PeerConnection::message_loop() {
                         break;
                     }
                     RequestPayload req = RequestPayload::deserialize(payload);
+                    // REJECT frees a request slot just like a completed PIECE
+                    on_request_rejected(req.length);
                     co_await events_->on_piece_rejected(self, req.index, req.begin, req.length);
                     break;
                 }
@@ -312,11 +318,74 @@ asio::awaitable<void> PeerConnection::send_simple_message(MessageType type) {
     co_await socket_.send_message(msg_body);
 }
 
-asio::awaitable<void> PeerConnection::send_request(size_t index, uint32_t begin, uint32_t length) {
+asio::awaitable<bool> PeerConnection::send_request(size_t index, uint32_t begin, uint32_t length) {
+    // Check pipeline limits
+    uint64_t pipeline_bytes = total_bytes_requested_ - total_bytes_received_;
+    if (outstanding_request_count_ >= max_outstanding_requests_ ||
+        pipeline_bytes >= MAX_PIPELINE_BUFFER) {
+        // At limit — queue for later
+        pending_requests_.push_back({static_cast<uint32_t>(index), begin, length});
+        co_return false;
+    }
+
+    // Slot available — send immediately
     std::vector<std::byte> msg_body(1, static_cast<std::byte>(MessageType::Request));
     auto payload = RequestPayload::serialize(index, begin, length);
     msg_body.insert(msg_body.end(), payload.begin(), payload.end());
     co_await socket_.send_message(msg_body);
+
+    total_bytes_requested_ += length;
+    ++outstanding_request_count_;
+    co_return true;
+}
+
+void PeerConnection::flush_pending_requests() {
+    while (!pending_requests_.empty()) {
+        uint64_t pipeline_bytes = total_bytes_requested_ - total_bytes_received_;
+        if (outstanding_request_count_ >= max_outstanding_requests_ ||
+            pipeline_bytes >= MAX_PIPELINE_BUFFER) {
+            break;  // still at limit
+        }
+
+        auto req = pending_requests_.front();
+        pending_requests_.pop_front();
+
+        // Spawn the actual send (non-blocking)
+        auto self = shared_from_this();
+        asio::co_spawn(strand_,
+            [self, req]() -> asio::awaitable<void> {
+                std::vector<std::byte> msg_body(1, static_cast<std::byte>(MessageType::Request));
+                auto payload = RequestPayload::serialize(req.index, req.begin, req.length);
+                msg_body.insert(msg_body.end(), payload.begin(), payload.end());
+                co_await self->socket_.send_message(msg_body);
+            },
+            asio::detached
+        );
+
+        total_bytes_requested_ += req.length;
+        ++outstanding_request_count_;
+    }
+}
+
+void PeerConnection::on_request_completed(uint32_t length) {
+    total_bytes_received_ += length;
+    if (outstanding_request_count_ > 0) {
+        --outstanding_request_count_;
+    }
+    flush_pending_requests();
+}
+
+void PeerConnection::on_request_rejected(uint32_t length) {
+    // A rejected request never fulfilled — remove from requested bytes
+    if (total_bytes_requested_ >= length) {
+        total_bytes_requested_ -= length;
+    } else {
+        total_bytes_requested_ = 0;
+    }
+    if (outstanding_request_count_ > 0) {
+        --outstanding_request_count_;
+    }
+    flush_pending_requests();
 }
 
 asio::awaitable<void> PeerConnection::send_piece(size_t index, uint32_t begin, std::span<const std::byte> block_data) {
@@ -335,6 +404,25 @@ asio::awaitable<void> PeerConnection::send_bitfield(const std::vector<uint8_t>& 
 }
 
 asio::awaitable<void> PeerConnection::send_cancel(size_t index, uint32_t begin, uint32_t length) {
+    auto it = std::ranges::find_if(pending_requests_, [&](const RequestPayload& r) {
+        return r.index == index && r.begin == begin && r.length == length;
+    });
+    if (it != pending_requests_.end()) {
+        // Request was never sent (still queued) — just remove it, no wire cancel needed
+        pending_requests_.erase(it);
+        co_return;
+    }
+
+    // Request was already sent — adjust pipeline tracking and send cancel on wire
+    if (outstanding_request_count_ > 0) {
+        --outstanding_request_count_;
+    }
+    if (total_bytes_requested_ >= length) {
+        total_bytes_requested_ -= length;
+    } else {
+        total_bytes_requested_ = 0;
+    }
+
     std::vector<std::byte> msg_body(1, static_cast<std::byte>(MessageType::Cancel));
     auto payload = RequestPayload::serialize(index, begin, length);
     msg_body.insert(msg_body.end(), payload.begin(), payload.end());

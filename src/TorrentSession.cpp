@@ -792,6 +792,29 @@ asio::awaitable<void> TorrentSession::on_disconnect(std::shared_ptr<PeerConnecti
         }
     }
 
+    // Re-queue any pending (unsent) requests for other peers
+    for (const auto& req : conn->pending_requests()) {
+        auto progress = piece_manager_->in_progress_piece(req.index);
+        if (!progress) {
+            continue;
+        }
+        uint32_t block_index = req.begin / BLOCK_SIZE;
+        if (block_index >= progress->total_blocks || progress->blocks_received[block_index]) {
+            continue;
+        }
+        auto available_peers = co_await peer_manager_->available_peers(req.index);
+        for (const auto& peer : available_peers) {
+            if (!peer->peer_is_choking()) {
+                co_await peer->send_request(req.index, req.begin, req.length);
+                if (block_index < progress->outstanding_requests.size()) {
+                    progress->outstanding_requests[block_index].push_back(peer->peer_id());
+                    progress->request_times[block_index] = std::chrono::steady_clock::now();
+                }
+                break;
+            }
+        }
+    }
+
     try {
         auto [ip, port] = decode_address(conn->peer_addr());
         auto peer_ip = asio::ip::make_address_v4(ip);

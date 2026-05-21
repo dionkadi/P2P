@@ -65,7 +65,7 @@ Ship a production-quality CLI BitTorrent client that can seed/download via `.tor
 - [x] 4.2. Create Multi-Torrent ClientApp Manager
 
 - [x] 5.1. Refine Choking Algorithm (BEP 3 Tit-for-Tat)
-- [ ] 5.2. Implement Request Pipelining Limits
+- [x] 5.2. Implement Request Pipelining Limits
 
 - [ ] 6.1. Fix Tracker Seeder/Leecher Counts and Add Peer Expiration
 
