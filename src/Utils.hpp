@@ -711,7 +711,8 @@ struct InProgressPiece {
 
 enum class Mode {
     Seed,
-    Leech
+    Leech,
+    Hybrid  // Simultaneously seed what we have and download what we need
 };
 
 struct ResumeData {
