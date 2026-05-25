@@ -46,6 +46,8 @@ target_link_libraries(p2p_common PUBLIC
     OpenSSL::Crypto
 )
 
+target_include_directories(p2p_common PUBLIC include)
+
 add_executable(tracker src/main_tracker.cpp)
 add_executable(client src/main_client.cpp)
 
