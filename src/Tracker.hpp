@@ -184,6 +184,12 @@ public:
 
     int get_interval() const noexcept { return interval_; }
 
+    auto& get_strand() noexcept { return strand_; }
+
+    // UI counters
+    std::atomic<uint64_t> announce_count_{0};
+    std::atomic<uint64_t> scrape_count_{0};
+
 private:
     asio::awaitable<void> udp_listen_loop(int port);
     asio::awaitable<void> handle_udp_request(asio::ip::udp::endpoint remote_endpoint, std::span<const char> request, asio::ip::udp::socket& socket);
@@ -334,6 +340,8 @@ inline HttpHandler Tracker::create_announce_handler() {
             std::memcpy(&compact_peer_addr[0], ip_bytes.data(), 4);
             std::memcpy(&compact_peer_addr[4], &port_net, 2);
             
+            announce_count_.fetch_add(1, std::memory_order_relaxed);
+
             co_await asio::dispatch(strand_, asio::use_awaitable);
 
             if (event == "stopped") {
@@ -485,6 +493,8 @@ inline asio::awaitable<void> Tracker::handle_udp_request(asio::ip::udp::endpoint
             uint16_t port_net = htons(be16toh(req->port));
             std::memcpy(&peer_addr[0], ip_bytes.data(), 4);
             std::memcpy(&peer_addr[4], &port_net, 2);
+            announce_count_.fetch_add(1, std::memory_order_relaxed);
+
             LOGINFO("Received UDP Announce from {} for hash {} (left: {})", 
                     remote_endpoint.address().to_string(), Crypto::bytes_to_hex(info_hash_bytes), left);
             
