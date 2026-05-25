@@ -203,21 +203,32 @@ asio::awaitable<void> TorrentSession::run() {
         co_return;
     }
 
-    peer_server_ = std::make_unique<AsyncServerSocket>(io_context_, peer_port_);
     auto self = shared_from_this();
-    asio::co_spawn(self->io_context_, [self]() -> asio::awaitable<void> {
-        LOGINFO("Listening for incoming connections on port {}", self->peer_port_);
-        while (!self->shutting_down_) {
-            try {
-                AsyncSocket new_socket = co_await self->peer_server_->accept();
-                auto endpoint = new_socket.remote_endpoint();
-                std::string addr = endpoint.address().to_string() + ":" + std::to_string(endpoint.port());
-                asio::co_spawn(self->io_context_, self->handle_new_connection(std::move(new_socket), addr), asio::detached);
-            } catch (const std::exception& e) {
-                LOGERR("Error accepting new peer connection: {}", e.what());
-            }
+    {
+        auto server = std::make_unique<AsyncServerSocket>(io_context_, peer_port_);
+        if (server->is_listening()) {
+            peer_server_ = std::move(server);
+        } else {
+            LOGWARN("Could not bind to port {} (already in use?). "
+                    "This torrent will not accept incoming connections.", peer_port_);
         }
-    }, asio::detached);
+    }
+
+    if (peer_server_) {
+        asio::co_spawn(self->io_context_, [self]() -> asio::awaitable<void> {
+            LOGINFO("Listening for incoming connections on port {}", self->peer_port_);
+            while (!self->shutting_down_) {
+                try {
+                    AsyncSocket new_socket = co_await self->peer_server_->accept();
+                    auto endpoint = new_socket.remote_endpoint();
+                    std::string addr = endpoint.address().to_string() + ":" + std::to_string(endpoint.port());
+                    asio::co_spawn(self->io_context_, self->handle_new_connection(std::move(new_socket), addr), asio::detached);
+                } catch (const std::exception& e) {
+                    LOGERR("Error accepting new peer connection: {}", e.what());
+                }
+            }
+        }, asio::detached);
+    }
 
     asio::co_spawn(strand_, tracker_announce_loop(), asio::detached);
 
@@ -407,8 +418,12 @@ asio::awaitable<void> TorrentSession::tracker_announce_loop() {
         boost::system::error_code ec;
         co_await tracker_announce_timer_.async_wait(asio::redirect_error(asio::use_awaitable, ec)); // Wait on timer
         if (ec == asio::error::operation_aborted) {
-            LOGDBG("Tracker announce timer aborted.");
-            co_return; // Likely during shutdown
+            if (shutting_down_) {
+                LOGDBG("Tracker announce timer aborted during shutdown.");
+                co_return;
+            }
+            LOGDBG("Tracker announce timer cancelled (new trackers added), restarting.");
+            continue;
         }
     }
 }
@@ -546,8 +561,12 @@ asio::awaitable<void> TorrentSession::discovered_peers_loop() {
         boost::system::error_code ec;
         co_await discovered_peers_timer_.async_wait(asio::redirect_error(asio::use_awaitable, ec));
         if (ec == asio::error::operation_aborted) {
-            LOGDBG("Discovered peers periodic loop aborted.");
-            co_return;
+            if (shutting_down_) {
+                LOGDBG("Discovered peers periodic loop aborted.");
+                co_return;
+            }
+            LOGDBG("Discovered peers timer cancelled, restarting.");
+            continue;
         }
     }
 }
@@ -573,8 +592,12 @@ asio::awaitable<void> TorrentSession::dht_announce_loop() {
         boost::system::error_code ec;
         co_await dht_announce_timer_.async_wait(asio::redirect_error(asio::use_awaitable, ec));
         if (ec == asio::error::operation_aborted) {
-            LOGDBG("DHT announce timer aborted.");
-            co_return;
+            if (shutting_down_) {
+                LOGDBG("DHT announce timer aborted during shutdown.");
+                co_return;
+            }
+            LOGDBG("DHT announce timer cancelled, restarting.");
+            continue;
         }
     }
 }
