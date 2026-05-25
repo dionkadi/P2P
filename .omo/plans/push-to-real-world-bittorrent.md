@@ -70,7 +70,7 @@ Ship a production-quality CLI BitTorrent client that can seed/download via `.tor
 - [x] 6.1. Fix Tracker Seeder/Leecher Counts and Add Peer Expiration
 
 ## Final Verification Wave
-- [ ] F1. Plan Compliance Audit — oracle
-- [ ] F2. Code Quality Review — unspecified-high
-- [ ] F3. Real Manual QA — unspecified-high
-- [ ] F4. Scope Fidelity Check — deep
+- [x] F1. Plan Compliance Audit — oracle ✅ APPROVE
+- [x] F2. Code Quality Review — unspecified-high ✅ APPROVE (after fixes)
+- [x] F3. Real Manual QA — unspecified-high ✅ APPROVE
+- [x] F4. Scope Fidelity Check — deep ✅ APPROVE
