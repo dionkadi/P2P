@@ -258,7 +258,7 @@ private:
         std::chrono::steady_clock::time_point expiry;
     };
     std::unique_ptr<asio::ip::udp::socket> udp_socket_;
-    std::unordered_map<asio::ip::address, UdpClientInfo> udp_clients_;
+    std::map<asio::ip::udp::endpoint, UdpClientInfo> udp_clients_;
     std::mt19937_64 rng_{std::random_device{}()};
 };
 
@@ -452,7 +452,7 @@ inline asio::awaitable<void> Tracker::handle_udp_request(asio::ip::udp::endpoint
         if (action == 0) {
             LOGINFO("Received UDP Connect request from {}", remote_endpoint.address().to_string());
             uint64_t new_connection_id = rng_();
-            udp_clients_[remote_endpoint.address()] = {
+            udp_clients_[remote_endpoint] = {
                 new_connection_id,
                 std::chrono::steady_clock::now() + std::chrono::minutes(2)
             };
@@ -472,7 +472,7 @@ inline asio::awaitable<void> Tracker::handle_udp_request(asio::ip::udp::endpoint
             auto *req = reinterpret_cast<const UdpAnnounceRequest *>(request.data());
 
             uint64_t received_conn_id = be64toh(req->connection_id);
-            auto it = udp_clients_.find(remote_endpoint.address());
+            auto it = udp_clients_.find(remote_endpoint);
             if (it == udp_clients_.end() || 
                 it->second.connection_id != received_conn_id ||
                 it->second.expiry < std::chrono::steady_clock::now()) 
