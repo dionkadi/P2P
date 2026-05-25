@@ -12,6 +12,7 @@
 #include <random>
 #include <boost/url.hpp>
 #include <boost/asio/experimental/awaitable_operators.hpp>
+#include <boost/beast/ssl.hpp>
 
 #include "Utils.hpp"
 #include "Bencode.hpp"
@@ -75,6 +76,21 @@ private:
     int port_;
 };
 
+class HttpsTrackerClient: public ITrackerClient, public std::enable_shared_from_this<HttpsTrackerClient> {
+public:
+    HttpsTrackerClient(asio::io_context& io_context, std::string host, int port, std::string target)
+        : io_context_(io_context), host_(std::move(host)), target_(std::move(target)), port_(port) {}
+
+    asio::awaitable<TrackerAnnounceResult> announce(const AnnounceRequestParams& params) override;
+    const std::string get_url() const override { return std::format("https://{}:{}", host_, port_); }
+
+private:
+    asio::io_context& io_context_;
+    std::string host_;
+    std::string target_;
+    int port_;
+};
+
 template <typename Cont>
 std::string url_encode(const Cont& value) {
     std::ostringstream escaped;
@@ -89,6 +105,89 @@ std::string url_encode(const Cont& value) {
         }
     }
     return escaped.str();
+}
+
+// Template helper: performs HTTP/HTTPS announce request/response cycle.
+// Works with both beast::tcp_stream and beast::ssl_stream<beast::tcp_stream>.
+template <typename Stream>
+asio::awaitable<TrackerAnnounceResult> http_announce_impl(
+    Stream& stream,
+    const std::string& host,
+    const std::string& target,
+    const AnnounceRequestParams& params)
+{
+    std::stringstream query_ss;
+    query_ss << "info_hash=" << url_encode(params.info_hash_bytes)
+             << "&peer_id=" << url_encode(params.peer_id)
+             << "&port=" << params.port
+             << "&uploaded=" << params.uploaded
+             << "&downloaded=" << params.downloaded
+             << "&left=" << params.left
+             << "&compact=1";
+
+    if (!params.event.empty()) {
+        query_ss << "&event=" << params.event;
+    }
+    std::string full_target = target + "?" + query_ss.str();
+
+    constexpr int max_redirects = 5;
+    for (int redirect = 0; redirect <= max_redirects; ++redirect) {
+        http::request<http::string_body> req{http::verb::get, full_target, 11};
+        req.set(http::field::host, host);
+        req.set(http::field::user_agent, "Cpp-P2P-Client/1.0");
+
+        co_await http::async_write(stream, req, asio::use_awaitable);
+
+        beast::flat_buffer buffer;
+        http::response<http::string_body> res;
+        co_await http::async_read(stream, buffer, res, asio::use_awaitable);
+
+        if (res.result() == http::status::ok) {
+            // Success — parse and return below
+            Value decoded_body = decode({reinterpret_cast<std::byte *>(res.body().data()), res.body().size()});
+            const auto* dict = std::get_if<std::unique_ptr<Dict>>(&decoded_body.get_variant());
+            if (!dict) {
+                throw std::runtime_error("Tracker response body is not a dictionary");
+            }
+
+            TrackerAnnounceResult result;
+            result.interval_seconds = std::get<Integer>((*dict)->at("interval").get_variant());
+            const auto& peers_str = std::get<String>((*dict)->at("peers").get_variant());
+            if (peers_str.length() % 6 != 0) {
+                throw std::runtime_error("Invalid peers list length in tracker response");
+            }
+            for (size_t i = 0; i < peers_str.length(); i += 6) {
+                asio::ip::address_v4::bytes_type ip_bytes;
+                std::copy_n(peers_str.data() + i, 4, ip_bytes.begin());
+
+                uint16_t port_bytes;
+                std::memcpy(&port_bytes, peers_str.data() + i + 4, 2);
+                uint16_t port_host = ntohs(port_bytes);
+                result.peers.push_back(asio::ip::address_v4(ip_bytes).to_string() + ":" + std::to_string(port_host));
+            }
+            co_return result;
+        }
+
+        if (res.result() == http::status::found ||
+            res.result() == http::status::moved_permanently ||
+            res.result() == http::status::temporary_redirect ||
+            res.result() == http::status::permanent_redirect) {
+            auto location = res[http::field::location];
+            if (location.empty()) {
+                throw std::runtime_error("Tracker returned redirect with no Location header");
+            }
+            std::string loc(location);
+            LOGDBG("Tracker redirect ({}): {} -> {}", res.result_int(), full_target, loc);
+            // For same-host path redirects, update target and retry
+            full_target = loc;
+            continue;
+        }
+
+        throw std::runtime_error("Tracker returned non-200 status: " + std::to_string(res.result_int()) +
+                                 " (" + std::string(res.reason()) + ")");
+    }
+
+    throw std::runtime_error("Tracker returned too many redirects (" + std::to_string(max_redirects) + ")");
 }
 
 inline std::shared_ptr<ITrackerClient> create_tracker_client(asio::io_context& io_context, const std::string& tracker_url) {
@@ -128,6 +227,10 @@ inline std::shared_ptr<ITrackerClient> create_tracker_client(asio::io_context& i
     else if (scheme == "http") {
         LOGINFO("Creating HTTP Tracker client for {}:{}", host, port);
         return std::make_shared<HttpTrackerClient>(io_context, host, port, target);
+    }
+    else if (scheme == "https") {
+        LOGINFO("Creating HTTPS Tracker client for {}:{}", host, port);
+        return std::make_shared<HttpsTrackerClient>(io_context, host, port, target);
     }
     else {
         throw std::runtime_error("Unsupported tracker scheme: " + scheme);
@@ -259,73 +362,53 @@ inline asio::awaitable<TrackerAnnounceResult> UdpTrackerClient::announce(const A
 
 inline asio::awaitable<TrackerAnnounceResult> HttpTrackerClient::announce(const AnnounceRequestParams& params) {
     auto self = shared_from_this();
-
     try {
-        std::stringstream query_ss;
-        query_ss << "info_hash=" << url_encode(params.info_hash_bytes)
-                 << "&peer_id=" << url_encode(params.peer_id)
-                 << "&port=" << params.port
-                 << "&uploaded=" << params.uploaded
-                 << "&downloaded=" << params.downloaded
-                 << "&left=" << params.left
-                 << "&compact=1";
-
-        if (!params.event.empty()) {
-            query_ss << "&event=" << params.event;
-        }
-        std::string full_target = target_ + "?" + query_ss.str();
-
         tcp::resolver resolver(io_context_);
         beast::tcp_stream stream(io_context_);
 
         auto const results = co_await resolver.async_resolve(host_, std::to_string(port_), asio::use_awaitable);
-
         stream.expires_after(std::chrono::seconds(30));
         co_await stream.async_connect(results, asio::use_awaitable);
 
-        http::request<http::string_body> req{http::verb::get, full_target, 11};
-        req.set(http::field::host, host_);
-        req.set(http::field::user_agent, "Cpp-P2P-Client/1.0");
+        auto result = co_await http_announce_impl(stream, host_, target_, params);
 
-        co_await http::async_write(stream, req, asio::use_awaitable);
-
-        beast::flat_buffer buffer;
-        http::response<http::string_body> res;
-
-        co_await http::async_read(stream, buffer, res, asio::use_awaitable);
-        
         beast::error_code ec;
         ec = stream.socket().shutdown(tcp::socket::shutdown_both, ec);
-        if(ec && ec != beast::errc::not_connected)
+        if (ec && ec != beast::errc::not_connected)
             throw beast::system_error{ec};
-        if (res.result() != http::status::ok) {
-            throw std::runtime_error("Tracker returned non-200 status: " + std::to_string(res.result_int()));
-        }
-        
-        Value decoded_body = decode({reinterpret_cast<std::byte *>(res.body().data()), res.body().size()});
-        const auto* dict = std::get_if<std::unique_ptr<Dict>>(&decoded_body.get_variant());
-        if (!dict) {
-            throw std::runtime_error("Tracker response body is not a dictionary");
-        }
 
-        TrackerAnnounceResult result;
-        result.interval_seconds = std::get<Integer>((*dict)->at("interval").get_variant());
-        const auto& peers_str = std::get<String>((*dict)->at("peers").get_variant());
-        if (peers_str.length() % 6 != 0) {
-            throw std::runtime_error("Invalid peers list length in tracker response");
-        }
-        for (size_t i = 0; i < peers_str.length(); i += 6) {
-            asio::ip::address_v4::bytes_type ip_bytes;
-            std::copy_n(peers_str.data() + i, 4, ip_bytes.begin());
-            
-            uint16_t port_asio;
-            std::memcpy(&port_asio, peers_str.data() + i + 4, 2);
-            uint16_t port_host = ntohs(port_asio);
-            result.peers.push_back(asio::ip::address_v4(ip_bytes).to_string() + ":" + std::to_string(port_host));
-        }
         co_return result;
     } catch (const std::exception& e) {
         LOGERR("HTTP announce to {} failed: {}", get_url(), e.what());
+        throw;
+    }
+}
+
+inline asio::awaitable<TrackerAnnounceResult> HttpsTrackerClient::announce(const AnnounceRequestParams& params) {
+    auto self = shared_from_this();
+    try {
+        boost::asio::ssl::context ssl_ctx(boost::asio::ssl::context::tlsv12_client);
+        ssl_ctx.set_default_verify_paths();
+        beast::ssl_stream<beast::tcp_stream> stream(io_context_, ssl_ctx);
+
+        if (!SSL_set_tlsext_host_name(stream.native_handle(), host_.c_str())) {
+            beast::error_code ec{static_cast<int>(::ERR_get_error()), asio::error::get_ssl_category()};
+            throw beast::system_error{ec};
+        }
+
+        tcp::resolver resolver(io_context_);
+        auto const results = co_await resolver.async_resolve(host_, std::to_string(port_), asio::use_awaitable);
+        beast::get_lowest_layer(stream).expires_after(std::chrono::seconds(30));
+        co_await beast::get_lowest_layer(stream).async_connect(results, asio::use_awaitable);
+        co_await stream.async_handshake(asio::ssl::stream_base::client);
+
+        auto result = co_await http_announce_impl(stream, host_, target_, params);
+
+        beast::error_code ec;
+        stream.shutdown(ec);
+        co_return result;
+    } catch (const std::exception& e) {
+        LOGERR("HTTPS announce to {} failed: {}", get_url(), e.what());
         throw;
     }
 }
