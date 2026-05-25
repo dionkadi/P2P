@@ -21,7 +21,7 @@ ClientApp::~ClientApp() {
 }
 
 void ClientApp::add_torrent(Mode mode, const std::filesystem::path& torrent_path,
-                            const std::filesystem::path& save_path, uint16_t port) {
+                             const std::filesystem::path& save_path, uint16_t port) {
     PeerId peer_id = generate_id(PEER_ID_PREFIX);
 
     auto session = std::make_shared<TorrentSession>(
@@ -37,15 +37,83 @@ void ClientApp::add_torrent(Mode mode, const std::filesystem::path& torrent_path
     // Inject cached peers for this info_hash (cross-torrent bootstrapping)
     seed_session_from_cache(info_hash, session);
 
-    auto [it, inserted] = torrents_.emplace(info_hash, session);
-    if (!inserted) {
-        LOGWARN("Torrent with info_hash already exists, replacing existing session");
-        asio::co_spawn(io_context_, it->second->stop(), asio::detached);
-        it->second = session;
+    {
+        std::lock_guard lock(torrents_mutex_);
+        auto [it, inserted] = torrents_.emplace(info_hash, session);
+        if (!inserted) {
+            LOGWARN("Torrent with info_hash already exists, replacing existing session");
+            asio::co_spawn(io_context_, it->second->stop(), asio::detached);
+            it->second = session;
+        }
     }
 
     LOGINFO("Added {} torrent: {} on port {}",
-            (mode == Mode::Seed ? "seed" : "download"),
+            (mode == Mode::Seed ? "seed" : (mode == Mode::Hybrid ? "hybrid" : "download")),
+            session->get_display_name(), port);
+}
+
+// Apply file selection to a session's state, marking pieces belonging to
+// deselected files as Skipped so the downloader avoids them.
+static void apply_file_selection(const std::shared_ptr<SessionState>& state,
+                                  const std::vector<bool>& file_selection) {
+    const auto& info = state->torrent_info();
+    if (info.files.size() != file_selection.size()) return;
+    size_t piece_size = info.piece_size;
+    uint64_t file_offset = 0;
+    for (size_t fi = 0; fi < info.files.size(); ++fi) {
+        uint64_t file_start = file_offset;
+        uint64_t file_end = file_offset + info.files[fi].size;
+        size_t start_piece = file_start / piece_size;
+        size_t end_piece = (file_end + piece_size - 1) / piece_size;
+        if (!file_selection[fi]) {
+            state->update_file_stat(fi, false);
+            for (size_t pi = start_piece; pi < end_piece && pi < state->num_pieces(); ++pi) {
+                uint64_t piece_start = pi * piece_size;
+                uint64_t piece_end = piece_start + piece_size;
+                // Only skip pieces fully within deselected files to avoid
+                // corrupting data shared with selected files.
+                if (piece_start >= file_start && piece_end <= file_end) {
+                    state->piece_status(pi, PieceStatus::Skipped);
+                }
+            }
+        }
+        file_offset += info.files[fi].size;
+    }
+}
+
+void ClientApp::add_torrent(Mode mode, const std::filesystem::path& torrent_path,
+                             const std::filesystem::path& save_path, uint16_t port,
+                             const std::vector<bool>& file_selection) {
+    PeerId peer_id = generate_id(PEER_ID_PREFIX);
+
+    auto session = std::make_shared<TorrentSession>(
+        io_context_, peer_id, torrent_path, save_path, port, mode,
+        config_.upload_rate_limit, config_.download_rate_limit
+    );
+
+    // Apply file selection before registering the session
+    if (session->get_state() && !file_selection.empty()) {
+        apply_file_selection(session->get_state(), file_selection);
+    }
+
+    const auto& hash_vec = session->get_info_hash();
+    InfoHash info_hash{};
+    std::copy_n(hash_vec.begin(), std::min(hash_vec.size(), info_hash.size()), info_hash.begin());
+
+    seed_session_from_cache(info_hash, session);
+
+    {
+        std::lock_guard lock(torrents_mutex_);
+        auto [it, inserted] = torrents_.emplace(info_hash, session);
+        if (!inserted) {
+            LOGWARN("Torrent with info_hash already exists, replacing existing session");
+            asio::co_spawn(io_context_, it->second->stop(), asio::detached);
+            it->second = session;
+        }
+    }
+
+    LOGINFO("Added {} torrent: {} on port {}",
+            (mode == Mode::Seed ? "seed" : (mode == Mode::Hybrid ? "hybrid" : "download")),
             session->get_display_name(), port);
 }
 
@@ -68,10 +136,15 @@ void ClientApp::stop_all() {
         return;
     }
 
-    LOGINFO("ClientApp stopping all {} torrent(s)...", torrents_.size());
+    std::map<InfoHash, std::shared_ptr<TorrentSession>> snapshot;
+    {
+        std::lock_guard lock(torrents_mutex_);
+        LOGINFO("ClientApp stopping all {} torrent(s)...", torrents_.size());
+        snapshot = torrents_;
+    }
 
     // Harvest peers from active sessions into cache before stopping
-    for (auto& [hash, session] : torrents_) {
+    for (auto& [hash, session] : snapshot) {
         if (!session) continue;
         auto discovered = session->peer_manager()->get_discovered_peers();
         if (!discovered.empty()) {
@@ -79,7 +152,7 @@ void ClientApp::stop_all() {
         }
     }
 
-    for (auto& [hash, session] : torrents_) {
+    for (auto& [hash, session] : snapshot) {
         if (session) {
             asio::co_spawn(io_context_, session->stop(), asio::detached);
         }
@@ -88,8 +161,8 @@ void ClientApp::stop_all() {
     // Force-stop the io_context after a timeout if graceful shutdown stalls
     // (e.g., pending HTTP tracker requests that never complete)
     std::thread force_stop_thread([this] {
-        // Give shutdown enough time: stop() has a 2s announce timeout + 5s save timeout for leechers.
-        std::this_thread::sleep_for(std::chrono::seconds(15));
+        // Give shutdown enough time: stop() has a 2s announce timeout + 5s save timeout.
+        std::this_thread::sleep_for(std::chrono::seconds(5));
         if (!io_context_.stopped()) {
             io_context_.stop();
         }
@@ -128,7 +201,10 @@ int ClientApp::run() {
         spawn_session(session);
     }
 
-    LOGINFO("ClientApp running {} torrent(s) on io_context...", torrents_.size());
+    {
+        std::lock_guard lock(torrents_mutex_);
+        LOGINFO("ClientApp running {} torrent(s) on io_context...", torrents_.size());
+    }
 
     // Run io_context on hardware concurrency threads
     unsigned int num_threads = std::thread::hardware_concurrency();

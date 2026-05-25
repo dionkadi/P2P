@@ -172,6 +172,21 @@ asio::awaitable<bool> TorrentSession::init() {
         } else {
             co_await piece_manager_->build_piece_rarity();
         }
+
+        // Hybrid mode: after loading resume data, also verify any
+        // existing pieces we already have on disk (beyond what resume
+        // data records) so we seed while downloading the rest.
+        if (mode_ == Mode::Hybrid && !state_->is_download_complete()) {
+            bool all_done = co_await file_manager_->verify_seed_data();
+            if (all_done) {
+                std::ranges::for_each(std::views::iota(0UL, state_->num_pieces()),
+                                      [this](size_t i) { state_->piece_status(i, PieceStatus::Have); });
+                state_->completed_pieces(state_->num_pieces());
+                state_->is_download_complete(true);
+                completion_timer_.cancel();
+                LOGINFO("All pieces verified on disk, nothing to download.");
+            }
+        }
     }
 
     co_return true;
@@ -214,16 +229,16 @@ asio::awaitable<void> TorrentSession::run() {
     asio::co_spawn(strand_, dht_announce_loop(), asio::detached);
     lsd_discovery_->start();
     asio::co_spawn(io_context_, peer_manager_->choke_loop(), asio::detached);
-    if (mode_ == Mode::Leech) {
+    if (mode_ != Mode::Seed) {
         auto self = shared_from_this();
         piece_manager_->set_callback([self] (size_t piece_index) 
-                                            -> asio::awaitable<std::vector<std::shared_ptr<PeerConnection>>> 
-                                        { co_return co_await self->peer_manager_->available_peers(piece_index); }
-                                    );
+                                             -> asio::awaitable<std::vector<std::shared_ptr<PeerConnection>>> 
+                                         { co_return co_await self->peer_manager_->available_peers(piece_index); }
+                                     );
         piece_manager_->set_block_timeout_callback([self](uint32_t piece_index, uint32_t block_index)
-                                                        -> asio::awaitable<void> {
-                                                    co_await self->send_cancel_for_block(piece_index, block_index, PeerId{});
-                                                });
+                                                         -> asio::awaitable<void> {
+                                                     co_await self->send_cancel_for_block(piece_index, block_index, PeerId{});
+                                                 });
         asio::co_spawn(io_context_, piece_manager_->downloader(), asio::detached);
         asio::co_spawn(strand_, periodically_save(), asio::detached);
         asio::co_spawn(strand_, peer_manager_->pex_loop(), asio::detached);
@@ -285,7 +300,7 @@ asio::awaitable<void> TorrentSession::stop() {
         }
     }
 
-    if (mode_ == Mode::Leech) {
+    if (mode_ != Mode::Seed) {
         LOGINFO("Shutdown initiated, saving final progress...");
         asio::steady_timer timer(io_context_);
         timer.expires_after(std::chrono::seconds(5));
@@ -366,6 +381,7 @@ asio::awaitable<void> TorrentSession::handle_new_connection(AsyncSocket socket, 
 }
 
 asio::awaitable<void> TorrentSession::tracker_announce_loop() {
+    auto self = shared_from_this();
     std::string event = "started";
     bool completed_event_sent = false;
     std::random_device rd;
@@ -374,7 +390,7 @@ asio::awaitable<void> TorrentSession::tracker_announce_loop() {
     while (true) {
         bool is_completed = state_->is_download_complete();
 
-        if (is_completed && mode_ != Mode::Seed) {
+        if (is_completed && mode_ == Mode::Leech) {
             LOGINFO("Download complete. Stopping tracker announcements.");
             co_return;
         }
@@ -398,6 +414,7 @@ asio::awaitable<void> TorrentSession::tracker_announce_loop() {
 }
 
 asio::awaitable<void> TorrentSession::announce_tracker_for(std::string event) {
+    auto self = shared_from_this();
     uint64_t left = 0;
     if (state_->is_download_complete()) {
         left = 0; // Seeder or completed download
@@ -483,6 +500,22 @@ asio::awaitable<void> TorrentSession::announce_tracker_for(std::string event) {
     if (!announce_successful) {
         LOGERR("Failed to announce '{}' to any tracker.", event);
     }
+}
+
+void TorrentSession::add_tracker_url(const std::string& url) {
+    auto client = create_tracker_client(io_context_, url);
+    if (!client) {
+        LOGERR("Failed to create tracker client for URL: {}", url);
+        return;
+    }
+    asio::dispatch(strand_, [this, client = std::move(client), url]() mutable {
+        if (tracker_clients_by_tier_.empty()) {
+            tracker_clients_by_tier_.push_back({});
+        }
+        tracker_clients_by_tier_[0].push_back(std::move(client));
+        tracker_announce_timer_.cancel();
+        LOGINFO("Tracker URL added: {}", url);
+    });
 }
 
 asio::awaitable<void> TorrentSession::discovered_peers_loop() {
@@ -1050,7 +1083,7 @@ asio::awaitable<void> TorrentSession::on_extended_message(std::shared_ptr<PeerCo
 
             if (msg_type == 0) {
                 // Request from peer for a metadata piece
-                if (mode_ != Mode::Seed) {
+                if (mode_ != Mode::Seed && mode_ != Mode::Hybrid) {
                     co_return;
                 }
                 const auto& info_bencoded = state_->info().get_info_bencoded();
@@ -1477,6 +1510,24 @@ asio::awaitable<void> TorrentSession::on_metadata_complete() {
             state_->completed_pieces(num_pieces);
             state_->is_download_complete(true);
             co_await piece_manager_->build_piece_rarity();
+        } else if (mode_ == Mode::Hybrid) {
+            // Combined approach: preallocate files, then verify any data that may
+            // already exist on disk so we seed while downloading the rest.
+            if (!co_await file_manager_->preallocate_files()) {
+                LOGERR("Failed to preallocate files after metadata download");
+                co_return;
+            }
+            bool all_verified = co_await file_manager_->verify_seed_data();
+            if (all_verified) {
+                std::ranges::for_each(std::views::iota(0UL, num_pieces),
+                                      [this](size_t i) { state_->piece_status(i, PieceStatus::Have); });
+                state_->completed_pieces(num_pieces);
+                state_->is_download_complete(true);
+                LOGINFO("Metadata received: all pieces verified on disk.");
+            } else {
+                co_await piece_manager_->build_piece_rarity();
+                LOGINFO("Metadata received: partial data on disk, downloading remaining pieces.");
+            }
         } else {
             if (!co_await file_manager_->preallocate_files()) {
                 LOGERR("Failed to preallocate files after metadata download");
@@ -1486,7 +1537,7 @@ asio::awaitable<void> TorrentSession::on_metadata_complete() {
         }
 
         // Start download loops that were skipped in init()
-        if (mode_ == Mode::Leech) {
+        if (mode_ != Mode::Seed) {
             auto meta_self = shared_from_this();
             asio::co_spawn(io_context_, peer_manager_->choke_loop(), asio::detached);
             piece_manager_->set_callback([meta_self](size_t piece_index)

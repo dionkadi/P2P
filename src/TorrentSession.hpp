@@ -64,6 +64,8 @@ public:
     const TorrentInfo& get_torrent_info() const noexcept { return state_->torrent_info(); }
     const std::string& get_display_name() const noexcept { return state_->torrent_info().name; }
 
+    void add_tracker_url(const std::string& url);
+
     // IPeerConnectionEvents implementation
     asio::awaitable<void> on_piece_block(std::shared_ptr<PeerConnection> conn, size_t piece_index, uint32_t begin, std::span<const std::byte> block_data) override;
     asio::awaitable<void> on_block_request(std::shared_ptr<PeerConnection> conn, size_t piece_index, uint32_t begin, uint32_t length) override;
