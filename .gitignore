@@ -3,3 +3,4 @@ logs
 data
 .cache
 .vscode
+.omo/run-continuation/
