@@ -122,9 +122,45 @@ private:
 class AsyncServerSocket {
 public:
     explicit AsyncServerSocket(asio::io_context& io_context, int port) noexcept
-        : acceptor_(io_context, {asio::ip::tcp::v4(), static_cast<asio::ip::port_type>(port)}) 
-    {    
-        acceptor_.set_option(asio::ip::tcp::acceptor::reuse_address(true));
+        : acceptor_(io_context)
+    {
+        boost::system::error_code ec;
+
+        acceptor_.open(asio::ip::tcp::v4(), ec);
+        if (ec) {
+            LOGERR("Failed to open TCP acceptor: {}", ec.message());
+            return;
+        }
+
+        // SO_REUSEPORT (Linux 3.9+) — allows multiple sockets on the same port.
+        // The kernel distributes incoming connections among them. Must be set
+        // on EVERY socket (including the first) before bind().
+        {
+            int reuse_port = 1;
+            if (::setsockopt(acceptor_.native_handle(), SOL_SOCKET, SO_REUSEPORT,
+                             &reuse_port, sizeof(reuse_port)) < 0) {
+                // Non-Linux or old kernel — not fatal, just means only the
+                // first session can bind; subsequent sessions fall back
+                // gracefully in TorrentSession::run().
+                LOGWARN("SO_REUSEPORT not available (non-Linux/old kernel), "
+                        "multi-torrent on same port limited");
+            }
+        }
+
+        acceptor_.set_option(asio::ip::tcp::acceptor::reuse_address(true), ec);
+
+        acceptor_.bind({asio::ip::tcp::v4(), static_cast<asio::ip::port_type>(port)}, ec);
+        if (ec) {
+            LOGERR("Failed to bind to port {}: {}", port, ec.message());
+            return;
+        }
+
+        acceptor_.listen(asio::socket_base::max_listen_connections, ec);
+        if (ec) {
+            LOGERR("Failed to listen on port {}: {}", port, ec.message());
+            return;
+        }
+
         LOGINFO("Server listening on port {}", port);
     }
 
@@ -132,6 +168,10 @@ public:
     AsyncServerSocket& operator=(const AsyncServerSocket&) = delete;
     AsyncServerSocket(AsyncServerSocket&&) noexcept = default;
     AsyncServerSocket& operator=(AsyncServerSocket&&) noexcept = default;
+
+    bool is_listening() const noexcept {
+        return acceptor_.is_open();
+    }
 
     asio::awaitable<AsyncSocket> accept() {
         asio::ip::tcp::socket socket = co_await acceptor_.async_accept(asio::use_awaitable);
@@ -159,6 +199,10 @@ public:
     {
         if (port > 0) {
             socket_.open(udp::v4());
+            // SO_REUSEPORT — allows multiple DHT nodes on the same port
+            int reuse_port = 1;
+            ::setsockopt(socket_.native_handle(), SOL_SOCKET, SO_REUSEPORT,
+                         &reuse_port, sizeof(reuse_port));
             socket_.bind(udp::endpoint(udp::v4(), port));
             LOGINFO("UDP socket bound to port {}", port);
         }
