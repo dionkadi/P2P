@@ -1,14 +1,22 @@
 #include "ClientApp.hpp"
 #include "ClientConfig.hpp"
+#include "MagnetUri.hpp"
 #include "TorrentFile.hpp"
 #include "Utils.hpp"
 
 #include <argparse.hpp>
 #include <progress_bar.hpp>
 
+#include <boost/asio.hpp>
+#include <boost/beast/core.hpp>
+#include <boost/beast/http.hpp>
+#include <boost/beast/ssl.hpp>
+#include <boost/url.hpp>
+
 #include <atomic>
 #include <csignal>
 #include <cstddef>
+#include <cstdlib>
 #include <cstdint>
 #include <exception>
 #include <filesystem>
@@ -42,15 +50,6 @@ static std::string trim(std::string s) {
     return s.substr(start, end - start + 1);
 }
 
-static std::vector<FileInfo> peek_file_list(const std::filesystem::path& torrent_path) {
-    MetaInfo meta;
-    std::vector<std::vector<std::string>> tiers;
-    if (!meta.load_from_file(torrent_path.string(), tiers)) {
-        return {};
-    }
-    return meta.get_torrent_info().files;
-}
-
 // RAII terminal raw mode: disables echo and canonical (line-buffered) input
 // so we can read keystrokes character-by-character. Keeps ISIG so CTRL+C
 // still sends SIGINT for graceful shutdown.
@@ -77,6 +76,80 @@ public:
     ~ScopedRawTerminal() { disable(); }
 };
 
+// Template helper: performs HTTP GET and parses tracker lines from response body.
+// Works with both beast::tcp_stream and beast::ssl_stream<beast::tcp_stream>.
+template <typename Stream>
+static std::vector<std::string> http_get_trackers(Stream& stream, const std::string& host, const std::string& target) {
+    http::request<http::string_body> req{http::verb::get, target, 11};
+    req.set(http::field::host, host);
+    req.set(http::field::user_agent, "Cpp-P2P-Client/1.0");
+    http::write(stream, req);
+
+    beast::flat_buffer buffer;
+    http::response<http::string_body> res;
+    http::read(stream, buffer, res);
+
+    if (res.result() != http::status::ok) {
+        LOGWARN("Fetch trackers returned HTTP {}", static_cast<int>(res.result()));
+        return {};
+    }
+
+    std::vector<std::string> trackers;
+    std::istringstream body_stream(res.body());
+    std::string line;
+    while (std::getline(body_stream, line)) {
+        line = trim(line);
+        if (line.empty() || line[0] == '#' || line[0] == '/') continue;
+        if (line.back() == '\r') line.pop_back();
+        trackers.push_back(line);
+    }
+    return trackers;
+}
+
+static std::vector<std::string> fetch_tracker_list(const std::string& url_str) {
+    try {
+        using namespace boost::beast;
+        using tcp = boost::asio::ip::tcp;
+
+        boost::urls::url u(url_str);
+        std::string host = u.host();
+        std::string port = u.has_port() ? std::string(u.port()) : (u.scheme() == "https" ? "443" : "80");
+        std::string target = u.path() + (u.has_query() ? "?" + u.query() : "");
+
+        boost::asio::io_context ioc;
+        tcp::resolver resolver(ioc);
+        auto const results = resolver.resolve(host, port);
+
+        if (u.scheme() == "https") {
+            boost::asio::ssl::context ssl_ctx(boost::asio::ssl::context::tlsv12_client);
+            ssl_ctx.set_default_verify_paths();
+            beast::ssl_stream<beast::tcp_stream> stream(ioc, ssl_ctx);
+
+            if (!SSL_set_tlsext_host_name(stream.native_handle(), host.c_str())) {
+                beast::error_code ec{static_cast<int>(::ERR_get_error()), asio::error::get_ssl_category()};
+                LOGWARN("HTTPS SNI failure for {}: {}", host, ec.message());
+                return {};
+            }
+            beast::get_lowest_layer(stream).connect(results);
+            stream.handshake(asio::ssl::stream_base::client);
+            auto trackers = http_get_trackers(stream, host, target);
+            beast::error_code ec;
+            stream.shutdown(ec);
+            return trackers;
+        } else {
+            beast::tcp_stream stream(ioc);
+            stream.connect(results);
+            auto trackers = http_get_trackers(stream, host, target);
+            beast::error_code ec;
+            stream.socket().shutdown(tcp::socket::shutdown_both, ec);
+            return trackers;
+        }
+    } catch (const std::exception& e) {
+        LOGWARN("Failed to fetch tracker list from {}: {}", url_str, e.what());
+        return {};
+    }
+}
+
 int main(int argc, char* argv[]) {
     using namespace progressbar;
 
@@ -99,8 +172,8 @@ int main(int argc, char* argv[]) {
 
     argparse::ArgumentParser cmd_run("run");
     cmd_run.add_description("Run a torrent (seeds what we have, downloads what we need)");
-    cmd_run.add_argument("torrent").help("Path to .torrent file").required();
-    cmd_run.add_argument("dest").help("Content / destination directory").required();
+    cmd_run.add_argument("torrent").help("Path to .torrent file").default_value(std::string{});
+    cmd_run.add_argument("dest").help("Content / destination directory").default_value(std::string{});
     cmd_run.add_argument("--port").help("Peer listening port").scan<'d', int>().default_value(6881);
     cmd_run.add_argument("--upload-rate").help("Upload rate limit (bytes/s)").scan<'u', uint64_t>().default_value(uint64_t{512 * 1024});
     cmd_run.add_argument("--download-rate").help("Download rate limit (bytes/s)").scan<'u', uint64_t>().default_value(uint64_t{2 * 1024 * 1024});
@@ -186,42 +259,10 @@ int main(int argc, char* argv[]) {
     // ========================================================================
     // RUN command
     // ========================================================================
-    std::filesystem::path torrent_path = cmd_run.get<std::string>("torrent");
-    std::filesystem::path dest_path = cmd_run.get<std::string>("dest");
+    std::string torrent_arg = cmd_run.get<std::string>("torrent");
+    std::string dest_arg = cmd_run.get<std::string>("dest");
     uint16_t port = static_cast<uint16_t>(cmd_run.get<int>("--port"));
-    bool selective = cmd_run.is_used("--selective");
     bool interactive = !cmd_run.is_used("--non-interactive");
-
-    std::vector<bool> file_selection;
-    if (selective) {
-        auto files = peek_file_list(torrent_path);
-        if (files.empty()) {
-            LOGCRITICAL("Failed to read torrent file for selection.");
-            return 1;
-        }
-        std::cout << "\nFiles in torrent:\n";
-        for (size_t i = 0; i < files.size(); ++i) {
-            std::cout << std::format("  [{:3}] {:70} {:>10}\n",
-                                     i, files[i].path.string(), fmt_bytes(files[i].size));
-        }
-        std::cout << "\nSelect files to download (comma/space-separated numbers, or 'all', or 'none'):\n> " << std::flush;
-        std::string line;
-        std::getline(std::cin, line);
-        line = trim(line);
-        file_selection.resize(files.size(), false);
-        if (line == "all") {
-            std::ranges::fill(file_selection, true);
-        } else if (line != "none" && !line.empty()) {
-            for (char& c : line) { if (c == ',') c = ' '; }
-            std::istringstream ss(line);
-            size_t idx;
-            while (ss >> idx) {
-                if (idx < files.size()) file_selection[idx] = true;
-            }
-        }
-        size_t selected = std::ranges::count(file_selection, true);
-        LOGINFO("Selective download: {} of {} files selected.", selected, files.size());
-    }
 
     ClientConfig cfg;
     std::string found_cfg = cli_config_path.empty() ? ClientConfig::find_config_path() : cli_config_path;
@@ -242,36 +283,49 @@ int main(int argc, char* argv[]) {
     cfg.enable_pex = cli_overrides.enable_pex;
 
     ClientApp app(cfg);
-    if (selective && !file_selection.empty()) {
-        app.add_torrent(Mode::Hybrid, torrent_path, dest_path, port, file_selection);
-    } else {
-        app.add_torrent(Mode::Hybrid, torrent_path, dest_path, port);
+    std::string default_download_dir = cfg.download_dir;
+
+    const char* home_dir = std::getenv("HOME");
+    auto state_path = std::filesystem::path(home_dir ? home_dir : ".") / ".config" / "p2p" / "client_state.bencode";
+
+    if (!torrent_arg.empty()) {
+        std::string initial_dest = dest_arg.empty() ? default_download_dir : dest_arg;
+        app.add_torrent(Mode::Hybrid, torrent_arg, initial_dest, port);
+        LOGINFO("Initial torrent: {} -> {}", torrent_arg, initial_dest);
+    } else if (std::filesystem::exists(state_path)) {
+        LOGINFO("Loading client state from {}...", state_path.string());
+        app.load_state(state_path, port);
+        default_download_dir = app.config().download_dir;
     }
 
     // ========================================================================
     // Interactive input with poll-based character reading
     // ========================================================================
     ScopedRawTerminal raw_tty;
-    std::string input_buffer;       // Current line being typed
+    std::string input_buffer;
     std::mutex input_mutex;
-    ProgressLogger command_log;     // Submitted command history
-    std::atomic<bool> input_active{interactive};
+    ProgressLogger command_log;
+    auto input_active = std::make_shared<std::atomic<bool>>(interactive);
+    size_t cursor_pos = 0;
+    std::vector<std::string> cmd_history;
+    size_t history_pos = 0;
 
     if (interactive) {
         raw_tty.enable();
-        command_log.info("Interactive mode. Type 'h' for help, 'q' to quit.");
+        command_log.info("Interactive mode: q=quit, h=help");
 
         std::thread stdin_thread([&app, &input_buffer, &input_mutex, &command_log,
-                                  &input_active, port]() {
-            while (input_active.load()) {
+                                  input_active, port, &default_download_dir,
+                                  &cursor_pos, &cmd_history, &history_pos]() {
+            while (input_active->load()) {
                 struct pollfd pfd = {STDIN_FILENO, POLLIN, 0};
-                int ret = poll(&pfd, 1, 100);
+                int ret = poll(&pfd, 1, 16);
                 if (ret <= 0) continue;
 
                 char buf[64];
                 ssize_t n = read(STDIN_FILENO, buf, sizeof(buf));
                 if (n <= 0) {
-                    if (n == 0) break; // EOF
+                    if (n == 0) break;
                     continue;
                 }
 
@@ -283,15 +337,57 @@ int main(int argc, char* argv[]) {
                         if (c == '\n' || c == '\r') {
                             cmd_line = std::move(input_buffer);
                             input_buffer.clear();
+                            cursor_pos = 0;
                         } else if (c == 127 || c == '\b') {
-                            if (!input_buffer.empty()) input_buffer.pop_back();
+                            if (cursor_pos > 0 && !input_buffer.empty()) {
+                                input_buffer.erase(cursor_pos - 1, 1);
+                                --cursor_pos;
+                            }
+                        } else if (c == '\x1b' && i + 2 < n && buf[i + 1] == '[') {
+                            // Escape sequence: \x1b[<char>
+                            switch (buf[i + 2]) {
+                                case 'A': // Up — history back
+                                    if (!cmd_history.empty()) {
+                                        if (history_pos > 0) {
+                                            --history_pos;
+                                            input_buffer = cmd_history[history_pos];
+                                            cursor_pos = input_buffer.size();
+                                        }
+                                    }
+                                    break;
+                                case 'B': // Down — history forward
+                                    if (history_pos < cmd_history.size()) {
+                                        ++history_pos;
+                                        if (history_pos >= cmd_history.size()) {
+                                            input_buffer.clear();
+                                            cursor_pos = 0;
+                                        } else {
+                                            input_buffer = cmd_history[history_pos];
+                                            cursor_pos = input_buffer.size();
+                                        }
+                                    }
+                                    break;
+                                case 'C': // Right
+                                    if (cursor_pos < input_buffer.size()) ++cursor_pos;
+                                    break;
+                                case 'D': // Left
+                                    if (cursor_pos > 0) --cursor_pos;
+                                    break;
+                            }
+                            i += 2;
                         } else if (c >= 32 && c < 127) {
-                            input_buffer += c;
+                            input_buffer.insert(cursor_pos, 1, c);
+                            ++cursor_pos;
                         }
                     }
                 }
 
                 if (!cmd_line.empty()) {
+                    if (cmd_history.empty() || cmd_history.back() != cmd_line) {
+                        cmd_history.push_back(cmd_line);
+                    }
+                    history_pos = cmd_history.size();
+
                     cmd_line = trim(cmd_line);
                     if (cmd_line.empty()) continue;
 
@@ -300,29 +396,83 @@ int main(int argc, char* argv[]) {
                         app.stop_all();
                         break;
                     } else if (cmd_line == "h" || cmd_line == "help") {
-                        command_log.info("Commands: q=quit, a <torrent> [dest]=add torrent, t <url>=add tracker, h=help");
+                        command_log.info(
+                            "Commands:\n"
+                            "  a <torrent> [dest]  - Add .torrent file\n"
+                            "  m <magnet> [dest]   - Add magnet link\n"
+                            "  d <path>            - Set default download dir\n"
+                            "  t <url>             - Add tracker to all torrents\n"
+                            "  f <url>             - Fetch trackers list from URL\n"
+                            "  s <idx>             - Stop torrent at index\n"
+                            "  r <idx>             - Remove torrent at index\n"
+                            "  q                   - Quit\n"
+                            "  h                   - This help"
+                        );
                     } else if (cmd_line[0] == 'a' && cmd_line.size() > 1) {
                         std::string rest = trim(cmd_line.substr(1));
                         auto space = rest.find(' ');
                         std::string tpath = (space != std::string::npos) ? trim(rest.substr(0, space)) : rest;
-                        std::string dpath = (space != std::string::npos) ? trim(rest.substr(space + 1)) : "./downloads";
+                        std::string dpath = (space != std::string::npos) ? trim(rest.substr(space + 1)) : default_download_dir;
                         if (std::filesystem::exists(tpath)) {
                             app.add_torrent(Mode::Hybrid, tpath, dpath, port);
-                            command_log.info("Torrent added: " + tpath);
+                            command_log.info("Added: " + std::filesystem::path(tpath).filename().string());
                         } else {
                             command_log.warning("File not found: " + tpath);
                         }
+                    } else if (cmd_line[0] == 'm' && cmd_line.size() > 1) {
+                        std::string rest = trim(cmd_line.substr(1));
+                        auto space = rest.find(' ');
+                        std::string magnet = (space != std::string::npos) ? trim(rest.substr(0, space)) : rest;
+                        std::string dpath = (space != std::string::npos) ? trim(rest.substr(space + 1)) : default_download_dir;
+                        try {
+                            app.add_torrent_magnet(magnet, dpath, port);
+                            command_log.info("Magnet torrent added");
+                        } catch (const std::exception& e) {
+                            command_log.warning("Bad magnet URI: " + std::string(e.what()));
+                        }
+                    } else if (cmd_line[0] == 'd' && cmd_line.size() > 1) {
+                        default_download_dir = trim(cmd_line.substr(1));
+                        command_log.info("Default download dir: " + default_download_dir);
                     } else if (cmd_line[0] == 't' && cmd_line.size() > 1) {
                         std::string url = trim(cmd_line.substr(1));
-                        auto sessions = app.torrents();
-                        if (!sessions.empty()) {
-                            sessions.rbegin()->second->add_tracker_url(url);
-                            command_log.info("Tracker added: " + url);
+                        app.add_tracker_to_all(url);
+                        command_log.info("Tracker added to all: " + url);
+                    } else if (cmd_line[0] == 'f' && cmd_line.size() > 1) {
+                        std::string url = trim(cmd_line.substr(1));
+                        command_log.info("Fetching trackers from " + url + " (background)...");
+                        std::thread([url, &command_log, &app]() {
+                            try {
+                                auto trackers = fetch_tracker_list(url);
+                                if (trackers.empty()) {
+                                    command_log.warning("No trackers fetched from " + url);
+                                } else {
+                                    app.add_trackers_to_all(trackers);
+                                    command_log.info(std::format("Fetched {} tracker(s) from {}", trackers.size(), url));
+                                }
+                            } catch (...) {
+                                command_log.warning("Fetch threw for " + url);
+                            }
+                        }).detach();
+                    } else if ((cmd_line[0] == 's' || cmd_line[0] == 'r') && cmd_line.size() > 1) {
+                        std::string idx_str = trim(cmd_line.substr(1));
+                        char* end = nullptr;
+                        long idx = std::strtol(idx_str.c_str(), &end, 10);
+                        if (end == idx_str.c_str() || idx < 0) {
+                            command_log.warning("Usage: " + std::string(1, cmd_line[0]) + " <index>");
                         } else {
-                            command_log.warning("No active torrent sessions.");
+                            auto session = app.torrent_by_index(static_cast<size_t>(idx));
+                            if (!session) {
+                                command_log.warning("No torrent at index " + idx_str);
+                            } else if (cmd_line[0] == 's') {
+                                app.stop_torrent(static_cast<size_t>(idx));
+                                command_log.info("Stopped: " + session->get_display_name());
+                            } else {
+                                app.remove_torrent(static_cast<size_t>(idx));
+                                command_log.info("Removed: " + session->get_display_name());
+                            }
                         }
                     } else {
-                        command_log.warning("Unknown: " + cmd_line + "  (type 'h' for help)");
+                        command_log.warning("Unknown: '" + cmd_line + "'  (type 'h' for help)");
                     }
                 }
             }
@@ -333,7 +483,7 @@ int main(int argc, char* argv[]) {
     // ========================================================================
     // LiveDisplay TUI with panels
     // ========================================================================
-    LiveDisplay display(LiveDisplay::Config{std::chrono::milliseconds(333), false, false});
+    LiveDisplay display(LiveDisplay::Config{std::chrono::milliseconds(50), false, false});
 
     static constexpr double kEmaAlpha = 0.35;
     struct SpeedState {
@@ -347,7 +497,7 @@ int main(int argc, char* argv[]) {
     auto speed = std::make_shared<SpeedState>();
 
     display.add_slot([&app, speed, &input_buffer, &input_mutex,
-                      &command_log, &input_active]() -> std::string {
+                      &command_log, input_active, &cursor_pos]() -> std::string {
         auto now = std::chrono::steady_clock::now();
         size_t term_w = Terminal::width();
         if (term_w < 50) term_w = 50;
@@ -355,6 +505,7 @@ int main(int argc, char* argv[]) {
         // Build torrents panel content
         std::string torrents_body;
         auto torrents = app.torrents();
+        size_t tor_idx = 0;
         for (const auto& [hash, session] : torrents) {
             auto state = session->get_state();
             if (!state) continue;
@@ -391,8 +542,8 @@ int main(int argc, char* argv[]) {
                 torrents_body += Text{" ▓ DOWNLOAD "}.color(style::cyan).bold().str();
             }
 
-            size_t max_name = term_w > 56 ? term_w - 56 : 20;
-            std::string ndisp = name;
+            size_t max_name = term_w > 60 ? term_w - 60 : 20;
+            std::string ndisp = std::format("[{}] {}", tor_idx, name);
             if (count_visible_characters(ndisp) > max_name) {
                 ndisp = truncate(ndisp, max_name > 3 ? max_name - 3 : 0) + "...";
             }
@@ -416,7 +567,7 @@ int main(int argc, char* argv[]) {
             torrents_body += "] ";
 
             torrents_body += Text{std::format("{:5.1f}%", progress)}.color(style::yellow).str() + "  ";
-            torrents_body += Text{std::format("Peers: {}", peers)}.color(style::bright_black).str() + "\n";
+            torrents_body += Text{std::format("Peers: {}", peers)}.color(style::bright_black).str() + " |";
 
             torrents_body += "  ";
             torrents_body += Text{std::format("↓ {}/s", fmt_bytes(static_cast<uint64_t>(speed->down_speed)))}.color(style::blue).str() + "  ";
@@ -426,7 +577,8 @@ int main(int argc, char* argv[]) {
                 size_t needed = state->needed_pieces();
                 torrents_body += std::format("  Remaining: {} pieces", needed);
             }
-            torrents_body += "\n";
+            torrents_body += "\n\n";
+            ++tor_idx;
         }
 
         if (torrents.empty()) {
@@ -439,16 +591,13 @@ int main(int argc, char* argv[]) {
 
         // Build commands panel content
         std::string cmd_body;
-        if (input_active.load()) {
-            // Input line
+        if (input_active->load()) {
             {
                 std::lock_guard lock(input_mutex);
                 cmd_body += "> ";
-                if (!input_buffer.empty()) {
-                    cmd_body += input_buffer;
-                }
-                // Blinking cursor indicator (simulated as a dim underscore)
+                cmd_body += input_buffer.substr(0, cursor_pos);
                 cmd_body += Text{"_"}.color(style::bright_black).str();
+                cmd_body += input_buffer.substr(cursor_pos);
             }
 
             // Rule separator
@@ -474,8 +623,10 @@ int main(int argc, char* argv[]) {
     int result = app.run();
 
     display.stop();
-    input_active.store(false);
+    input_active->store(false);
     raw_tty.disable();
+
+    app.save_state(state_path);
 
     return result;
 }

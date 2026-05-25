@@ -1,7 +1,10 @@
 #include "ClientApp.hpp"
+#include "MagnetUri.hpp"
 
 #include <algorithm>
 #include <cstddef>
+#include <filesystem>
+#include <fstream>
 #include <ranges>
 #include <thread>
 
@@ -36,6 +39,7 @@ void ClientApp::add_torrent(Mode mode, const std::filesystem::path& torrent_path
 
     // Inject cached peers for this info_hash (cross-torrent bootstrapping)
     seed_session_from_cache(info_hash, session);
+    apply_global_trackers(session);
 
     {
         std::lock_guard lock(torrents_mutex_);
@@ -45,6 +49,18 @@ void ClientApp::add_torrent(Mode mode, const std::filesystem::path& torrent_path
             asio::co_spawn(io_context_, it->second->stop(), asio::detached);
             it->second = session;
         }
+    }
+
+    // Spawn the session coroutine immediately (safe even before run())
+    spawn_session(session);
+
+    {
+        std::lock_guard lock(torrents_mutex_);
+        torrent_meta_[info_hash] = TorrentEntry{
+            .source = torrent_path.string(),
+            .save_path = save_path.string(),
+            .is_magnet = false
+        };
     }
 
     LOGINFO("Added {} torrent: {} on port {}",
@@ -101,6 +117,7 @@ void ClientApp::add_torrent(Mode mode, const std::filesystem::path& torrent_path
     std::copy_n(hash_vec.begin(), std::min(hash_vec.size(), info_hash.size()), info_hash.begin());
 
     seed_session_from_cache(info_hash, session);
+    apply_global_trackers(session);
 
     {
         std::lock_guard lock(torrents_mutex_);
@@ -110,6 +127,17 @@ void ClientApp::add_torrent(Mode mode, const std::filesystem::path& torrent_path
             asio::co_spawn(io_context_, it->second->stop(), asio::detached);
             it->second = session;
         }
+    }
+
+    spawn_session(session);
+
+    {
+        std::lock_guard lock(torrents_mutex_);
+        torrent_meta_[info_hash] = TorrentEntry{
+            .source = torrent_path.string(),
+            .save_path = save_path.string(),
+            .is_magnet = false
+        };
     }
 
     LOGINFO("Added {} torrent: {} on port {}",
@@ -191,15 +219,7 @@ void ClientApp::spawn_session(const std::shared_ptr<TorrentSession>& session) {
 int ClientApp::run() {
     setup_signals();
 
-    if (torrents_.empty()) {
-        LOGWARN("No torrents added, nothing to do.");
-        return 0;
-    }
-
-    // Spawn all session coroutines before running io_context
-    for (auto& [hash, session] : torrents_) {
-        spawn_session(session);
-    }
+    // io_context runs even with 0 torrents so interactive commands can add them
 
     {
         std::lock_guard lock(torrents_mutex_);
@@ -258,4 +278,220 @@ void ClientApp::seed_session_from_cache(const InfoHash& hash, std::shared_ptr<To
             session->peer_manager()->add_discovered_peer(ep);
         }
     }
+}
+
+void ClientApp::add_torrent_magnet(const std::string& magnet_uri,
+                                    const std::filesystem::path& save_path,
+                                    uint16_t port) {
+    PeerId peer_id = generate_id(PEER_ID_PREFIX);
+    auto session = TorrentSession::create_from_magnet(
+        io_context_, peer_id, magnet_uri, save_path, port, Mode::Hybrid,
+        config_.upload_rate_limit, config_.download_rate_limit
+    );
+
+    const auto& hash_vec = session->get_info_hash();
+    InfoHash info_hash{};
+    std::copy_n(hash_vec.begin(), std::min(hash_vec.size(), info_hash.size()), info_hash.begin());
+
+    seed_session_from_cache(info_hash, session);
+    apply_global_trackers(session);
+
+    {
+        std::lock_guard lock(torrents_mutex_);
+        auto [it, inserted] = torrents_.emplace(info_hash, session);
+        if (!inserted) {
+            LOGWARN("Torrent with info_hash already exists");
+            return;
+        }
+    }
+
+    {
+        std::lock_guard lock(torrents_mutex_);
+        torrent_meta_[info_hash] = TorrentEntry{
+            .source = magnet_uri,
+            .save_path = save_path.string(),
+            .is_magnet = true
+        };
+    }
+
+    spawn_session(session);
+    LOGINFO("Added magnet torrent: {} on port {}", session->get_display_name(), port);
+}
+
+std::shared_ptr<TorrentSession> ClientApp::torrent_by_index(size_t index) const {
+    std::lock_guard lock(torrents_mutex_);
+    if (index >= torrents_.size()) return nullptr;
+    auto it = torrents_.begin();
+    std::advance(it, index);
+    return it->second;
+}
+
+void ClientApp::stop_torrent(size_t index) {
+    auto session = torrent_by_index(index);
+    if (!session) {
+        LOGWARN("No torrent at index {}", index);
+        return;
+    }
+    LOGINFO("Stopping torrent at index {}: {}", index, session->get_display_name());
+    asio::co_spawn(io_context_, session->stop(), asio::detached);
+}
+
+void ClientApp::remove_torrent(size_t index) {
+    std::shared_ptr<TorrentSession> session;
+    InfoHash hash{};
+    {
+        std::lock_guard lock(torrents_mutex_);
+        if (index >= torrents_.size()) {
+            LOGWARN("No torrent at index {}", index);
+            return;
+        }
+        auto it = torrents_.begin();
+        std::advance(it, index);
+        hash = it->first;
+        session = std::move(it->second);
+        torrents_.erase(it);
+        torrent_meta_.erase(hash);
+    }
+    LOGINFO("Removed torrent: {} (will stop async)", session->get_display_name());
+    asio::co_spawn(io_context_, session->stop(), asio::detached);
+}
+
+void ClientApp::apply_global_trackers(std::shared_ptr<TorrentSession> session) {
+    std::lock_guard lock(torrents_mutex_);
+    for (const auto& url : global_trackers_) {
+        session->add_tracker_url(url);
+    }
+}
+
+void ClientApp::add_tracker_to_all(const std::string& url) {
+    std::lock_guard lock(torrents_mutex_);
+    for (auto& [hash, session] : torrents_) {
+        session->add_tracker_url(url);
+    }
+    if (std::find(global_trackers_.begin(), global_trackers_.end(), url) == global_trackers_.end()) {
+        global_trackers_.push_back(url);
+    }
+    LOGINFO("Added tracker to {} active session(s): {}", torrents_.size(), url);
+}
+
+void ClientApp::add_trackers_to_all(const std::vector<std::string>& urls) {
+    std::lock_guard lock(torrents_mutex_);
+    for (auto& [hash, session] : torrents_) {
+        for (const auto& url : urls) {
+            session->add_tracker_url(url);
+        }
+    }
+    for (const auto& url : urls) {
+        if (std::find(global_trackers_.begin(), global_trackers_.end(), url) == global_trackers_.end()) {
+            global_trackers_.push_back(url);
+        }
+    }
+    LOGINFO("Added {} tracker(s) to {} active session(s)", urls.size(), torrents_.size());
+}
+
+void ClientApp::save_state(const std::filesystem::path& path) const {
+    std::lock_guard lock(torrents_mutex_);
+
+    Dict root;
+    root["download_dir"] = Value{config_.download_dir};
+
+    List torrents_list;
+    for (const auto& [hash, entry] : torrent_meta_) {
+        Dict entry_dict;
+        entry_dict["source"] = Value{entry.source};
+        entry_dict["dest"] = Value{entry.save_path};
+        entry_dict["type"] = Value{entry.is_magnet ? String("magnet") : String("file")};
+        torrents_list.push_back(Value{std::move(entry_dict)});
+    }
+    root["torrents"] = Value{std::move(torrents_list)};
+
+    List trackers_list;
+    for (const auto& url : global_trackers_) {
+        trackers_list.push_back(Value{url});
+    }
+    root["global_trackers"] = Value{std::move(trackers_list)};
+
+    auto encoded = encode(Value{std::move(root)});
+
+    std::filesystem::create_directories(path.parent_path());
+    std::ofstream ofs(path, std::ios::binary);
+    ofs.write(reinterpret_cast<const char*>(encoded.data()), static_cast<std::streamsize>(encoded.size()));
+    LOGINFO("Saved client state to {} ({} torrent(s))", path.string(), torrent_meta_.size());
+}
+
+void ClientApp::load_state(const std::filesystem::path& path, uint16_t port) {
+    std::ifstream ifs(path, std::ios::binary | std::ios::ate);
+    if (!ifs) {
+        LOGWARN("State file not found: {}", path.string());
+        return;
+    }
+    auto size = ifs.tellg();
+    ifs.seekg(0);
+
+    std::vector<std::byte> data(static_cast<size_t>(size));
+    ifs.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(size));
+
+    Value decoded = decode(data);
+    const auto* dict_ptr = std::get_if<std::unique_ptr<Dict>>(&decoded.get_variant());
+    if (!dict_ptr) {
+        LOGWARN("Invalid state file format (not a dict)");
+        return;
+    }
+    const auto& root = **dict_ptr;
+
+    auto dd_it = root.find("download_dir");
+    if (dd_it != root.end()) {
+        const auto* dd = std::get_if<String>(&dd_it->second.get_variant());
+        if (dd) {
+            config_.download_dir = *dd;
+        }
+    }
+
+    auto gt_it = root.find("global_trackers");
+    if (gt_it != root.end()) {
+        const auto* list_ptr = std::get_if<std::unique_ptr<List>>(&gt_it->second.get_variant());
+        if (list_ptr) {
+            for (const auto& entry_val : **list_ptr) {
+                const auto* url = std::get_if<String>(&entry_val.get_variant());
+                if (url) {
+                    global_trackers_.push_back(*url);
+                }
+            }
+            LOGINFO("Restored {} global tracker(s) from state", global_trackers_.size());
+        }
+    }
+
+    auto tr_it = root.find("torrents");
+    if (tr_it == root.end()) return;
+
+    const auto* list_ptr = std::get_if<std::unique_ptr<List>>(&tr_it->second.get_variant());
+    if (!list_ptr) return;
+    const auto& torrents_list = **list_ptr;
+
+    for (const auto& entry_val : torrents_list) {
+        const auto* entry_dict_ptr = std::get_if<std::unique_ptr<Dict>>(&entry_val.get_variant());
+        if (!entry_dict_ptr) continue;
+        const auto& entry = **entry_dict_ptr;
+
+        auto src_it = entry.find("source");
+        auto dest_it = entry.find("dest");
+        auto type_it = entry.find("type");
+        if (src_it == entry.end() || dest_it == entry.end() || type_it == entry.end()) continue;
+
+        const auto* source = std::get_if<String>(&src_it->second.get_variant());
+        const auto* dest = std::get_if<String>(&dest_it->second.get_variant());
+        const auto* type = std::get_if<String>(&type_it->second.get_variant());
+        if (!source || !dest || !type) continue;
+
+        try {
+            if (*type == "magnet") {
+                add_torrent_magnet(*source, *dest, port);
+            } else {
+                add_torrent(Mode::Hybrid, *source, *dest, port);
+            }
+        } catch (const std::exception& e) {
+            LOGWARN("Failed to restore torrent '{}': {}", *source, e.what());
+        }
+    }
+    LOGINFO("Loaded client state from {} ({} torrent(s))", path.string(), torrent_meta_.size());
 }
