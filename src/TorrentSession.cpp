@@ -32,7 +32,8 @@ TorrentSession::TorrentSession(
     }),
     upload_limiter_(io_context, upload_rate_bps),
     download_limiter_(io_context, download_rate_bps),
-    completion_timer_(io_context) 
+    completion_timer_(io_context),
+    tracker_announce_interval_(std::chrono::seconds(1800))
 {
     for (const auto& tier : state_->tracker_tiers()) {
         auto client_tier_view = tier
@@ -87,7 +88,8 @@ TorrentSession::TorrentSession(
     }),
     upload_limiter_(io_context, upload_rate_bps),
     download_limiter_(io_context, download_rate_bps),
-    completion_timer_(io_context)
+    completion_timer_(io_context),
+    tracker_announce_interval_(std::chrono::seconds(1800))
 {
     for (const auto& tier : state_->tracker_tiers()) {
         auto client_tier_view = tier
@@ -187,14 +189,15 @@ asio::awaitable<void> TorrentSession::run() {
     }
 
     peer_server_ = std::make_unique<AsyncServerSocket>(io_context_, peer_port_);
-    asio::co_spawn(io_context_, [this]() -> asio::awaitable<void> {
-        LOGINFO("Listening for incoming connections on port {}", peer_port_);
-        while (!shutting_down_) {
+    auto self = shared_from_this();
+    asio::co_spawn(self->io_context_, [self]() -> asio::awaitable<void> {
+        LOGINFO("Listening for incoming connections on port {}", self->peer_port_);
+        while (!self->shutting_down_) {
             try {
-                AsyncSocket new_socket = co_await peer_server_->accept();
+                AsyncSocket new_socket = co_await self->peer_server_->accept();
                 auto endpoint = new_socket.remote_endpoint();
                 std::string addr = endpoint.address().to_string() + ":" + std::to_string(endpoint.port());
-                asio::co_spawn(io_context_, handle_new_connection(std::move(new_socket), addr), asio::detached);
+                asio::co_spawn(self->io_context_, self->handle_new_connection(std::move(new_socket), addr), asio::detached);
             } catch (const std::exception& e) {
                 LOGERR("Error accepting new peer connection: {}", e.what());
             }
@@ -212,19 +215,23 @@ asio::awaitable<void> TorrentSession::run() {
     lsd_discovery_->start();
     asio::co_spawn(io_context_, peer_manager_->choke_loop(), asio::detached);
     if (mode_ == Mode::Leech) {
-        piece_manager_->set_callback([this] (size_t piece_index) 
+        auto self = shared_from_this();
+        piece_manager_->set_callback([self] (size_t piece_index) 
                                             -> asio::awaitable<std::vector<std::shared_ptr<PeerConnection>>> 
-                                        { co_return co_await peer_manager_->available_peers(piece_index); }
+                                        { co_return co_await self->peer_manager_->available_peers(piece_index); }
                                     );
-        piece_manager_->set_block_timeout_callback([this](uint32_t piece_index, uint32_t block_index)
+        piece_manager_->set_block_timeout_callback([self](uint32_t piece_index, uint32_t block_index)
                                                         -> asio::awaitable<void> {
-                                                    co_await send_cancel_for_block(piece_index, block_index, PeerId{});
+                                                    co_await self->send_cancel_for_block(piece_index, block_index, PeerId{});
                                                 });
         asio::co_spawn(io_context_, piece_manager_->downloader(), asio::detached);
         asio::co_spawn(strand_, periodically_save(), asio::detached);
         asio::co_spawn(strand_, peer_manager_->pex_loop(), asio::detached);
-        asio::co_spawn(strand_, discovered_peers_loop(), asio::detached);
     }
+
+    // discovered_peers_loop runs for both Seed and Leech modes so LSD-discovered
+    // peers are connected to even when there is no tracker.
+    asio::co_spawn(strand_, discovered_peers_loop(), asio::detached);
 
     asio::co_spawn(io_context_, peer_manager_->ban_cleanup_loop(), asio::detached);
 
@@ -265,12 +272,17 @@ asio::awaitable<void> TorrentSession::stop() {
     piece_manager_->signal_shutdown();
     piece_manager_->notify_one();
 
-    asio::steady_timer announce_timeout_timer(io_context_);
-    announce_timeout_timer.expires_after(std::chrono::seconds(2));
-    auto result_announce = co_await (asio::co_spawn(strand_, announce_tracker_for("stopped"), asio::use_awaitable) || announce_timeout_timer.async_wait(asio::use_awaitable));
-    
-    if (result_announce.index() == 1) { // timeout
-        LOGWARN("Sending 'stopped' event to tracker timed out during shutdown.");
+    // Only announce if we actually started tracker communication (peer_server_ was created).
+    // Sessions that find the download already complete from resume data never
+    // spawn tracker_announce_loop() and shouldn't block shutdown here.
+    if (peer_server_) {
+        asio::steady_timer announce_timeout_timer(io_context_);
+        announce_timeout_timer.expires_after(std::chrono::seconds(2));
+        auto result_announce = co_await (asio::co_spawn(strand_, announce_tracker_for("stopped"), asio::use_awaitable) || announce_timeout_timer.async_wait(asio::use_awaitable));
+        
+        if (result_announce.index() == 1) { // timeout
+            LOGWARN("Sending 'stopped' event to tracker timed out during shutdown.");
+        }
     }
 
     if (mode_ == Mode::Leech) {
@@ -292,10 +304,13 @@ asio::awaitable<void> TorrentSession::stop() {
     peer_manager_->close_all();
     peer_manager_->remove_all_connections();
 
-    // if (!io_context_.stopped()) {
-    //     io_context_.stop();
-    //     LOGINFO("io_context stopped by TorrentSession::stop().");
-    // }
+    // Sync-flush remaining dirty cache blocks (safe during shutdown
+    // because it does not dispatch through the io_context).
+    file_manager_->sync_flush_all_dirty();
+
+    // Intentionally NOT stopping the io_context — other sessions may
+    // share this context and need to clean up. Timer cancels and socket
+    // closes above suffice for natural coroutine exit.
 }
 
 asio::awaitable<void> TorrentSession::handle_new_connection(AsyncSocket socket, std::string peer_addr) {
@@ -383,6 +398,15 @@ asio::awaitable<void> TorrentSession::tracker_announce_loop() {
 }
 
 asio::awaitable<void> TorrentSession::announce_tracker_for(std::string event) {
+    uint64_t left = 0;
+    if (state_->is_download_complete()) {
+        left = 0; // Seeder or completed download
+    } else {
+        uint64_t total_size = state_->torrent_info().total_size;
+        uint64_t downloaded = static_cast<uint64_t>(state_->completed_pieces()) * state_->torrent_info().piece_size;
+        left = (downloaded >= total_size) ? 0 : (total_size - downloaded);
+    }
+
     AnnounceRequestParams params {
         .info_hash_bytes = state_->info_hash(),
         .peer_id = my_peer_id_,
@@ -390,7 +414,7 @@ asio::awaitable<void> TorrentSession::announce_tracker_for(std::string event) {
         .port = peer_port_,
         .uploaded = state_->total_bytes_uploaded(),
         .downloaded = state_->total_bytes_downloaded(),
-        .left = state_->torrent_info().total_size - (state_->completed_pieces() * state_->torrent_info().piece_size), // Adjust for last piece
+        .left = left,
     };
 
     bool announce_successful = false;
@@ -423,16 +447,16 @@ asio::awaitable<void> TorrentSession::announce_tracker_for(std::string event) {
                     tracker_backoff_states_[url].on_success();
                 }
                 
-                if (event == "started") {
-                    tracker_announce_interval_ = std::chrono::seconds(result.interval_seconds);
+                tracker_announce_interval_ = std::chrono::seconds(result.interval_seconds);
+                if (event != "stopped") {
                     for (const auto& peer_addr : result.peers) {
                         bool already_connected = peer_manager_->contains_peer_addr(peer_addr);
                         if (!already_connected) {
                             asio::co_spawn(io_context_, 
-                                [peer_addr, this] () -> asio::awaitable<void> {
-                                    auto socket = co_await peer_manager_->connect_to_peer(peer_addr);
+                                [peer_addr, self = shared_from_this()] () -> asio::awaitable<void> {
+                                    auto socket = co_await self->peer_manager_->connect_to_peer(peer_addr);
                                     if (socket) {
-                                        co_await handle_new_connection(std::move(*socket), peer_addr);
+                                        co_await self->handle_new_connection(std::move(*socket), peer_addr);
                                     }
                                 }, 
                                 asio::detached
@@ -466,14 +490,18 @@ asio::awaitable<void> TorrentSession::discovered_peers_loop() {
 
     while (!shutting_down_) {
         for (const auto& ep : peer_manager_->get_discovered_peers()) {
-            std::string addr = std::format("{}:{}", ep.address().to_string(), ep.port());
-            bool already_connected = peer_manager_->contains_peer_addr(addr);
+            std::string ip = ep.address().to_string();
+            std::string addr = std::format("{}:{}", ip, ep.port());
+            // Also check by IP to avoid duplicating an incoming connection that
+            // has a different ephemeral source port.
+            bool already_connected = peer_manager_->contains_peer_addr(addr) ||
+                                     peer_manager_->contains_peer_ip(ip);
             if (!already_connected) {
                 asio::co_spawn(io_context_, 
-                    [addr, this] () -> asio::awaitable<void> {
-                        auto socket = co_await peer_manager_->connect_to_peer(addr);
+                    [addr, self] () -> asio::awaitable<void> {
+                        auto socket = co_await self->peer_manager_->connect_to_peer(addr);
                         if (socket) {
-                            co_await handle_new_connection(std::move(*socket), addr);
+                            co_await self->handle_new_connection(std::move(*socket), addr);
                         }
                     }, 
                     asio::detached
@@ -574,6 +602,7 @@ asio::awaitable<void> TorrentSession::on_piece_block(std::shared_ptr<PeerConnect
 
     // Fast path: check duplicate and write block data under the piece mutex.
     // Hold is brief — no co_await while locked.
+    bool in_endgame = state_->is_in_endgame_mode();
     bool piece_complete = false;
     {
         std::lock_guard lock(progress->piece_mutex_);
@@ -581,15 +610,15 @@ asio::awaitable<void> TorrentSession::on_piece_block(std::shared_ptr<PeerConnect
             co_return; // Invalid or Duplicate
         }
 
-        if (state_->is_in_endgame_mode()) {
-            co_await send_cancel_for_block(piece_index, block_index, conn->peer_id());
-        }
-
         std::ranges::copy(block_data, progress->data.begin() + begin);
         progress->blocks_received[block_index] = true;
         ++progress->received_count;
 
         piece_complete = (progress->received_count == progress->total_blocks);
+    }
+
+    if (in_endgame) {
+        co_await send_cancel_for_block(piece_index, block_index, conn->peer_id());
     }
 
     state_->add_total_bytes_downloaded(block_data.size());
@@ -625,6 +654,7 @@ asio::awaitable<void> TorrentSession::on_piece_block(std::shared_ptr<PeerConnect
         if (state_->completed_pieces() == state_->num_pieces()) {
             state_->is_download_complete(true);
             LOGINFO("🎉 Download complete! File saved to {}", state_->save_path().string());
+            co_await file_manager_->flush();
             LOGINFO("Closing all peer connections...");
             peer_manager_->close_all();
             peer_manager_->remove_all_connections();
@@ -660,10 +690,9 @@ asio::awaitable<void> TorrentSession::on_block_request(std::shared_ptr<PeerConne
         co_return;
     }
 
-    // LOGDBG("TorrentSession: Peer {} requested piece_idx={}, begin={}, length={}", 
-    //         conn->peer_id(), piece_index, begin, length);
-
     co_await await_upload_tokens(length);
+    LOGDBG("TorrentSession: Peer {} requested piece_idx={}, begin={}, length={}", 
+            conn->peer_id(), piece_index, begin, length);
 
     try {
         auto block = co_await file_manager_->read_block(piece_index, begin, length);
@@ -728,6 +757,41 @@ asio::awaitable<void> TorrentSession::on_peer_has_piece(std::shared_ptr<PeerConn
     }
 
     piece_manager_->notify_one();
+}
+
+asio::awaitable<void> TorrentSession::on_peer_has_all(std::shared_ptr<PeerConnection> conn) {
+    // Initialize bitfield if not yet set (HaveAll may arrive before a bitfield message)
+    if (conn->bitfield_size() == 0) {
+        conn->bitfield(std::vector<uint8_t>((state_->num_pieces() + 7) / 8, 0xFF));
+    }
+    for (size_t i = 0; i < state_->num_pieces(); ++i) {
+        conn->set_has_piece(i);
+    }
+
+    bool should_be_interested = false;
+    for (size_t i = 0; i < state_->num_pieces(); ++i) {
+        if (state_->piece_status(i) == PieceStatus::Have) {
+            piece_manager_->add_piece_availability(i, 1);
+            continue;
+        }
+
+        uint32_t old_rarity = piece_manager_->piece_availability(i);
+        piece_manager_->add_piece_availability(i, 1);
+        uint32_t new_rarity = piece_manager_->piece_availability(i);
+        co_await piece_manager_->update_piece_rarity(i, old_rarity, new_rarity);
+        if (state_->piece_status(i) == PieceStatus::Needed) should_be_interested = true;
+    }
+
+    if (should_be_interested && !conn->am_interested()) {
+        conn->am_interested(true);
+        co_await conn->send_simple_message(MessageType::Interested);
+    }
+
+    piece_manager_->notify_one();
+}
+
+asio::awaitable<void> TorrentSession::on_peer_has_none(std::shared_ptr<PeerConnection> conn) {
+    co_return;
 }
 
 asio::awaitable<void> TorrentSession::on_peer_bitfield(std::shared_ptr<PeerConnection> conn, std::span<const std::byte> bitfield) {
@@ -1423,14 +1487,15 @@ asio::awaitable<void> TorrentSession::on_metadata_complete() {
 
         // Start download loops that were skipped in init()
         if (mode_ == Mode::Leech) {
+            auto meta_self = shared_from_this();
             asio::co_spawn(io_context_, peer_manager_->choke_loop(), asio::detached);
-            piece_manager_->set_callback([this](size_t piece_index)
+            piece_manager_->set_callback([meta_self](size_t piece_index)
                 -> asio::awaitable<std::vector<std::shared_ptr<PeerConnection>>> {
-                    co_return co_await peer_manager_->available_peers(piece_index);
+                    co_return co_await meta_self->peer_manager_->available_peers(piece_index);
                 });
-            piece_manager_->set_block_timeout_callback([this](uint32_t piece_index, uint32_t block_index)
+            piece_manager_->set_block_timeout_callback([meta_self](uint32_t piece_index, uint32_t block_index)
                                                             -> asio::awaitable<void> {
-                                                        co_await send_cancel_for_block(piece_index, block_index, PeerId{});
+                                                        co_await meta_self->send_cancel_for_block(piece_index, block_index, PeerId{});
                                                     });
             asio::co_spawn(io_context_, piece_manager_->downloader(), asio::detached);
             asio::co_spawn(strand_, periodically_save(), asio::detached);

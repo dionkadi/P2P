@@ -35,6 +35,14 @@ public:
         size_t piece_index
     ) = 0;
 
+    virtual asio::awaitable<void> on_peer_has_all(
+        std::shared_ptr<PeerConnection> conn
+    ) = 0;
+
+    virtual asio::awaitable<void> on_peer_has_none(
+        std::shared_ptr<PeerConnection> conn
+    ) = 0;
+
     virtual asio::awaitable<void> on_peer_bitfield(
         std::shared_ptr<PeerConnection> conn,
         std::span<const std::byte> bitfield

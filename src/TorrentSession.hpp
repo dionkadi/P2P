@@ -57,6 +57,8 @@ public:
     void set_tracker_announce_interval(std::chrono::seconds interval) { tracker_announce_interval_ = interval; }
 
     const std::shared_ptr<PeerManager>& peer_manager() const noexcept { return peer_manager_; }
+    std::shared_ptr<SessionState> get_state() const noexcept { return state_; }
+    Mode get_mode() const noexcept { return mode_; }
     uint16_t get_port() const noexcept { return peer_port_; }
     const std::vector<std::byte>& get_info_hash() const noexcept { return state_->info_hash(); }
     const TorrentInfo& get_torrent_info() const noexcept { return state_->torrent_info(); }
@@ -66,6 +68,8 @@ public:
     asio::awaitable<void> on_piece_block(std::shared_ptr<PeerConnection> conn, size_t piece_index, uint32_t begin, std::span<const std::byte> block_data) override;
     asio::awaitable<void> on_block_request(std::shared_ptr<PeerConnection> conn, size_t piece_index, uint32_t begin, uint32_t length) override;
     asio::awaitable<void> on_peer_has_piece(std::shared_ptr<PeerConnection> conn, size_t piece_index) override;
+    asio::awaitable<void> on_peer_has_all(std::shared_ptr<PeerConnection> conn) override;
+    asio::awaitable<void> on_peer_has_none(std::shared_ptr<PeerConnection> conn) override;
     asio::awaitable<void> on_peer_bitfield(std::shared_ptr<PeerConnection> conn, std::span<const std::byte> bitfield) override;
     asio::awaitable<void> on_choke_status_changed(std::shared_ptr<PeerConnection> conn, bool is_choking) override;
     asio::awaitable<void> on_piece_rejected(std::shared_ptr<PeerConnection> conn, size_t piece_index, uint32_t begin, uint32_t length) override;
