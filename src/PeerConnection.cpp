@@ -198,6 +198,14 @@ asio::awaitable<void> PeerConnection::message_loop() {
                     // LOGDBG("Peer {} sent NOT INTERESTED. Setting peer_is_interested to false.", peer_id_);
                     peer_is_interested_.store(false, std::memory_order_relaxed);
                     break;
+                case MessageType::HaveAll: {
+                    co_await events_->on_peer_has_all(self);
+                    break;
+                }
+                case MessageType::HaveNone: {
+                    co_await events_->on_peer_has_none(self);
+                    break;
+                }
                 case MessageType::Bitfield: {
                     co_await events_->on_peer_bitfield(self, payload);
                     break;

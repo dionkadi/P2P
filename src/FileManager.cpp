@@ -743,6 +743,10 @@ void FileManager::sync_flush_all_dirty() {
     }
 }
 
+asio::awaitable<void> FileManager::flush() {
+    co_await flush_all_dirty();
+}
+
 asio::awaitable<void> FileManager::flush_all_dirty() {
     std::vector<std::pair<CacheKey, std::vector<std::byte>>> to_flush;
     {

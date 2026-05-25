@@ -67,6 +67,14 @@ public:
     }
     asio::awaitable<std::map<std::string, int64_t>> async_get_file_mtimes();
 
+    // Async flush — safe to call while the io_context is running.
+    asio::awaitable<void> flush();
+
+    // Sync flush — safe to call during shutdown (does not dispatch
+    // through the io_context, so it won't deadlock when the io_context
+    // is being stopped).
+    void sync_flush_all_dirty();
+
 protected:
     virtual asio::awaitable<int> async_prompt(const std::string& question);
     bool auto_approve_all_{true};
@@ -112,7 +120,6 @@ private:
     void touch_cache(const CacheKey& key);
     void evict_if_needed();
     void sync_write_block(const CacheKey& key, const std::vector<std::byte>& data);
-    void sync_flush_all_dirty();
     asio::awaitable<void> flush_all_dirty();
     asio::awaitable<void> periodic_flush();
 };
