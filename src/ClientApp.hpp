@@ -35,6 +35,9 @@ public:
     ClientConfig& config() { return config_; }
     const ClientConfig& config() const { return config_; }
 
+    // Access torrent sessions for UI rendering
+    const auto& torrents() const { return torrents_; }
+
     // Peer cache: cross-torrent known peer sharing
     void add_to_peer_cache(const InfoHash& hash, const EndPoint& ep);
     void add_peers_to_cache(const InfoHash& hash, const std::unordered_set<EndPoint>& peers);

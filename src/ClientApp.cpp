@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <ranges>
+#include <thread>
 
 ClientApp::ClientApp()
     : signals_(io_context_, SIGINT, SIGTERM)
@@ -53,6 +54,10 @@ void ClientApp::setup_signals() {
         if (!ec) {
             LOGINFO("Signal {} received, initiating graceful shutdown...", signal_number);
             stop_all();
+            // Re-arm for subsequent signals (signal_set is one-shot)
+            if (!stopping_.load()) {
+                setup_signals();
+            }
         }
     });
 }
@@ -79,6 +84,17 @@ void ClientApp::stop_all() {
             asio::co_spawn(io_context_, session->stop(), asio::detached);
         }
     }
+
+    // Force-stop the io_context after a timeout if graceful shutdown stalls
+    // (e.g., pending HTTP tracker requests that never complete)
+    std::thread force_stop_thread([this] {
+        // Give shutdown enough time: stop() has a 2s announce timeout + 5s save timeout for leechers.
+        std::this_thread::sleep_for(std::chrono::seconds(15));
+        if (!io_context_.stopped()) {
+            io_context_.stop();
+        }
+    });
+    force_stop_thread.detach();
 }
 
 void ClientApp::spawn_session(const std::shared_ptr<TorrentSession>& session) {
