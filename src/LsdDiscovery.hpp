@@ -148,7 +148,7 @@ private:
 
     static constexpr std::string_view MULTICAST_ADDR = "239.192.152.143";
     static constexpr uint16_t MULTICAST_PORT = 6771;
-    static constexpr auto ANNOUNCE_INTERVAL = 5min;
+    static constexpr auto ANNOUNCE_INTERVAL = 2min;
 };
 
 inline LsdDiscovery::LsdDiscovery(
@@ -382,10 +382,8 @@ inline void LsdDiscovery::parse_and_add_peer(
 
     uint16_t port = parsed->port;
 
-    if (sender_addr.is_v4() &&
-        sender_addr.to_v4().to_bytes() == asio::ip::address_v4::bytes_type{127, 0, 0, 1} &&
-        port == listening_port_) {
-        LOGDBG("LSD: Ignoring self-announcement from {}", sender_addr.to_string());
+    if (port == listening_port_) {
+        LOGDBG("LSD: Ignoring self-announcement from {} (port matches listening port)", sender_addr.to_string());
         return;
     }
 
