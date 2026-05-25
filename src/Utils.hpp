@@ -21,7 +21,7 @@
 #include <deque>
 #include <chrono>
 #include <spdlog/spdlog.h>
-#include "spdlog/sinks/stdout_color_sinks.h"
+#include <spdlog/sinks/null_sink.h>
 #include "spdlog/sinks/rotating_file_sink.h"
 #include <openssl/evp.h>
 #include <openssl/sha.h>
@@ -406,12 +406,6 @@ struct formatter<PeerId> {
 
 }
 
-static std::once_flag logger_init_flag;
-
-namespace spdlog {
-    class logger;
-}
- 
 #define LOGINFO(...) Logger::get()->info(__VA_ARGS__)
 #define LOGDBG(...) Logger::get()->debug(__VA_ARGS__)
 #define LOGERR(...) Logger::get()->error(__VA_ARGS__)
@@ -423,41 +417,58 @@ public:
     Logger(const Logger&) = delete;
     Logger& operator= (const Logger&) = delete;
 
-    static std::shared_ptr<spdlog::logger> get() {
-        std::call_once(logger_init_flag, &Logger::init);
+    /// Must be called once at program start before any LOGxxx macro.
+    /// Creates logs/<name>-<timestamp>.log with a rotating file sink (no console logging).
+    static void init(std::string_view log_name = "app") {
+        std::call_once(init_flag_, [&]() {
+            do_init(log_name);
+        });
+    }
+
+    static std::shared_ptr<spdlog::logger> get() noexcept {
+        if (!logger_) {
+            // Safe fallback when LOGxxx used before explicit init()
+            static std::once_flag null_init;
+            std::call_once(null_init, []() {
+                auto null_sink = std::make_shared<spdlog::sinks::null_sink_mt>();
+                logger_ = std::make_shared<spdlog::logger>("null", null_sink);
+            });
+        }
         return logger_;
     }
 
 private:
     Logger() {}
 
-    static void init() {
-        constexpr std::string_view name = "logs/server.log";
+    static void do_init(std::string_view log_name) {
+        // Build timestamped filename: logs/client-20260101-120000.log
+        auto now = std::chrono::system_clock::now();
+        auto t = std::chrono::system_clock::to_time_t(now);
+        std::stringstream ss;
+        ss << "logs/" << log_name << "-"
+           << std::put_time(std::localtime(&t), "%Y%m%d-%H%M%S") << ".log";
+
         try {
-            std::filesystem::create_directory("logs");
-            std::ofstream f(name.data(), std::ios::trunc | std::ios::in | std::ios::out);
-            f.close();
-        } catch (const std::exception& e) {
+            std::filesystem::create_directories("logs");
+        } catch (const std::exception&) {
         }
 
-        // auto console_sink = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
-        // console_sink->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] [thread %t] %v");
-
-        auto file_sink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(name.data(), 1024 * 1024 * 5, 3);
+        // File sink only — no console sink
+        auto file_sink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(
+            ss.str(), 1024 * 1024 * 5, 3);
         file_sink->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%^%l%$] [thread %t] %v");
 
-        std::vector<spdlog::sink_ptr> sinks {file_sink};
-        logger_ = std::make_shared<spdlog::logger>("server_logger", sinks.begin(), sinks.end());
-
+        logger_ = std::make_shared<spdlog::logger>(log_name.data(), file_sink);
         logger_->set_level(spdlog::level::debug);
         logger_->flush_on(spdlog::level::info);
         spdlog::register_logger(logger_);
     }
 
+    static std::once_flag init_flag_;
     static std::shared_ptr<spdlog::logger> logger_;
 };
 
-
+inline std::once_flag Logger::init_flag_;
 inline std::shared_ptr<spdlog::logger> Logger::logger_;
 
 // ----------- THREAD POOL -------------
@@ -1078,4 +1089,12 @@ void print_size(const T&) {
 template <typename T, typename = std::void_t<decltype(std::declval<T>().size())>>
 void print_size(const T&) {
 
+}
+
+// ---------- FORMATTING HELPERS ----------
+inline std::string fmt_bytes(uint64_t bytes) {
+    if (bytes >= 1'000'000'000) return std::format("{:.2f} GB", bytes / 1'000'000'000.0);
+    if (bytes >= 1'000'000)     return std::format("{:.2f} MB", bytes / 1'000'000.0);
+    if (bytes >= 1'000)         return std::format("{:.2f} KB", bytes / 1'000.0);
+    return std::format("{} B", bytes);
 }
