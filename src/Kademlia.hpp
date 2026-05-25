@@ -1241,8 +1241,19 @@ inline asio::awaitable<void> DHTNode::bootstrap(const std::vector<std::string>& 
 
     for (const auto& addr : bootstrap_nodes_addrs) {
         try {
-            auto [ip, port] = decode_address(addr);
-            udp::endpoint ep(asio::ip::make_address_v4(ip), port);
+            auto [host, port] = decode_address(addr);
+            // Resolve hostname to endpoint (handles both dotted-decimal IPs and DNS names)
+            udp::resolver resolver(io_context_);
+            auto results = co_await resolver.async_resolve(
+                host, std::to_string(port),
+                asio::ip::resolver_base::numeric_service,
+                asio::use_awaitable
+            );
+            if (results.empty()) {
+                LOGWARN("Failed to resolve bootstrap node: {}", addr);
+                continue;
+            }
+            udp::endpoint ep = results.begin()->endpoint();
             co_await send_ping(ep);
         } catch (const std::exception& e) {
             LOGWARN("Failed to bootstrap with {}: {}", addr, e.what());
