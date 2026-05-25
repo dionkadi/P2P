@@ -36,10 +36,12 @@ asio::awaitable<void> PieceManager::downloader() {
     // Start the periodic block timeout checker
     asio::co_spawn(io_context_, self->block_timeout_loop(), asio::detached);
 
-    while (!state_->is_download_complete()) {
+    while (!state_->is_download_complete() && !shutting_down_) {
         int slots_to_fill = 0;
 
         co_await asio::dispatch(strand_, asio::use_awaitable);
+
+        if (shutting_down_) break;
 
         size_t current_in_progress = in_progress_pieces_->size();
         if (current_in_progress < max_in_progress_pieces) {
@@ -194,7 +196,19 @@ asio::awaitable<void> PieceManager::broadcast_outstanding_requests() {
     const auto& info = state_->torrent_info();
     const size_t num_pieces = info.pieces.size() / 20;
 
-    for (auto& [piece_idx, piece_progress] : *in_progress_pieces()) {
+    // Snapshot shared_ptrs to avoid use-after-free: co_await inside the loop
+    // allows concurrent map mutation (remove_in_progress_piece, etc.), which
+    // would dangle references into the map. Local shared_ptr copies keep
+    // each InProgressPiece alive regardless of map state.
+    auto pieces_snapshot = in_progress_pieces();
+    if (!pieces_snapshot) co_return;
+    std::vector<std::pair<size_t, std::shared_ptr<InProgressPiece>>> pieces;
+    pieces.reserve(pieces_snapshot->size());
+    for (const auto& [idx, prog] : *pieces_snapshot) {
+        pieces.emplace_back(idx, prog);
+    }
+
+    for (auto& [piece_idx, piece_progress] : pieces) {
         for (uint32_t block_idx = 0; block_idx < piece_progress->total_blocks; ++block_idx) {
             uint32_t offset = block_idx * BLOCK_SIZE;
             uint64_t current_piece_size;
@@ -208,6 +222,9 @@ asio::awaitable<void> PieceManager::broadcast_outstanding_requests() {
                             ? (current_piece_size - offset)
                             : BLOCK_SIZE;
 
+            // Get available peers BEFORE the lock — no co_await inside lock_guard.
+            auto unchoked_peers_with_piece = co_await get_available_peers_(piece_idx);
+
             // Snapshot which peers we need to re-request from under the piece lock,
             // but do the actual co_await sends outside the lock.
             std::vector<std::shared_ptr<PeerConnection>> target_peers;
@@ -216,7 +233,6 @@ asio::awaitable<void> PieceManager::broadcast_outstanding_requests() {
                 if (piece_progress->blocks_received[block_idx]) {
                     continue;
                 }
-                auto unchoked_peers_with_piece = co_await get_available_peers_(piece_idx);
                 for (const auto& peer_conn : unchoked_peers_with_piece) {
                     piece_progress->outstanding_requests[block_idx].push_back(peer_conn->peer_id());
                 }
@@ -229,6 +245,7 @@ asio::awaitable<void> PieceManager::broadcast_outstanding_requests() {
             }
         }
     }
+    LOGDBG("Endgame broadcast complete.");
 }
 
 asio::awaitable<void> PieceManager::return_piece_to_queue(size_t piece_index) {
@@ -386,10 +403,19 @@ asio::awaitable<void> PieceManager::check_block_timeouts() {
         co_return;
     }
 
-    auto pieces = in_progress_pieces();
+    // Snapshot shared_ptrs to avoid use-after-free from concurrent map mutation
+    // while suspended at co_await (see broadcast_outstanding_requests for details).
+    auto pieces_snapshot = in_progress_pieces();
+    if (!pieces_snapshot) co_return;
+    std::vector<std::pair<size_t, std::shared_ptr<InProgressPiece>>> pieces;
+    pieces.reserve(pieces_snapshot->size());
+    for (const auto& [idx, prog] : *pieces_snapshot) {
+        pieces.emplace_back(idx, prog);
+    }
+
     auto now = std::chrono::steady_clock::now();
 
-    for (const auto& [piece_idx, piece_progress] : *pieces) {
+    for (const auto& [piece_idx, piece_progress] : pieces) {
         for (uint32_t block_idx = 0; block_idx < piece_progress->total_blocks; ++block_idx) {
             // Read request_time under lock to check for timeout
             TimePoint request_time;

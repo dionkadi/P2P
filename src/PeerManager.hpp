@@ -84,6 +84,13 @@ public:
                                        return conn->peer_addr() == peer_addr;
                                    });
     }
+    bool contains_peer_ip(const std::string& ip) {
+        std::lock_guard lock(mutex_);
+        return std::ranges::any_of(active_connections_ | std::views::values, 
+                                   [&ip](const std::shared_ptr<PeerConnection>& conn) {
+                                       return extract_ip_from_addr(conn->peer_addr()) == ip;
+                                   });
+    }
     size_t connection_count() {
         std::lock_guard lock(mutex_);
         return active_connections_.size();

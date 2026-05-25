@@ -119,7 +119,14 @@ public:
     asio::awaitable<void> check_block_timeouts();
 
     // Signal that shutdown is in progress (called by TorrentSession::stop())
-    void signal_shutdown() noexcept { shutting_down_ = true; }
+    void signal_shutdown() noexcept {
+        shutting_down_ = true;
+        std::lock_guard lock(mutex_);
+        // Break shared_ptr cycle: callbacks capture shared_from_this() of TorrentSession;
+        // without clearing them TorrentSession never destructs → FileManager cache_ leaks.
+        get_available_peers_ = nullptr;
+        block_timeout_callback_ = nullptr;
+    }
 
 private:
 
