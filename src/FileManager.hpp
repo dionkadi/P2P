@@ -75,13 +75,22 @@ public:
     // is being stopped).
     void sync_flush_all_dirty();
 
+    // Signal shutdown and cancel the periodic flush timer.
+    // Called from TorrentSession::stop() to allow periodic_flush() to exit
+    // cleanly so the io_context can drain.
+    void signal_shutdown() noexcept {
+        shutting_down_.store(true);
+        io_cancelled_->store(true);
+        if (flush_timer_) {
+            flush_timer_->cancel();
+        }
+    }
+
 protected:
     virtual asio::awaitable<int> async_prompt(const std::string& question);
     bool auto_approve_all_{true};
 
 private:
-    static ThreadPool& get_file_io_pool();
-    
     asio::awaitable<void> async_write_to_file(const std::filesystem::path& path, uint64_t offset, std::span<const std::byte> data);
     asio::awaitable<std::vector<std::byte>> async_read_from_file(const std::filesystem::path& path, uint64_t offset, uint32_t size = 0);
 
@@ -99,7 +108,7 @@ private:
     };
     using LRUList = std::list<CacheKey>;
 
-    ThreadPool& file_io_pool_;
+    ThreadPool file_io_pool_;
     std::shared_ptr<FileLocker> file_locker_;
     std::vector<std::shared_ptr<std::vector<PieceFileOverlap>>> piece_to_files_map_;
     std::vector<std::shared_ptr<std::vector<size_t>>> file_to_pieces_map_;
@@ -115,6 +124,7 @@ private:
     std::unique_ptr<asio::steady_timer> flush_timer_;
     bool flush_timer_started_ = false;
     std::atomic<bool> shutting_down_{false};
+    std::shared_ptr<std::atomic<bool>> io_cancelled_{std::make_shared<std::atomic<bool>>(false)};
 
     // -- Cache helpers --
     void touch_cache(const CacheKey& key);

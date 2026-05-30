@@ -5,7 +5,7 @@
 
 FileManager::FileManager(std::shared_ptr<SessionState> state)
     : state_(state),
-      file_io_pool_(get_file_io_pool()),
+      file_io_pool_(4),
       file_locker_(std::make_shared<FileLocker>())
 {
     const auto& info = state_->torrent_info();
@@ -25,6 +25,7 @@ FileManager::FileManager(std::shared_ptr<SessionState> state)
 
 FileManager::~FileManager() {
     shutting_down_.store(true);
+    io_cancelled_->store(true);
     if (flush_timer_) {
         flush_timer_->cancel();
     }
@@ -127,11 +128,6 @@ asio::awaitable<void> FileManager::write_piece(size_t piece_index, std::span<con
     }
 }
 
-ThreadPool& FileManager::get_file_io_pool() {
-    static ThreadPool instance(4);
-    return instance;
-}
-
 void FileManager::build_maps() {
     const auto& info = state_->torrent_info();
     const size_t num_pieces = state_->num_pieces();
@@ -215,10 +211,14 @@ std::filesystem::path FileManager::get_resume_file_path() const {
 
 asio::awaitable<void> FileManager::async_write_to_file(const std::filesystem::path& path, uint64_t offset, std::span<const std::byte> data) {
     co_await asio::async_initiate<void(std::error_code)>(
-        [this, &path, offset, data] (auto&& completion_handler) {
+        [this, path, offset, data, cancelled = io_cancelled_] (auto&& completion_handler) {
             file_io_pool_.enqueue(
-                [path, offset, data, locker = file_locker_, handler = std::move(completion_handler)]
+                [path, offset, data, cancelled, locker = file_locker_, handler = std::move(completion_handler)]
                 () mutable {
+                    if (cancelled->load()) {
+                        std::move(handler)(make_error_code(std::errc::operation_canceled));
+                        return;
+                    }
                     try {
                         std::lock_guard lock(locker->get_lock(path));
 
@@ -248,6 +248,11 @@ asio::awaitable<void> FileManager::async_write_to_file(const std::filesystem::pa
                         }
                         output_file.flush();
 
+                        if (cancelled->load()) {
+                            std::move(handler)(make_error_code(std::errc::operation_canceled));
+                            return;
+                        }
+
                         std::move(handler)(std::error_code{});
                     } catch (const std::exception& e) {
                         LOGERR("File write error for {}: {}", path.string(), e.what());
@@ -262,12 +267,15 @@ asio::awaitable<void> FileManager::async_write_to_file(const std::filesystem::pa
 
 asio::awaitable<std::vector<std::byte>> FileManager::async_read_from_file(const std::filesystem::path& path, uint64_t offset, uint32_t size) {
     auto [ec, block_data] = co_await asio::async_initiate<void(std::error_code, std::vector<std::byte>)>(
-        [this, &path, offset, size] (auto&& completion_handler) {
+        [this, path, offset, size, cancelled = io_cancelled_] (auto&& completion_handler) mutable {
             file_io_pool_.enqueue(
-                [&path, offset, size, handler = std::move(completion_handler)]
+                [path, offset, size, cancelled, handler = std::move(completion_handler)]
                 () mutable {
+                    if (cancelled->load()) {
+                        std::move(handler)(make_error_code(std::errc::operation_canceled), std::vector<std::byte>{});
+                        return;
+                    }
                     try {
-                        // LOGDBG("FileManager: [FileIO Pool] Attempting to open '{}'", path.string());
                         std::ifstream data_file(path, std::ios::binary);
                         if (!data_file) {
                             LOGERR("FileManager: [FileIO Pool] Failed to open file for reading: {}", path.string());
@@ -275,9 +283,6 @@ asio::awaitable<std::vector<std::byte>> FileManager::async_read_from_file(const 
                         }
                         
                         uint64_t actual_file_size = std::filesystem::file_size(path);
-                        // LOGDBG("FileManager: [FileIO Pool] Reading from '{}', requested offset={}, size={}, actual file size={}", 
-                        //     path.string(), offset, size, actual_file_size);
-                        // Validate read range against actual file size
                         if (offset + size > actual_file_size) {
                             LOGERR("FileManager: [FileIO Pool] Requested read ({}+{}) exceeds actual file size ({}) for file: {}", 
                                 offset, size, actual_file_size, path.string());
@@ -300,11 +305,15 @@ asio::awaitable<std::vector<std::byte>> FileManager::async_read_from_file(const 
                             throw std::runtime_error("Incomplete read from file: " + path.string());
                         }
                         std::streamsize bytes_read_actual = data_file.gcount();
-                        // LOGDBG("FileManager: [FileIO Pool] Read {} bytes, requested {}. EOF={}, Fail={}", bytes_read_actual, size, data_file.eof(), data_file.fail());
                         if (static_cast<uint32_t>(bytes_read_actual) != size) {
                             LOGERR("FileManager: [FileIO Pool] Incomplete read from file '{}'. Read {} bytes, requested {}. EOF={}, Fail={}", 
                                 path.string(), bytes_read_actual, size, data_file.eof(), data_file.fail());
                             throw std::runtime_error("Incomplete read from file: " + path.string());
+                        }
+
+                        if (cancelled->load()) {
+                            std::move(handler)(make_error_code(std::errc::operation_canceled), std::vector<std::byte>{});
+                            return;
                         }
                         
                         std::move(handler)(std::error_code{}, std::move(buffer));
