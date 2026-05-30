@@ -28,6 +28,8 @@ public:
 
     Tracker(asio::io_context& ioc) noexcept : io_context_(ioc), strand_(asio::make_strand(ioc)) {}
 
+    ~Tracker() { stop_http_listener(); }
+
     Tracker(const Tracker&) = delete;
     Tracker& operator= (const Tracker&) = delete;
 
@@ -37,11 +39,25 @@ public:
         http_router_->add_route("/", create_announce_handler());
         auto const address = asio::ip::make_address("0.0.0.0");
         auto endpoint = tcp::endpoint{address, static_cast<unsigned short>(port)};
+        http_acceptor_ = std::make_shared<tcp::acceptor>(io_context_);
+        http_acceptor_->open(endpoint.protocol());
+        http_acceptor_->set_option(tcp::acceptor::reuse_address(true));
+        http_acceptor_->bind(endpoint);
+        http_acceptor_->listen();
         asio::co_spawn(
             io_context_,
-            http_listener(io_context_, endpoint, http_router_),
+            http_listener(http_acceptor_, http_router_),
             asio::detached
         );
+    }
+
+    void stop_http_listener() {
+        if (http_acceptor_ && http_acceptor_->is_open()) {
+            boost::system::error_code ec;
+            http_acceptor_->cancel(ec);
+            http_acceptor_->close(ec);
+            http_acceptor_.reset();
+        }
     }
 
     void listen_udp(int port) {
@@ -252,6 +268,7 @@ private:
     std::filesystem::path data_dir_;
 
     std::shared_ptr<HttpRouter> http_router_;
+    std::shared_ptr<tcp::acceptor> http_acceptor_;
 
     struct UdpClientInfo {
         uint64_t connection_id;

@@ -29,6 +29,11 @@ public:
 
     virtual asio::awaitable<TrackerAnnounceResult> announce(const AnnounceRequestParams& params) = 0;
     virtual const std::string get_url() const = 0;
+
+    /// Cancel any in-flight announce() operation.
+    /// After cancel(), the next announce() call creates a fresh connection.
+    /// Thread-safe: implementations must not require external synchronization.
+    virtual void cancel() = 0;
 };
 
 class UdpTrackerClient: public ITrackerClient, public std::enable_shared_from_this<UdpTrackerClient> {
@@ -46,6 +51,10 @@ public:
 
     asio::awaitable<TrackerAnnounceResult> announce(const AnnounceRequestParams& params) override;
     const std::string get_url() const override { return "udp://" + url_str_; }
+    void cancel() override {
+        boost::system::error_code ec;
+        socket_.close(ec);
+    }
 
 private:
     asio::awaitable<bool> connect_to_tracker();
@@ -68,12 +77,22 @@ public:
 
     asio::awaitable<TrackerAnnounceResult> announce(const AnnounceRequestParams& params) override;
     const std::string get_url() const override { return std::format("http://{}:{}", host_, port_); }
+    void cancel() override {
+        if (active_stream_) {
+            boost::beast::error_code ec;
+            active_stream_->socket().close(ec);
+        }
+    }
 
 private:
     asio::io_context& io_context_;
     std::string host_;
     std::string target_;
     int port_;
+    // Non-owning pointer set during announce(), cleared when announce() completes.
+    // Points to a local tcp_stream on the coroutine frame (or the lowest layer
+    // of an ssl_stream). Valid only while announce() is in-flight.
+    boost::beast::tcp_stream* active_stream_ = nullptr;
 };
 
 class HttpsTrackerClient: public ITrackerClient, public std::enable_shared_from_this<HttpsTrackerClient> {
@@ -83,12 +102,21 @@ public:
 
     asio::awaitable<TrackerAnnounceResult> announce(const AnnounceRequestParams& params) override;
     const std::string get_url() const override { return std::format("https://{}:{}", host_, port_); }
+    void cancel() override {
+        if (active_stream_) {
+            boost::beast::error_code ec;
+            active_stream_->socket().close(ec);
+        }
+    }
 
 private:
     asio::io_context& io_context_;
     std::string host_;
     std::string target_;
     int port_;
+    // Non-owning pointer to the lowest layer (tcp_stream) of the SSL stream.
+    // Set during announce(), cleared when announce() completes.
+    boost::beast::tcp_stream* active_stream_ = nullptr;
 };
 
 template <typename Cont>
@@ -362,9 +390,10 @@ inline asio::awaitable<TrackerAnnounceResult> UdpTrackerClient::announce(const A
 
 inline asio::awaitable<TrackerAnnounceResult> HttpTrackerClient::announce(const AnnounceRequestParams& params) {
     auto self = shared_from_this();
+    beast::tcp_stream stream(io_context_);
+    active_stream_ = &stream;
     try {
         tcp::resolver resolver(io_context_);
-        beast::tcp_stream stream(io_context_);
 
         auto const results = co_await resolver.async_resolve(host_, std::to_string(port_), asio::use_awaitable);
         stream.expires_after(std::chrono::seconds(30));
@@ -377,8 +406,10 @@ inline asio::awaitable<TrackerAnnounceResult> HttpTrackerClient::announce(const 
         if (ec && ec != beast::errc::not_connected)
             throw beast::system_error{ec};
 
+        active_stream_ = nullptr;
         co_return result;
     } catch (const std::exception& e) {
+        active_stream_ = nullptr;
         LOGERR("HTTP announce to {} failed: {}", get_url(), e.what());
         throw;
     }
@@ -386,11 +417,11 @@ inline asio::awaitable<TrackerAnnounceResult> HttpTrackerClient::announce(const 
 
 inline asio::awaitable<TrackerAnnounceResult> HttpsTrackerClient::announce(const AnnounceRequestParams& params) {
     auto self = shared_from_this();
+    boost::asio::ssl::context ssl_ctx(boost::asio::ssl::context::tlsv12_client);
+    ssl_ctx.set_default_verify_paths();
+    beast::ssl_stream<beast::tcp_stream> stream(io_context_, ssl_ctx);
+    active_stream_ = &beast::get_lowest_layer(stream);
     try {
-        boost::asio::ssl::context ssl_ctx(boost::asio::ssl::context::tlsv12_client);
-        ssl_ctx.set_default_verify_paths();
-        beast::ssl_stream<beast::tcp_stream> stream(io_context_, ssl_ctx);
-
         if (!SSL_set_tlsext_host_name(stream.native_handle(), host_.c_str())) {
             beast::error_code ec{static_cast<int>(::ERR_get_error()), asio::error::get_ssl_category()};
             throw beast::system_error{ec};
@@ -406,8 +437,10 @@ inline asio::awaitable<TrackerAnnounceResult> HttpsTrackerClient::announce(const
 
         beast::error_code ec;
         stream.shutdown(ec);
+        active_stream_ = nullptr;
         co_return result;
     } catch (const std::exception& e) {
+        active_stream_ = nullptr;
         LOGERR("HTTPS announce to {} failed: {}", get_url(), e.what());
         throw;
     }
