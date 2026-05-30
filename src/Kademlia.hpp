@@ -398,13 +398,22 @@ inline void DHTNode::stop() {
     socket_.close();
     refresh_timer_.cancel();
     cleanup_timer_.cancel();
+
+    // Extract queries under lock, then complete outside lock to avoid
+    // reentrancy when completion handlers resume coroutines that access
+    // pending_queries_ (which would deadlock on queries_mutex_).
+    std::vector<std::shared_ptr<PendingQuery>> queries;
     {
         std::lock_guard lock(queries_mutex_);
         for (auto& [tid, query_ptr] : pending_queries_) {
-            query_ptr->completion(asio::error::operation_aborted, {});
+            queries.push_back(std::move(query_ptr));
         }
         pending_queries_.clear();
     }
+    for (auto& query_ptr : queries) {
+        query_ptr->completion(asio::error::operation_aborted, {});
+    }
+
     LOGINFO("DHT Node stopped.");
 }
 
@@ -451,6 +460,10 @@ auto DHTNode::async_ping(String tid, udp::endpoint target, CompletionToken&& tok
 }
 
 inline asio::awaitable<void> DHTNode::send_ping(const udp::endpoint& target_endpoint) {
+    if (shuting_down_) {
+        co_return;
+    }
+
     auto transaction_id = generate_transaction_id();
     try {
         asio::steady_timer timer(io_context_);
@@ -511,6 +524,10 @@ auto DHTNode::async_find_nodes(String tid, BucketEntry node, NodeId target_id, C
 }
 
 inline asio::awaitable<std::vector<BucketEntry>> DHTNode::find_nodes(const NodeId& target_id, uint count) {
+    if (shuting_down_) {
+        co_return std::vector<BucketEntry>{};
+    }
+
     auto closest_nodes = routing_table_.find_closest_nodes(target_id, count);
     std::vector<BucketEntry> result;
     
@@ -534,6 +551,9 @@ inline asio::awaitable<std::vector<BucketEntry>> DHTNode::find_nodes(const NodeI
     }
     
     for (int i = 0; i < 3; ++i) {
+        if (shuting_down_) {
+            break;
+        }
         if (nodes_to_query.empty()) {
             break;
         }
@@ -541,6 +561,9 @@ inline asio::awaitable<std::vector<BucketEntry>> DHTNode::find_nodes(const NodeI
         std::vector<BucketEntry> discovered;
         std::mutex mutex;
         auto find_nodes_coro = [this, &target_id, &discovered, &mutex, &queried_nodes] (const BucketEntry& node) -> asio::awaitable<void> {
+            if (shuting_down_) {
+                co_return;
+            }
             auto transaction_id = generate_transaction_id();
             try {
                 asio::steady_timer timer(io_context_);
@@ -648,6 +671,10 @@ auto DHTNode::async_get_peers(String tid, BucketEntry node, InfoHash info_hash, 
 }
 
 inline asio::awaitable<std::vector<EndPoint>> DHTNode::get_peers(const InfoHash& info_hash, uint count) {
+    if (shuting_down_) {
+        co_return std::vector<EndPoint>{};
+    }
+
     std::vector<EndPoint> discovered;
     std::set<EndPoint> added;
     {
@@ -672,6 +699,9 @@ inline asio::awaitable<std::vector<EndPoint>> DHTNode::get_peers(const InfoHash&
     }
 
     for (int i = 0; i < 3; ++i) {
+        if (shuting_down_) {
+            break;
+        }
         if (nodes_to_query.empty() || discovered.size() > count) {
             break;
         }
@@ -681,6 +711,9 @@ inline asio::awaitable<std::vector<EndPoint>> DHTNode::get_peers(const InfoHash&
         std::vector<BucketEntry> current_nodes;
 
         auto get_peers_coro = [this, &info_hash, &query_result_mutex, &current_peers, &current_nodes] (const BucketEntry& node) -> asio::awaitable<void> {
+            if (shuting_down_) {
+                co_return;
+            }
             auto tid = generate_transaction_id();
             try {
                 asio::steady_timer timer(io_context_);
@@ -810,9 +843,16 @@ auto DHTNode::async_announce_peer(String tid, BucketEntry node, InfoHash info_ha
 }
 
 inline asio::awaitable<void> DHTNode::announce_peer(const InfoHash& info_hash, uint16_t client_port) {
+    if (shuting_down_) {
+        co_return;
+    }
+
     auto closest = routing_table_.find_closest_nodes(info_hash, K);
 
     for (const auto& node : closest) {
+        if (shuting_down_) {
+            co_return;
+        }
         if (node.id == my_node_id_ || node.status == NodeStatus::Bad) {
             continue;
         }
@@ -1240,6 +1280,9 @@ inline asio::awaitable<void> DHTNode::bootstrap(const std::vector<std::string>& 
     LOGINFO("Bootstrapping DHT with {} nodes", bootstrap_nodes_addrs.size());
 
     for (const auto& addr : bootstrap_nodes_addrs) {
+        if (shuting_down_) {
+            co_return;
+        }
         try {
             auto [host, port] = decode_address(addr);
             // Resolve hostname to endpoint (handles both dotted-decimal IPs and DNS names)
@@ -1253,11 +1296,18 @@ inline asio::awaitable<void> DHTNode::bootstrap(const std::vector<std::string>& 
                 LOGWARN("Failed to resolve bootstrap node: {}", addr);
                 continue;
             }
+            if (shuting_down_) {
+                co_return;
+            }
             udp::endpoint ep = results.begin()->endpoint();
             co_await send_ping(ep);
         } catch (const std::exception& e) {
             LOGWARN("Failed to bootstrap with {}: {}", addr, e.what());
         }
+    }
+
+    if (shuting_down_) {
+        co_return;
     }
 
     auto closest = co_await find_nodes(my_node_id_, K);
