@@ -121,6 +121,8 @@ public:
     // Signal that shutdown is in progress (called by TorrentSession::stop())
     void signal_shutdown() noexcept {
         shutting_down_ = true;
+        block_timeout_timer_.cancel();
+        piece_request_trigger_.cancel();
         std::lock_guard lock(mutex_);
         // Break shared_ptr cycle: callbacks capture shared_from_this() of TorrentSession;
         // without clearing them TorrentSession never destructs → FileManager cache_ leaks.

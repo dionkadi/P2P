@@ -472,7 +472,7 @@ asio::awaitable<void> PieceManager::check_block_timeouts() {
 asio::awaitable<void> PieceManager::block_timeout_loop() {
     auto self = shared_from_this();
 
-    while (!state_->is_download_complete()) {
+    while (!state_->is_download_complete() && !shutting_down_.load()) {
         co_await self->check_block_timeouts();
 
         block_timeout_timer_.expires_after(std::chrono::seconds(1));
