@@ -567,7 +567,8 @@ int main(int argc, char* argv[]) {
             torrents_body += "] ";
 
             torrents_body += Text{std::format("{:5.1f}%", progress)}.color(style::yellow).str() + "  ";
-            torrents_body += Text{std::format("Peers: {}", peers)}.color(style::bright_black).str() + " |";
+            size_t trackers = session->connected_tracker_count();
+            torrents_body += Text{std::format("Peers: {}  Trackers: {}", peers, trackers)}.color(style::bright_black).str() + " |";
 
             torrents_body += "  ";
             torrents_body += Text{std::format("↓ {}/s", fmt_bytes(static_cast<uint64_t>(speed->down_speed)))}.color(style::blue).str() + "  ";
