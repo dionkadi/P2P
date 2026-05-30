@@ -850,16 +850,23 @@ asio::awaitable<void> TorrentSession::on_peer_has_piece(std::shared_ptr<PeerConn
 }
 
 asio::awaitable<void> TorrentSession::on_peer_has_all(std::shared_ptr<PeerConnection> conn) {
+    size_t num_pieces = state_->num_pieces();
+    if (num_pieces == 0) {
+        conn->peer_has_all_hint(true);
+        conn->inventory_pending_metadata(true);
+        co_return;
+    }
+
     // Initialize bitfield if not yet set (HaveAll may arrive before a bitfield message)
     if (conn->bitfield_size() == 0) {
-        conn->bitfield(std::vector<uint8_t>((state_->num_pieces() + 7) / 8, 0xFF));
+        conn->bitfield(std::vector<uint8_t>((num_pieces + 7) / 8, 0xFF));
     }
-    for (size_t i = 0; i < state_->num_pieces(); ++i) {
+    for (size_t i = 0; i < num_pieces; ++i) {
         conn->set_has_piece(i);
     }
 
     bool should_be_interested = false;
-    for (size_t i = 0; i < state_->num_pieces(); ++i) {
+    for (size_t i = 0; i < num_pieces; ++i) {
         if (state_->piece_status(i) == PieceStatus::Have) {
             piece_manager_->add_piece_availability(i, 1);
             continue;
@@ -877,6 +884,7 @@ asio::awaitable<void> TorrentSession::on_peer_has_all(std::shared_ptr<PeerConnec
         co_await conn->send_simple_message(MessageType::Interested);
     }
 
+    conn->inventory_pending_metadata(false);
     piece_manager_->notify_one();
 }
 
@@ -885,7 +893,21 @@ asio::awaitable<void> TorrentSession::on_peer_has_none(std::shared_ptr<PeerConne
 }
 
 asio::awaitable<void> TorrentSession::on_peer_bitfield(std::shared_ptr<PeerConnection> conn, std::span<const std::byte> bitfield) {
-    size_t expected_bitfield_size = (state_->num_pieces() + 7) / 8;
+    size_t num_pieces = state_->num_pieces();
+
+    // If metadata hasn't been fetched yet (magnet link), just store the bitfield
+    // and defer processing. The bitfield will be reconciled when metadata arrives.
+    if (num_pieces == 0) {
+        conn->bitfield(std::vector<uint8_t>(
+            reinterpret_cast<const uint8_t*>(bitfield.data()),
+            reinterpret_cast<const uint8_t*>(bitfield.data()) + bitfield.size()
+        ));
+        conn->peer_has_all_hint(false);
+        conn->inventory_pending_metadata(true);
+        co_return;
+    }
+
+    size_t expected_bitfield_size = (num_pieces + 7) / 8;
     if (expected_bitfield_size != bitfield.size()) {
         LOGWARN("Received bitfield of incorrect size. Expected {}, got {}. Dropping connection.",
             expected_bitfield_size, bitfield.size()
@@ -898,7 +920,7 @@ asio::awaitable<void> TorrentSession::on_peer_bitfield(std::shared_ptr<PeerConne
     conn->bitfield(std::vector<uint8_t>(reinterpret_cast<const uint8_t *>(bitfield.data()), reinterpret_cast<const uint8_t *>(bitfield.data()) + bitfield.size()));
 
     bool should_be_interested = false;
-    for (size_t i = 0; i < state_->num_pieces(); ++i) {
+    for (size_t i = 0; i < num_pieces; ++i) {
         if (conn->has_piece(i)) {
             if (state_->piece_status(i) == PieceStatus::Have) {
                 piece_manager_->add_piece_availability(i, 1);
@@ -918,6 +940,7 @@ asio::awaitable<void> TorrentSession::on_peer_bitfield(std::shared_ptr<PeerConne
         co_await conn->send_simple_message(MessageType::Interested);
     }
 
+    conn->inventory_pending_metadata(false);
     piece_manager_->notify_one();
 }
 
@@ -1031,7 +1054,10 @@ asio::awaitable<void> TorrentSession::on_extended_message(std::shared_ptr<PeerCo
                 for (auto &[k, v] : **m_dict) {
                     LOGDBG("\t{}", k);
                     uint8_t index = std::get<Integer>(v.get_variant());
-                    conn->update_extension_type(index, to_extended_type(k));
+                    auto ext_type = to_extended_type(k);
+                    if (ext_type != ExtendedMessageType::UNKNOWN) {
+                        conn->update_extension_type(index, ext_type);
+                    }
                 }
             }
 
@@ -1125,7 +1151,8 @@ asio::awaitable<void> TorrentSession::on_extended_message(std::shared_ptr<PeerCo
                 co_return;
             }
 
-            auto decoded_val = decode(extended_payload);
+            size_t dict_end = 0;
+            auto decoded_val = decode_prefix(extended_payload, dict_end);
             const auto* msg_dict = std::get_if<std::unique_ptr<Dict>>(&decoded_val.get_variant());
             if (!msg_dict) {
                 LOGWARN("Invalid ut_metadata message from peer {}", conn->peer_id());
@@ -1181,25 +1208,6 @@ asio::awaitable<void> TorrentSession::on_extended_message(std::shared_ptr<PeerCo
                     co_return;
                 }
 
-                // The raw metadata piece data follows the bencoded dict
-                size_t dict_end = 0;
-                // Find where the bencoded dict ends by finding the 'e' that closes the top-level dict
-                int depth = 0;
-                for (size_t i = 0; i < extended_payload.size(); ++i) {
-                    char c = static_cast<char>(extended_payload[i]);
-                    if (c == 'd' || c == 'l' || c == 'i') {
-                        if (depth == 0 && (c == 'd' || c == 'l')) {
-                            // OK, start of dict/list
-                        }
-                        if (c == 'd' || c == 'l') depth++;
-                    } else if (c == 'e') {
-                        depth--;
-                        if (depth == 0) {
-                            dict_end = i + 1;
-                            break;
-                        }
-                    }
-                }
                 if (dict_end == 0 || dict_end >= extended_payload.size()) {
                     LOGWARN("ut_metadata data message has no payload data from peer {}", conn->peer_id());
                     co_return;
@@ -1590,6 +1598,37 @@ asio::awaitable<void> TorrentSession::on_metadata_complete() {
                 co_return;
             }
             co_await piece_manager_->build_piece_rarity();
+        }
+
+        if (mode_ != Mode::Seed) {
+            size_t expected_bitfield_size = (num_pieces + 7) / 8;
+            for (const auto& conn : peer_manager_->get_all_connections()) {
+                if (!conn->inventory_pending_metadata()) {
+                    continue;
+                }
+
+                if (conn->peer_has_all_hint()) {
+                    co_await on_peer_has_all(conn);
+                    continue;
+                }
+
+                auto peer_bitfield = conn->bitfield_copy();
+                if (peer_bitfield.empty()) {
+                    conn->inventory_pending_metadata(false);
+                    continue;
+                }
+
+                if (peer_bitfield.size() != expected_bitfield_size) {
+                    LOGWARN("Stored peer bitfield has incorrect size after metadata. Expected {}, got {}. Dropping connection.",
+                            expected_bitfield_size, peer_bitfield.size());
+                    peer_manager_->report_protocol_violation(conn->peer_addr());
+                    conn->close();
+                    continue;
+                }
+
+                auto peer_bitfield_span = std::span<const uint8_t>(peer_bitfield.data(), peer_bitfield.size());
+                co_await on_peer_bitfield(conn, std::as_bytes(peer_bitfield_span));
+            }
         }
 
         // Start download loops that were skipped in init()

@@ -578,9 +578,9 @@ enum class MessageType: uint8_t {
     Cancel = 8,
     Port = 9,
     Reject = 16,
-    HaveNone = 17,
-    HaveAll = 18,
-    AllowedFast = 19,
+    HaveNone = 15,
+    HaveAll = 14,
+    AllowedFast = 17,
     ExtendedMessage = 20,
 };
 
@@ -591,14 +591,14 @@ enum class ExtendedMessageType: uint8_t {
     UNKNOWN = 255,
 };
 
-inline ExtendedMessageType to_extended_type(const std::string& s) {
+inline ExtendedMessageType to_extended_type(const std::string& s) noexcept {
     if (s == "ut_pex") {
         return ExtendedMessageType::ut_pex;
     }
     if (s == "ut_metadata") {
         return ExtendedMessageType::ut_metadata;
     }
-    throw std::invalid_argument("Unknown extended message type");
+    return ExtendedMessageType::UNKNOWN;
 }
 
 #pragma pack(push, 1)
