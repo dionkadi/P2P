@@ -37,6 +37,7 @@ public:
     PeerConnection& operator=(const PeerConnection&) = delete;
     PeerConnection(PeerConnection&&) noexcept = delete;
     PeerConnection& operator=(PeerConnection&&) noexcept = delete;
+    ~PeerConnection();
 
     bool has_piece(size_t index) const noexcept {
         std::lock_guard lock(mutex_);
@@ -112,6 +113,12 @@ public:
     }
 
     void close() noexcept {
+        if (upload_limiter_) {
+            upload_limiter_->stop();
+        }
+        if (download_limiter_) {
+            download_limiter_->stop();
+        }
         asio::post(strand_, [self = shared_from_this()] {
             self->socket_.close();
             self->keep_alive_timer_.cancel();
