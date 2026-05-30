@@ -64,6 +64,10 @@ public:
         std::lock_guard lock(mutex_);
         return bitfield_.size();
     }
+    std::vector<uint8_t> bitfield_copy() const {
+        std::lock_guard lock(mutex_);
+        return bitfield_;
+    }
 
     uint64_t bytes_downloaded() const noexcept { return bytes_downloaded_.load(std::memory_order_relaxed); } 
     uint64_t bytes_uploaded() const noexcept { return bytes_uploaded_.load(std::memory_order_relaxed); }
@@ -97,6 +101,22 @@ public:
     void bitfield(T&& other) {
         std::lock_guard lock(mutex_);
         bitfield_ = std::forward<T>(other);
+    }
+    bool inventory_pending_metadata() const noexcept {
+        std::lock_guard lock(mutex_);
+        return inventory_pending_metadata_;
+    }
+    void inventory_pending_metadata(bool val) noexcept {
+        std::lock_guard lock(mutex_);
+        inventory_pending_metadata_ = val;
+    }
+    bool peer_has_all_hint() const noexcept {
+        std::lock_guard lock(mutex_);
+        return peer_has_all_hint_;
+    }
+    void peer_has_all_hint(bool val) noexcept {
+        std::lock_guard lock(mutex_);
+        peer_has_all_hint_ = val;
     }
 
     bool supported_pex() noexcept {
@@ -225,6 +245,8 @@ private:
     bool fast_extension_supported_{false};
     uint8_t metadata_ext_id_{0};
     int32_t metadata_size_{0};
+    bool inventory_pending_metadata_{false};
+    bool peer_has_all_hint_{false};
 
     mutable std::mutex mutex_;
 

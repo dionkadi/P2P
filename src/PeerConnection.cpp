@@ -252,6 +252,15 @@ asio::awaitable<void> PeerConnection::message_loop() {
                     // Handle cancel if needed (e.g., remove from upload queue, but for now ignore)
                     break;
                 }
+                case MessageType::Port: {
+                    // DHT port message (BEP 14) — ignore for now
+                    break;
+                }
+                case MessageType::AllowedFast: {
+                    // BEP 6 — peer indicates we can download from them even while choked
+                    // For now, just ignore
+                    break;
+                }
                 case MessageType::ExtendedMessage: {
                     co_await events_->on_extended_message(self, payload);
                     break;
