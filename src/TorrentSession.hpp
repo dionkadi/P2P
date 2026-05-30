@@ -55,6 +55,8 @@ public:
 
     void set_on_complete(std::function<void()> cb) { on_complete_ = std::move(cb); }
     void set_tracker_announce_interval(std::chrono::seconds interval) { tracker_announce_interval_ = interval; }
+    void set_enable_dht(bool enabled) noexcept { enable_dht_ = enabled; }
+    void set_enable_lsd(bool enabled) noexcept { enable_lsd_ = enabled; }
 
     const std::shared_ptr<PeerManager>& peer_manager() const noexcept { return peer_manager_; }
     std::shared_ptr<SessionState> get_state() const noexcept { return state_; }
@@ -65,6 +67,17 @@ public:
     const std::string& get_display_name() const noexcept { return state_->torrent_info().name; }
 
     void add_tracker_url(const std::string& url);
+    // Count trackers that have had at least one successful announce
+    size_t connected_tracker_count() const noexcept {
+        std::lock_guard lock(tracker_backoff_mutex_);
+        size_t count = 0;
+        for (const auto& [url, state] : tracker_backoff_states_) {
+            if (state.last_success_at_ != TimePoint{}) {
+                ++count;
+            }
+        }
+        return count;
+    }
 
     // IPeerConnectionEvents implementation
     asio::awaitable<void> on_piece_block(std::shared_ptr<PeerConnection> conn, size_t piece_index, uint32_t begin, std::span<const std::byte> block_data) override;
@@ -132,6 +145,8 @@ private:
     std::shared_ptr<LsdDiscovery> lsd_discovery_;
     asio::steady_timer dht_announce_timer_;
     std::vector<std::string> dht_bootstrap_nodes_;
+    bool enable_dht_{true};
+    bool enable_lsd_{true};
 
     bool metadata_download_active_{false};
     std::vector<std::byte> metadata_buffer_;
