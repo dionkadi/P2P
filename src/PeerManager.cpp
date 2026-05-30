@@ -10,6 +10,12 @@ PeerManager::PeerManager(asio::io_context& io_context, std::shared_ptr<SessionSt
     state_(state), choke_interval_(choke_interval), backoff_retry_timer_(io_context_), ban_cleanup_timer_(io_context_)
 {}
 
+void PeerManager::close_all() {
+    std::lock_guard lock(mutex_);
+    std::ranges::for_each(active_connections_ | std::views::values,
+        [] (std::shared_ptr<PeerConnection>& conn) { conn->close(); });
+}
+
 bool PeerManager::add_connection(const PeerId& id, std::shared_ptr<PeerConnection> conn) {
     // Reject banned peers (must check BEFORE locking mutex_ to avoid ABBA deadlock
     // with ban_peer_by_ip which locks ban_mutex_ then mutex_)
@@ -91,6 +97,10 @@ std::string PeerManager::extract_ip_from_addr(const std::string& peer_addr) {
 }
 
 asio::awaitable<std::optional<AsyncSocket>> PeerManager::connect_to_peer(const std::string& peer_addr) {
+    if (shutting_down_.load(std::memory_order_acquire)) {
+        co_return std::nullopt;
+    }
+
     // Check backoff state before attempting
     {
         std::lock_guard lock(backoff_mutex_);
@@ -133,8 +143,44 @@ asio::awaitable<std::optional<AsyncSocket>> PeerManager::connect_to_peer(const s
             std::string ip = peer_addr.substr(0, colon_pos);
             int port = std::stoi(peer_addr.substr(colon_pos + 1));
 
-            AsyncSocket socket(asio::ip::tcp::socket{io_context_});
-            co_await socket.connect(ip, port);
+            auto raw_socket = std::make_shared<asio::ip::tcp::socket>(io_context_);
+            {
+                std::lock_guard lock(pending_connect_mutex_);
+                pending_connect_sockets_.push_back(raw_socket);
+            }
+
+            auto remove_pending_socket = [this, &raw_socket] {
+                std::lock_guard lock(pending_connect_mutex_);
+                std::erase(pending_connect_sockets_, raw_socket);
+            };
+
+            asio::ip::tcp::resolver resolver(io_context_);
+            boost::system::error_code ec;
+            auto endpoints = co_await resolver.async_resolve(ip, std::to_string(port), asio::redirect_error(asio::use_awaitable, ec));
+            if (ec || shutting_down_.load(std::memory_order_acquire)) {
+                remove_pending_socket();
+                raw_socket->close();
+                if (half_open_connections_.load() > 0) {
+                    --half_open_connections_;
+                }
+                co_return std::nullopt;
+            }
+
+            co_await asio::async_connect(*raw_socket, endpoints, asio::redirect_error(asio::use_awaitable, ec));
+            remove_pending_socket();
+
+            if (ec || shutting_down_.load(std::memory_order_acquire)) {
+                raw_socket->close();
+                if (half_open_connections_.load() > 0) {
+                    --half_open_connections_;
+                }
+                if (!shutting_down_.load(std::memory_order_acquire)) {
+                    report_connection_failure(peer_addr);
+                }
+                co_return std::nullopt;
+            }
+
+            AsyncSocket socket(std::move(*raw_socket));
             LOGINFO("Successfully connected to peer {}", peer_addr);
             report_connection_success(peer_addr);
             // Success - return socket, half-open will be decremented in add_connection
@@ -229,10 +275,16 @@ asio::awaitable<void> PeerManager::choke_loop() {
     };
 
     while (true) {
+        if (shutting_down_.load(std::memory_order_acquire)) {
+            break;
+        }
         choke_timer_.expires_after(choke_interval_);
+        if (shutting_down_.load(std::memory_order_acquire)) {
+            choke_timer_.expires_at(decltype(choke_timer_)::clock_type::time_point::min());
+        }
         boost::system::error_code ec;
         co_await choke_timer_.async_wait(asio::redirect_error(asio::use_awaitable, ec));
-        if (ec) {
+        if (ec || shutting_down_.load(std::memory_order_acquire)) {
             break;
         }
 
@@ -375,6 +427,9 @@ asio::awaitable<void> PeerManager::pex_loop() {
     auto self = shared_from_this();
     
     while (true) {
+        if (shutting_down_.load(std::memory_order_acquire)) {
+            co_return;
+        }
         std::string added = populate_added();
         std::string dropped = populate_dropped();
         
@@ -398,11 +453,16 @@ asio::awaitable<void> PeerManager::pex_loop() {
         }
         
         pex_timer_.expires_after(std::chrono::minutes(1));
+        if (shutting_down_.load(std::memory_order_acquire)) {
+            pex_timer_.expires_at(decltype(pex_timer_)::clock_type::time_point::min());
+        }
         EC ec;
         co_await pex_timer_.async_wait(asio::redirect_error(asio::use_awaitable, ec));
 
-        if (ec == asio::error::operation_aborted) {
-            LOGWARN("PEX loop aborted");
+        if (ec == asio::error::operation_aborted || shutting_down_.load(std::memory_order_acquire)) {
+            if (ec == asio::error::operation_aborted) {
+                LOGWARN("PEX loop aborted");
+            }
             co_return;
         }
     }
@@ -428,7 +488,7 @@ std::string PeerManager::populate_added(size_t max_peers) {
 std::string PeerManager::populate_dropped() {
     std::string dropped;
     while (!dropped_peers_.empty()) {
-        const auto& ep = dropped_peers_.front();
+        auto ep = dropped_peers_.front();  // copy before pop (pop_front destroys the element)
         dropped_peers_.pop_front();
         
         const auto ep_bytes = ep.address().to_v4().to_bytes();
@@ -542,12 +602,20 @@ asio::awaitable<void> PeerManager::ban_cleanup_loop() {
     auto self = shared_from_this();
 
     while (true) {
+        if (shutting_down_.load(std::memory_order_acquire)) {
+            co_return;
+        }
         ban_cleanup_timer_.expires_after(5min);
+        if (shutting_down_.load(std::memory_order_acquire)) {
+            ban_cleanup_timer_.expires_at(decltype(ban_cleanup_timer_)::clock_type::time_point::min());
+        }
         boost::system::error_code ec;
         co_await ban_cleanup_timer_.async_wait(asio::redirect_error(asio::use_awaitable, ec));
 
-        if (ec == asio::error::operation_aborted) {
-            LOGDBG("Ban cleanup loop aborted");
+        if (ec == asio::error::operation_aborted || shutting_down_.load(std::memory_order_acquire)) {
+            if (ec == asio::error::operation_aborted) {
+                LOGDBG("Ban cleanup loop aborted");
+            }
             co_return;
         }
 

@@ -6,6 +6,7 @@
 #include <boost/asio/steady_timer.hpp>
 #include <cstddef>
 #include <map>
+#include <vector>
 #include <unordered_map>
 #include <unordered_set>
 #include <memory>
@@ -69,10 +70,7 @@ public:
         }
         active_connections_[id]->close();
     }
-    void close_all() {
-        std::lock_guard lock(mutex_);
-        std::ranges::for_each(active_connections_ | std::views::values, [] (std::shared_ptr<PeerConnection>& conn) { conn->close(); });
-    }
+    void close_all();
     bool contains_peer(const PeerId& id) {
         std::lock_guard lock(mutex_);
         return active_connections_.count(id) > 0;
@@ -150,6 +148,7 @@ public:
     }
 
     void cancel() noexcept {
+        shutting_down_.store(true, std::memory_order_release);
         LOGDBG("PeerManager: Cancelling pex_timer_...");
         pex_timer_.cancel();
         LOGDBG("PeerManager: pex_timer_ cancelled. Cancelling choke_timer_...");
@@ -159,6 +158,17 @@ public:
         LOGDBG("PeerManager: backoff_retry_timer_ cancelled. Cancelling ban_cleanup_timer_...");
         ban_cleanup_timer_.cancel();
         LOGDBG("PeerManager: ban_cleanup_timer_ cancelled.");
+
+        std::vector<std::shared_ptr<asio::ip::tcp::socket>> pending_sockets;
+        {
+            std::lock_guard lock(pending_connect_mutex_);
+            pending_sockets.swap(pending_connect_sockets_);
+        }
+        for (const auto& socket : pending_sockets) {
+            boost::system::error_code ec;
+            socket->cancel(ec);
+            socket->close(ec);
+        }
     }
 
     // --- Ban management ---
@@ -209,10 +219,13 @@ private:
     std::unordered_map<std::string, BackoffState> backoff_states_;
     mutable std::mutex backoff_mutex_;
     asio::steady_timer backoff_retry_timer_;
+    mutable std::mutex pending_connect_mutex_;
+    std::vector<std::shared_ptr<asio::ip::tcp::socket>> pending_connect_sockets_;
 
     // Ban state (mutable for const method read + lazy expiry cleanup)
     mutable std::unordered_map<std::string, BannedPeer> banned_peers_;
     mutable std::unordered_map<std::string, PeerMisbehavior> peer_misbehavior_;
     mutable std::mutex ban_mutex_;
+    std::atomic<bool> shutting_down_{false};
     asio::steady_timer ban_cleanup_timer_;
 };
