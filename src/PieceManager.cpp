@@ -265,9 +265,8 @@ asio::awaitable<void> PieceManager::return_piece_to_queue(size_t piece_index) {
 }
 
 asio::awaitable<void> PieceManager::update_piece_rarity(size_t piece_index, uint32_t old_rarity, uint32_t new_rarity) {
-    // Remove from the old rarity set
+    // Remove from the old rarity set (post to strand ensures we're on strand upon return)
     co_await remove_piece_rarity(piece_index, old_rarity);
-    co_await asio::dispatch(strand_, asio::use_awaitable);
     // Add to the new rarity set
     auto& set_ptr = (*pieces_by_rarity_)[new_rarity];
     if (!set_ptr) {
@@ -277,7 +276,7 @@ asio::awaitable<void> PieceManager::update_piece_rarity(size_t piece_index, uint
 }
 
 asio::awaitable<void> PieceManager::remove_piece_rarity(size_t piece_index, uint32_t rarity) {
-    co_await asio::dispatch(strand_, asio::use_awaitable);
+    co_await asio::post(strand_, asio::use_awaitable);
     if (auto it = pieces_by_rarity_->find(rarity); it != pieces_by_rarity_->end()) {
         it->second->erase(piece_index);
         // If the set for the old rarity is now empty, remove the map entry
