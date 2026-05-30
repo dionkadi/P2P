@@ -42,5 +42,6 @@ private:
 };
 
 
+Value decode_prefix(std::span<const std::byte> data, size_t& consumed);
 Value decode(std::span<const std::byte> data);
 std::vector<std::byte> encode(const Value& value);

@@ -152,10 +152,17 @@ Value decode_value(std::span<const std::byte>& data) {
     }
 }
 
-Value decode(std::span<const std::byte> data) {
+Value decode_prefix(std::span<const std::byte> data, size_t& consumed) {
     auto view = data;
     Value result = decode_value(view);
-    if (!view.empty()) {
+    consumed = data.size() - view.size();
+    return result;
+}
+
+Value decode(std::span<const std::byte> data) {
+    size_t consumed = 0;
+    Value result = decode_prefix(data, consumed);
+    if (consumed != data.size()) {
         throw std::runtime_error("Bencode: Trailing data left after decoding.");
     }
     return result;
