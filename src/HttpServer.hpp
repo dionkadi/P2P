@@ -92,15 +92,13 @@ inline asio::awaitable<void> http_session(tcp::socket socket, std::shared_ptr<Ht
     }
 }
 
-inline asio::awaitable<void> http_listener(asio::io_context& ioc, tcp::endpoint endpoint, std::shared_ptr<HttpRouter> router) {
+inline asio::awaitable<void> http_listener(std::shared_ptr<tcp::acceptor> acceptor, std::shared_ptr<HttpRouter> router) {
     auto executor = co_await asio::this_coro::executor;
-    tcp::acceptor acceptor(executor, endpoint);
-    LOGINFO("HTTP Server listening on port {}", endpoint.port());
+    LOGINFO("HTTP Server listening on port {}", acceptor->local_endpoint().port());
     
     try {
         while (true) {
-            tcp::socket socket = co_await acceptor.async_accept(asio::use_awaitable);
-            acceptor.set_option(tcp::acceptor::reuse_address(true));
+            tcp::socket socket = co_await acceptor->async_accept(asio::use_awaitable);
             LOGINFO("[HTTP] Accepted connection from {}", socket.remote_endpoint().address().to_string());
             
             asio::co_spawn(executor, http_session(std::move(socket), router), asio::detached);
