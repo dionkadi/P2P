@@ -45,6 +45,19 @@ public:
     TorrentInfo& torrent_info() noexcept { return meta_info_.get_torrent_info(); }
     const std::vector<std::byte>& info_hash() const noexcept { return meta_info_.get_info_hash(); }
     const std::vector<std::vector<std::string>>& tracker_tiers() const noexcept { return tracker_tiers_; }
+    bool has_metadata() const noexcept { return num_pieces_ > 0 && !meta_info_.get_info_bencoded().empty(); }
+
+    void load_metadata(const std::vector<std::byte>& info_bencoded) {
+        auto expected_hash = meta_info_.get_info_hash();
+        if (!meta_info_.load_from_info_bytes(info_bencoded)) {
+            throw std::runtime_error("Failed to load persisted magnet metadata.");
+        }
+        if (!expected_hash.empty() && expected_hash != meta_info_.get_info_hash()) {
+            throw std::runtime_error("Persisted magnet metadata info hash mismatch.");
+        }
+        num_pieces_ = meta_info_.get_torrent_info().pieces.size() / 20;
+        piece_status_.assign(num_pieces_, PieceStatus::Needed);
+    }
 
     PieceStatus piece_status(size_t piece_index) const noexcept { 
         assert(piece_index < num_pieces_);

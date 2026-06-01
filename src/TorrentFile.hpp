@@ -8,6 +8,7 @@
 class MetaInfo {
 public:
     bool load_from_file(const std::string& file_path, std::vector<std::vector<std::string>>& out_tracker_tiers);
+    bool load_from_info_bytes(std::span<const std::byte> info_bencoded);
     static bool create_from_file(const std::filesystem::path& source_path, const std::filesystem::path& torrent_path, const std::vector<std::string>& tracker_urls, uint32_t piece_size = 262144);
     
     const std::vector<std::byte>& get_info_hash() const noexcept { return info_hash_bytes_; }
@@ -39,6 +40,39 @@ inline void gather_files(const std::filesystem::path& base_path, const std::file
             uint64_t file_size = std::filesystem::file_size(entry.path());
             files.push_back({relative_path, file_size, true});
             total_size += file_size;
+        }
+    }
+}
+
+inline void populate_torrent_info_from_dict(const Dict& info_dict, TorrentInfo& info) {
+    info = TorrentInfo{};
+    info.name = std::get<String>(info_dict.at("name").get_variant());
+    info.piece_size = std::get<Integer>(info_dict.at("piece length").get_variant());
+    const auto& pieces_str = std::get<String>(info_dict.at("pieces").get_variant());
+    info.pieces.assign(reinterpret_cast<const std::byte*>(pieces_str.data()),
+                       reinterpret_cast<const std::byte*>(pieces_str.data()) + pieces_str.size());
+
+    if (info.pieces.size() % 20 != 0) {
+        throw std::runtime_error("Invalid pieces length in torrent metadata.");
+    }
+
+    if (info_dict.count("length")) {
+        info.total_size = std::get<Integer>(info_dict.at("length").get_variant());
+        info.files.push_back({std::filesystem::path(info.name), info.total_size, true});
+    } else {
+        const List* file_list = std::get_if<std::unique_ptr<List>>(&info_dict.at("files").get_variant())->get();
+        for (const auto& file_val : *file_list) {
+            const Dict* file_dict = std::get_if<std::unique_ptr<Dict>>(&file_val.get_variant())->get();
+            uint64_t length = std::get<Integer>(file_dict->at("length").get_variant());
+            const List* path_list = std::get_if<std::unique_ptr<List>>(&file_dict->at("path").get_variant())->get();
+
+            std::filesystem::path file_path;
+            for (const std::string& part : *path_list | std::views::transform([](const Value& part_val){ return std::get<String>(part_val.get_variant()); })) {
+                file_path /= part;
+            }
+
+            info.files.push_back({file_path, length, true});
+            info.total_size += length;
         }
     }
 }
@@ -103,40 +137,30 @@ inline bool MetaInfo::load_from_file(const std::string& file_path, std::vector<s
         info_bencoded_ = encode(Value(info_dict));
         info_hash_bytes_ = Crypto::calculate_sha1_hash_data({info_bencoded_.data(), info_bencoded_.size()});
 
-        info_.name = std::get<String>(info_dict.at("name").get_variant());
-        info_.piece_size = std::get<Integer>(info_dict.at("piece length").get_variant());
-        const auto& pieces_str = std::get<String>(info_dict.at("pieces").get_variant());
-        info_.pieces.assign(reinterpret_cast<const std::byte*>(pieces_str.data()), 
-                            reinterpret_cast<const std::byte*>(pieces_str.data()) + pieces_str.size());
-
-        if (info_.pieces.size() % 20 != 0) {
-            throw std::runtime_error("Invalid pieces length in torrent file.");
-        }
-
-        if (info_dict.count("length")) {
-            info_.total_size = std::get<Integer>(info_dict.at("length").get_variant());
-            info_.files.push_back({std::filesystem::path(info_.name), info_.total_size, true});
-        } else {
-            const List* file_list = std::get_if<std::unique_ptr<List>>(&info_dict.at("files").get_variant())->get();
-            for (const auto& file_val : *file_list) {
-                const Dict* file_dict = std::get_if<std::unique_ptr<Dict>>(&file_val.get_variant())->get();
-                uint64_t length = std::get<Integer>(file_dict->at("length").get_variant());
-                const List* path_list = std::get_if<std::unique_ptr<List>>(&file_dict->at("path").get_variant())->get();
-
-                std::filesystem::path file_path;
-                for (const std::string& part : *path_list | std::views::transform([](const Value& part_val){ return std::get<String>(part_val.get_variant()); })) {
-                    file_path /= part;
-                }
-
-                info_.files.push_back({file_path, length, true});
-                info_.total_size += length;
-            }
-        }
+        populate_torrent_info_from_dict(info_dict, info_);
 
         return true;
 
     } catch (const std::exception& e) {
         LOGERR("Failed to parse .torrent file {}: {}", file_path, e.what());
+        return false;
+    }
+}
+
+inline bool MetaInfo::load_from_info_bytes(std::span<const std::byte> info_bencoded) {
+    try {
+        Value info_val = decode(info_bencoded);
+        const auto* info_dict_ptr = std::get_if<std::unique_ptr<Dict>>(&info_val.get_variant());
+        if (!info_dict_ptr || !(*info_dict_ptr)) {
+            throw std::runtime_error("Metadata is not an info dictionary.");
+        }
+
+        info_bencoded_.assign(info_bencoded.begin(), info_bencoded.end());
+        info_hash_bytes_ = Crypto::calculate_sha1_hash_data(info_bencoded_);
+        populate_torrent_info_from_dict(**info_dict_ptr, info_);
+        return true;
+    } catch (const std::exception& e) {
+        LOGERR("Failed to parse magnet metadata: {}", e.what());
         return false;
     }
 }
