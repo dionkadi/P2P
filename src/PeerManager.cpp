@@ -159,7 +159,10 @@ asio::awaitable<std::optional<AsyncSocket>> PeerManager::connect_to_peer(const s
             auto endpoints = co_await resolver.async_resolve(ip, std::to_string(port), asio::redirect_error(asio::use_awaitable, ec));
             if (ec || shutting_down_.load(std::memory_order_acquire)) {
                 remove_pending_socket();
-                raw_socket->close();
+                if (raw_socket->is_open()) {
+                    boost::system::error_code close_ec;
+                    raw_socket->close(close_ec);
+                }
                 if (half_open_connections_.load() > 0) {
                     --half_open_connections_;
                 }
@@ -170,7 +173,10 @@ asio::awaitable<std::optional<AsyncSocket>> PeerManager::connect_to_peer(const s
             remove_pending_socket();
 
             if (ec || shutting_down_.load(std::memory_order_acquire)) {
-                raw_socket->close();
+                if (raw_socket->is_open()) {
+                    boost::system::error_code close_ec;
+                    raw_socket->close(close_ec);
+                }
                 if (half_open_connections_.load() > 0) {
                     --half_open_connections_;
                 }

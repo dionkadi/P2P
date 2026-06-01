@@ -167,7 +167,6 @@ public:
         for (const auto& socket : pending_sockets) {
             boost::system::error_code ec;
             socket->cancel(ec);
-            socket->close(ec);
         }
     }
 
