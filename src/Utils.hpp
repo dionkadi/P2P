@@ -697,6 +697,7 @@ struct InProgressPiece {
     std::vector<bool> blocks_received;
     uint32_t received_count = 0;
     uint32_t total_blocks = 0;
+    bool resume_task_active = false;
 
     std::vector<std::vector<PeerId>> outstanding_requests;
     std::vector<TimePoint> request_times;  // When each block was first requested (for timeout detection)
