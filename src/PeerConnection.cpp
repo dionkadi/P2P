@@ -196,6 +196,10 @@ asio::awaitable<void> PeerConnection::message_loop() {
                 case MessageType::Unchoke: {
                     // LOGDBG("Peer {} sent UNCHOKE. Setting peer_is_choking to false.", peer_id_);
                     peer_is_choking_.store(false, std::memory_order_relaxed);
+                    {
+                        std::lock_guard lock(pipeline_mutex_);
+                        flush_pending_requests();
+                    }
                     co_await events_->on_choke_status_changed(self, false);
                     break;
                 }
@@ -235,13 +239,8 @@ asio::awaitable<void> PeerConnection::message_loop() {
                     BufferReader piece_reader(payload);
                     uint32_t piece_index = asio::detail::socket_ops::network_to_host_long(piece_reader.read<uint32_t>());
                     uint32_t piece_begin = asio::detail::socket_ops::network_to_host_long(piece_reader.read<uint32_t>());
-                    uint32_t block_length = asio::detail::socket_ops::network_to_host_long(piece_reader.read<uint32_t>());
-                    std::span<const std::byte> block_data = piece_reader.read_all();                 
-                    if (block_data.size() != block_length) {
-                        LOGERR("Received Piece message block data size mismatch. Expected {}, got {} for piece {} offset {}.",
-                               block_length, block_data.size(), piece_index, piece_begin);
-                        break;
-                    }
+                    std::span<const std::byte> block_data = piece_reader.read_all();
+                    uint32_t block_length = static_cast<uint32_t>(block_data.size());
                     // PIECE received — a request slot just freed up
                     on_request_completed(block_length);
                     co_await download_limiter_->await_tokens(block_length);
@@ -364,6 +363,7 @@ asio::awaitable<bool> PeerConnection::send_request(size_t index, uint32_t begin,
     msg_body.insert(msg_body.end(), payload.begin(), payload.end());
     try {
         co_await socket_.send_message(msg_body);
+        notify_request_sent(static_cast<uint32_t>(index), begin, length);
     } catch (...) {
         std::lock_guard lock(pipeline_mutex_);
         if (total_bytes_requested_ >= length) {
@@ -386,6 +386,10 @@ void PeerConnection::flush_pending_requests() {
     // on_request_completed/on_request_rejected which already hold it.
     // Do NOT lock here.
 
+    if (peer_is_choking_.load(std::memory_order_relaxed)) {
+        return;
+    }
+
     while (!pending_requests_.empty()) {
         uint64_t pipeline_bytes = total_bytes_requested_ - total_bytes_received_;
         if (outstanding_request_count_ >= max_outstanding_requests_ ||
@@ -404,6 +408,7 @@ void PeerConnection::flush_pending_requests() {
                 auto payload = RequestPayload::serialize(req.index, req.begin, req.length);
                 msg_body.insert(msg_body.end(), payload.begin(), payload.end());
                 co_await self->socket_.send_message(msg_body);
+                self->notify_request_sent(req.index, req.begin, req.length);
             },
             asio::detached
         );
@@ -441,8 +446,9 @@ void PeerConnection::on_request_rejected(uint32_t length) {
 asio::awaitable<void> PeerConnection::send_piece(size_t index, uint32_t begin, std::span<const std::byte> block_data) {
     co_await upload_limiter_->await_tokens(block_data.size());
     std::vector<std::byte> msg_body(1, static_cast<std::byte>(MessageType::Piece));
-    auto payload = RequestPayload::serialize(index, begin, block_data.size());
-    msg_body.insert(msg_body.end(), payload.begin(), payload.end());
+    BufferWriter writer(msg_body);
+    writer.write(asio::detail::socket_ops::host_to_network_long(static_cast<uint32_t>(index)));
+    writer.write(asio::detail::socket_ops::host_to_network_long(begin));
     msg_body.insert(msg_body.end(), block_data.begin(), block_data.end());
     co_await socket_.send_message(msg_body);
 }

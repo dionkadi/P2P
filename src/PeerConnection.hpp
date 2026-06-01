@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -24,6 +25,8 @@ class PeerManager;
 
 class PeerConnection: public std::enable_shared_from_this<PeerConnection> {
 public:
+    using RequestSentHook = std::function<void(uint32_t index, uint32_t begin, uint32_t length, const PeerId& peer_id)>;
+
     static asio::awaitable<std::shared_ptr<PeerConnection>> create(
         asio::io_context& io_context,
         AsyncSocket socket,
@@ -163,6 +166,10 @@ public:
 
     void set_upload_rate(uint64_t bps) noexcept;
     void set_download_rate(uint64_t bps) noexcept;
+    void set_request_sent_hook(RequestSentHook hook) {
+        std::lock_guard lock(mutex_);
+        request_sent_hook_ = std::move(hook);
+    }
 
     // Pipeline state introspection (for testing/monitoring)
     size_t max_outstanding_requests() const noexcept { return max_outstanding_requests_; }
@@ -223,6 +230,19 @@ protected:
     uint64_t total_bytes_received_ = 0;
 
 private:
+    void notify_request_sent(uint32_t index, uint32_t begin, uint32_t length) {
+        RequestSentHook hook;
+        PeerId peer_id{};
+        {
+            std::lock_guard lock(mutex_);
+            hook = request_sent_hook_;
+            peer_id = peer_id_;
+        }
+        if (hook) {
+            hook(index, begin, length, peer_id);
+        }
+    }
+
     asio::awaitable<bool> perform_handshake(const PeerId& my_peer_id);
     asio::awaitable<void> message_loop();
     asio::awaitable<void> keep_alive_loop();
@@ -234,6 +254,7 @@ private:
 
     std::vector<uint8_t> bitfield_;
     std::map<uint8_t, ExtendedMessageType> remote_extension_;
+    RequestSentHook request_sent_hook_;
 
     std::atomic_bool am_choking_{true};
     std::atomic_bool peer_is_choking_{true};
