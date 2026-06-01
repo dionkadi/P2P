@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -47,6 +48,18 @@ public:
         uint64_t download_rate_bps = 2048 * 1024
     );
 
+    static std::shared_ptr<TorrentSession> create_from_magnet_with_metadata(
+        asio::io_context& io_context,
+        PeerId my_peer_id,
+        const std::string& magnet_uri,
+        const std::filesystem::path& save_path,
+        int peer_port,
+        Mode mode,
+        const std::vector<std::byte>& info_bencoded,
+        uint64_t upload_rate_bps = 512 * 1024,
+        uint64_t download_rate_bps = 2048 * 1024
+    );
+
     TorrentSession(const TorrentSession&) = delete;
     TorrentSession& operator=(const TorrentSession&) = delete;
 
@@ -62,11 +75,13 @@ public:
     std::shared_ptr<SessionState> get_state() const noexcept { return state_; }
     Mode get_mode() const noexcept { return mode_; }
     uint16_t get_port() const noexcept { return peer_port_; }
+    bool is_stopped() const noexcept { return shutting_down_.load(std::memory_order_acquire); }
     const std::vector<std::byte>& get_info_hash() const noexcept { return state_->info_hash(); }
     const TorrentInfo& get_torrent_info() const noexcept { return state_->torrent_info(); }
     const std::string& get_display_name() const noexcept { return state_->torrent_info().name; }
 
     void add_tracker_url(const std::string& url);
+    void add_tracker_url_direct(const std::string& url);
     // Count trackers that have had at least one successful announce
     size_t connected_tracker_count() const noexcept {
         std::lock_guard lock(tracker_backoff_mutex_);
@@ -121,6 +136,7 @@ private:
     asio::awaitable<void> on_metadata_complete();
 
     asio::awaitable<void> send_cancel_for_block(uint32_t piece_index, uint32_t block_index, const PeerId& exclude_peer_id);
+    void record_request_sent(size_t piece_index, uint32_t begin, uint32_t length, const PeerId& peer_id);
 
     void reset() noexcept;
 
@@ -150,7 +166,8 @@ private:
 
     bool metadata_download_active_{false};
     std::vector<std::byte> metadata_buffer_;
-    size_t metadata_pieces_received_{0};
+    std::atomic<size_t> metadata_pieces_received_{0};
+    std::once_flag metadata_buffer_init_flag_;
     AsyncRateLimiter<> upload_limiter_;
     AsyncRateLimiter<> download_limiter_;
     std::atomic<bool> shutting_down_{false};

@@ -138,6 +138,31 @@ std::shared_ptr<TorrentSession> TorrentSession::create_from_magnet(
     return session;
 }
 
+std::shared_ptr<TorrentSession> TorrentSession::create_from_magnet_with_metadata(
+    asio::io_context& io_context,
+    PeerId my_peer_id,
+    const std::string& magnet_uri,
+    const std::filesystem::path& save_path,
+    int peer_port,
+    Mode mode,
+    const std::vector<std::byte>& info_bencoded,
+    uint64_t upload_rate_bps,
+    uint64_t download_rate_bps
+) {
+    MagnetLink link = parse_magnet_uri(magnet_uri);
+    std::vector<std::vector<std::string>> tracker_tiers;
+    if (!link.tracker_urls.empty()) {
+        tracker_tiers.push_back(link.tracker_urls);
+    }
+
+    auto state = std::make_shared<SessionState>(link.info_hash, std::move(tracker_tiers), save_path);
+    state->load_metadata(info_bencoded);
+    return std::shared_ptr<TorrentSession>(new TorrentSession(
+        io_context, std::move(my_peer_id), state, peer_port, mode,
+        upload_rate_bps, download_rate_bps
+    ));
+}
+
 asio::awaitable<bool> TorrentSession::init() {
     // Magnet link mode: no metadata yet, skip file operations
     if (state_->num_pieces() == 0) {
@@ -154,7 +179,7 @@ asio::awaitable<bool> TorrentSession::init() {
                               [this](size_t i) { state_->piece_status(i, PieceStatus::Have); });
         state_->completed_pieces(state_->num_pieces());
         state_->is_download_complete(true);
-        co_await piece_manager_->build_piece_rarity();
+        piece_manager_->build_piece_rarity();
     } else {
         if (!co_await file_manager_->preallocate_files()) {
             co_return false;
@@ -170,7 +195,7 @@ asio::awaitable<bool> TorrentSession::init() {
                 completion_timer_.cancel();
             }
         } else {
-            co_await piece_manager_->build_piece_rarity();
+            piece_manager_->build_piece_rarity();
         }
 
         // Hybrid mode: after loading resume data, verify any pieces
@@ -310,20 +335,9 @@ asio::awaitable<void> TorrentSession::stop() {
     // shutting_down_.
     for (auto& tier : tracker_clients_by_tier_) {
         for (auto& client : tier) {
-            client->cancel();
-        }
-    }
-
-    // Only announce if we actually started tracker communication (peer_server_ was created).
-    // Sessions that find the download already complete from resume data never
-    // spawn tracker_announce_loop() and shouldn't block shutdown here.
-    if (peer_server_) {
-        asio::steady_timer announce_timeout_timer(io_context_);
-        announce_timeout_timer.expires_after(std::chrono::seconds(2));
-        auto result_announce = co_await (asio::co_spawn(strand_, announce_tracker_for("stopped"), asio::use_awaitable) || announce_timeout_timer.async_wait(asio::use_awaitable));
-        
-        if (result_announce.index() == 1) { // timeout
-            LOGWARN("Sending 'stopped' event to tracker timed out during shutdown.");
+            if (client) {
+                client->cancel();
+            }
         }
     }
 
@@ -358,6 +372,25 @@ asio::awaitable<void> TorrentSession::stop() {
     LOGINFO("Torrent session shutdown complete.");
 }
 
+void TorrentSession::record_request_sent(size_t piece_index, uint32_t begin, uint32_t, const PeerId& peer_id) {
+    auto progress = piece_manager_->in_progress_piece(piece_index);
+    if (!progress) {
+        return;
+    }
+
+    uint32_t block_index = begin / BLOCK_SIZE;
+    std::lock_guard lock(progress->piece_mutex_);
+    if (block_index >= progress->total_blocks || progress->blocks_received[block_index]) {
+        return;
+    }
+
+    auto& outstanding = progress->outstanding_requests[block_index];
+    if (std::find(outstanding.begin(), outstanding.end(), peer_id) == outstanding.end()) {
+        outstanding.push_back(peer_id);
+    }
+    progress->request_times[block_index] = std::chrono::steady_clock::now();
+}
+
 asio::awaitable<void> TorrentSession::handle_new_connection(AsyncSocket socket, std::string peer_addr) {
     // LOGDBG("Incomming {}", peer_addr);
     std::shared_ptr<PeerConnection> conn = nullptr;
@@ -375,6 +408,12 @@ asio::awaitable<void> TorrentSession::handle_new_connection(AsyncSocket socket, 
         LOGERR("PeerConnection::create returned nullptr for {}. Handshake likely failed or was dropped.", peer_addr);
         co_return;
     }
+
+    conn->set_request_sent_hook([weak_self = weak_from_this()](uint32_t piece_index, uint32_t begin, uint32_t length, const PeerId& peer_id) {
+        if (auto self = weak_self.lock()) {
+            self->record_request_sent(piece_index, begin, length, peer_id);
+        }
+    });
 
     asio::co_spawn(io_context_, [conn] () -> asio::awaitable<void> {
         co_await conn->send_simple_message(MessageType::Unchoke);
@@ -474,6 +513,9 @@ asio::awaitable<void> TorrentSession::announce_tracker_for(std::string event) {
     co_await asio::dispatch(strand_, asio::use_awaitable);
     for (auto& tier : tracker_clients_by_tier_) {
         for (const auto& tracker_client : tier) {
+            if (!tracker_client) {
+                continue;
+            }
             const auto& url = tracker_client->get_url();
 
             // Check backoff for this tracker URL
@@ -545,6 +587,9 @@ asio::awaitable<void> TorrentSession::announce_tracker_for(std::string event) {
 }
 
 void TorrentSession::add_tracker_url(const std::string& url) {
+    if (shutting_down_) {
+        return;
+    }
     std::shared_ptr<ITrackerClient> client;
     try {
         client = create_tracker_client(io_context_, url);
@@ -557,6 +602,9 @@ void TorrentSession::add_tracker_url(const std::string& url) {
         return;
     }
     asio::dispatch(strand_, [self = shared_from_this(), client = std::move(client), url]() mutable {
+        if (self->shutting_down_) {
+            return;
+        }
         if (self->tracker_clients_by_tier_.empty()) {
             self->tracker_clients_by_tier_.push_back({});
         }
@@ -564,6 +612,30 @@ void TorrentSession::add_tracker_url(const std::string& url) {
         self->tracker_announce_timer_.cancel();
         LOGINFO("Tracker URL added: {}", url);
     });
+}
+
+void TorrentSession::add_tracker_url_direct(const std::string& url) {
+    if (shutting_down_) {
+        return;
+    }
+
+    std::shared_ptr<ITrackerClient> client;
+    try {
+        client = create_tracker_client(io_context_, url);
+    } catch (const std::exception& e) {
+        LOGWARN("Failed to create tracker client for URL '{}': {}", url, e.what());
+        return;
+    }
+    if (!client) {
+        LOGERR("Failed to create tracker client for URL: {}", url);
+        return;
+    }
+
+    if (tracker_clients_by_tier_.empty()) {
+        tracker_clients_by_tier_.push_back({});
+    }
+    tracker_clients_by_tier_[0].push_back(std::move(client));
+    LOGINFO("Tracker URL added: {}", url);
 }
 
 asio::awaitable<void> TorrentSession::discovered_peers_loop() {
@@ -811,24 +883,42 @@ asio::awaitable<void> TorrentSession::on_piece_rejected(std::shared_ptr<PeerConn
         co_return;
     }
 
-    auto& outstanding = progress->outstanding_requests[block_index];
-    std::erase(outstanding, conn->peer_id());
+    {
+        std::lock_guard lock(progress->piece_mutex_);
+        auto& outstanding = progress->outstanding_requests[block_index];
+        std::erase(outstanding, conn->peer_id());
+        if (outstanding.empty()) {
+            progress->request_times[block_index] = TimePoint{};
+        }
+    }
 
+    bool replacement_found = false;
     auto available_peers = co_await peer_manager_->available_peers(piece_index);
     for (const auto& peer : available_peers) {
         if (peer->peer_id() != conn->peer_id() && !peer->peer_is_choking()) {
             co_await peer->send_request(piece_index, begin, length);
-            progress->outstanding_requests[block_index].push_back(peer->peer_id());
-            progress->request_times[block_index] = std::chrono::steady_clock::now();
+            replacement_found = true;
             break;
         }
+    }
+
+    if (!replacement_found) {
+        piece_manager_->ensure_resume_piece_download(piece_index);
     }
 
     piece_manager_->notify_one();
 }
 
 asio::awaitable<void> TorrentSession::on_peer_has_piece(std::shared_ptr<PeerConnection> conn, size_t piece_index) {
-    if (piece_index < conn->bitfield_size()) {
+    if (piece_index >= state_->num_pieces()) {
+        co_return;
+    }
+
+    if (conn->bitfield_size() == 0) {
+        conn->bitfield(std::vector<uint8_t>((state_->num_pieces() + 7) / 8, 0));
+    }
+
+    if (piece_index / 8 < conn->bitfield_size()) {
         conn->set_has_piece(piece_index);
         if (state_->piece_status(piece_index) == PieceStatus::Have) {
             piece_manager_->add_piece_availability(piece_index, 1);
@@ -838,7 +928,7 @@ asio::awaitable<void> TorrentSession::on_peer_has_piece(std::shared_ptr<PeerConn
         uint32_t old_rarity = piece_manager_->piece_availability(piece_index);
         piece_manager_->add_piece_availability(piece_index, 1);
         uint32_t new_rarity = piece_manager_->piece_availability(piece_index);
-        co_await piece_manager_->update_piece_rarity(piece_index, old_rarity, new_rarity);
+        piece_manager_->update_piece_rarity(piece_index, old_rarity, new_rarity);
     }
 
     if (state_->piece_status(piece_index) == PieceStatus::Needed && !conn->am_interested()) {
@@ -875,7 +965,7 @@ asio::awaitable<void> TorrentSession::on_peer_has_all(std::shared_ptr<PeerConnec
         uint32_t old_rarity = piece_manager_->piece_availability(i);
         piece_manager_->add_piece_availability(i, 1);
         uint32_t new_rarity = piece_manager_->piece_availability(i);
-        co_await piece_manager_->update_piece_rarity(i, old_rarity, new_rarity);
+        piece_manager_->update_piece_rarity(i, old_rarity, new_rarity);
         if (state_->piece_status(i) == PieceStatus::Needed) should_be_interested = true;
     }
 
@@ -930,7 +1020,7 @@ asio::awaitable<void> TorrentSession::on_peer_bitfield(std::shared_ptr<PeerConne
             uint32_t old_rarity = piece_manager_->piece_availability(i);
             piece_manager_->add_piece_availability(i, 1);
             uint32_t new_rarity = piece_manager_->piece_availability(i);
-            co_await piece_manager_->update_piece_rarity(i, old_rarity, new_rarity);
+            piece_manager_->update_piece_rarity(i, old_rarity, new_rarity);
             if (state_->piece_status(i) == PieceStatus::Needed) should_be_interested = true;
         }
     }
@@ -974,14 +1064,26 @@ asio::awaitable<void> TorrentSession::on_disconnect(std::shared_ptr<PeerConnecti
             uint32_t old_rarity = piece_manager_->piece_availability(i);
             piece_manager_->add_piece_availability(i, -1);
             uint32_t new_rarity = piece_manager_->piece_availability(i);
-            co_await piece_manager_->update_piece_rarity(i, old_rarity, new_rarity);
+            piece_manager_->update_piece_rarity(i, old_rarity, new_rarity);
         }
     }
 
     // Clean outstanding requests
     for (auto& [piece_index, progress] : *piece_manager_->in_progress_pieces()) {
-        for (auto& requests : progress->outstanding_requests) {
-            requests.erase(std::remove(requests.begin(), requests.end(), conn->peer_id()), requests.end());
+        bool needs_resume = false;
+        {
+            std::lock_guard lock(progress->piece_mutex_);
+            for (size_t block_index = 0; block_index < progress->outstanding_requests.size(); ++block_index) {
+                auto& requests = progress->outstanding_requests[block_index];
+                requests.erase(std::remove(requests.begin(), requests.end(), conn->peer_id()), requests.end());
+                if (requests.empty() && !progress->blocks_received[block_index]) {
+                    progress->request_times[block_index] = TimePoint{};
+                    needs_resume = true;
+                }
+            }
+        }
+        if (needs_resume) {
+            piece_manager_->ensure_resume_piece_download(piece_index);
         }
     }
 
@@ -996,15 +1098,16 @@ asio::awaitable<void> TorrentSession::on_disconnect(std::shared_ptr<PeerConnecti
             continue;
         }
         auto available_peers = co_await peer_manager_->available_peers(req.index);
+        bool replacement_found = false;
         for (const auto& peer : available_peers) {
             if (!peer->peer_is_choking()) {
                 co_await peer->send_request(req.index, req.begin, req.length);
-                if (block_index < progress->outstanding_requests.size()) {
-                    progress->outstanding_requests[block_index].push_back(peer->peer_id());
-                    progress->request_times[block_index] = std::chrono::steady_clock::now();
-                }
+                replacement_found = true;
                 break;
             }
+        }
+        if (!replacement_found) {
+            piece_manager_->ensure_resume_piece_download(req.index);
         }
     }
 
@@ -1215,17 +1318,20 @@ asio::awaitable<void> TorrentSession::on_extended_message(std::shared_ptr<PeerCo
                 std::span<const std::byte> raw_piece = extended_payload.subspan(dict_end);
 
                 if (metadata_download_active_) {
-                    metadata_buffer_.resize(total_size);
+                    // Thread-safe one-time buffer initialization.
+                    std::call_once(metadata_buffer_init_flag_, [&] {
+                        metadata_buffer_.resize(total_size);
+                    });
                     size_t offset = static_cast<size_t>(piece_idx) * METADATA_PIECE_SIZE;
-                    if (offset + raw_piece.size() <= total_size) {
+                    if (offset + raw_piece.size() <= metadata_buffer_.size()) {
                         std::ranges::copy(raw_piece, metadata_buffer_.begin() + offset);
-                        metadata_pieces_received_++;
+                        size_t received = metadata_pieces_received_.fetch_add(1, std::memory_order_relaxed) + 1;
                         LOGDBG("Received metadata piece {}/{} from peer {}", piece_idx,
                                (total_size + METADATA_PIECE_SIZE - 1) / METADATA_PIECE_SIZE,
                                conn->peer_id());
 
                         size_t total_pieces = (total_size + METADATA_PIECE_SIZE - 1) / METADATA_PIECE_SIZE;
-                        if (metadata_pieces_received_ >= total_pieces) {
+                        if (received >= total_pieces) {
                             LOGINFO("Full metadata received ({} bytes) from peer {}", total_size, conn->peer_id());
                             co_await on_metadata_complete();
                         }
@@ -1295,7 +1401,7 @@ asio::awaitable<void> TorrentSession::load_session_state(const ResumeData& data)
                 state_->piece_status(i, PieceStatus::Have);
                 ++pieces_done_count;
 
-                co_await piece_manager_->remove_piece_rarity(i, 0);
+                piece_manager_->remove_piece_rarity(i, 0);
             } else {
                 // This piece is not in the 'have' bitfield.
                 // Only mark it as 'Needed' if it wasn't already marked 'Skipped'
@@ -1360,7 +1466,7 @@ asio::awaitable<void> TorrentSession::load_session_state(const ResumeData& data)
         state_->completed_pieces(pieces_done_count);
 
         // Rebuild the rarity map
-        co_await piece_manager_->build_piece_rarity();
+        piece_manager_->build_piece_rarity();
 
         // Load in-progress pieces
         if (!data.in_progress_pieces.empty()) {
@@ -1399,11 +1505,11 @@ asio::awaitable<void> TorrentSession::load_session_state(const ResumeData& data)
                     // Update status and rarity maps
                     state_->piece_status(piece_idx, PieceStatus::InProgress);
                     uint32_t current_rarity = piece_manager_->piece_availability(piece_idx);
-                    co_await piece_manager_->update_piece_rarity(piece_idx, current_rarity, IN_PROGRESS_RARITY_GROUP_ID);
+                    piece_manager_->update_piece_rarity(piece_idx, current_rarity, IN_PROGRESS_RARITY_GROUP_ID);
                     piece_manager_->emplace_in_progress_pieces(piece_idx, std::move(progress));
 
-                    // Re-initiate the action by spawning a resume task
-                    asio::co_spawn(io_context_, piece_manager_->resume_piece_download(piece_idx), asio::detached);
+                    // Re-initiate the action by spawning a guarded resume task
+                    piece_manager_->ensure_resume_piece_download(piece_idx);
                 } catch (const std::exception& e) {
                     LOGWARN("Could not parse in-progress piece '{}': {}", piece_idx_str, e.what());
                 }
@@ -1469,6 +1575,7 @@ asio::awaitable<void> TorrentSession::send_cancel_for_block(uint32_t piece_index
         }
         peer_ids_to_cancel = progress->outstanding_requests[block_index];
         progress->outstanding_requests[block_index].clear();
+        progress->request_times[block_index] = TimePoint{};
     }
 
     const auto& info = state_->torrent_info();
@@ -1510,10 +1617,11 @@ asio::awaitable<void> TorrentSession::request_metadata_from_peer(std::shared_ptr
         co_return;
     }
 
-    if (metadata_buffer_.empty()) {
+    // Thread-safe one-time initialization of the metadata buffer.
+    std::call_once(metadata_buffer_init_flag_, [&] {
         metadata_buffer_.resize(static_cast<size_t>(total_size));
-        metadata_pieces_received_ = 0;
-    }
+        metadata_pieces_received_.store(0, std::memory_order_relaxed);
+    });
 
     int total_pieces = (total_size + static_cast<int>(METADATA_PIECE_SIZE) - 1) / static_cast<int>(METADATA_PIECE_SIZE);
     for (int piece = 0; piece < total_pieces; ++piece) {
@@ -1524,44 +1632,9 @@ asio::awaitable<void> TorrentSession::request_metadata_from_peer(std::shared_ptr
 
 asio::awaitable<void> TorrentSession::on_metadata_complete() {
     try {
-        Value info_val = decode(metadata_buffer_);
-        const auto* info_dict_ptr = std::get_if<std::unique_ptr<Dict>>(&info_val.get_variant());
-        if (!info_dict_ptr) {
-            LOGERR("Received metadata is not a dictionary");
-            metadata_download_active_ = false;
-            co_return;
-        }
-
-        state_->info_mut().set_info_bencoded(metadata_buffer_);
-        const Dict& info_dict = **info_dict_ptr;
-        auto& info = state_->torrent_info();
-        info.name = std::get<String>(info_dict.at("name").get_variant());
-        info.piece_size = std::get<Integer>(info_dict.at("piece length").get_variant());
-        const auto& pieces_str = std::get<String>(info_dict.at("pieces").get_variant());
-        info.pieces.assign(reinterpret_cast<const std::byte*>(pieces_str.data()),
-                           reinterpret_cast<const std::byte*>(pieces_str.data()) + pieces_str.size());
-
-        if (info_dict.count("length")) {
-            info.total_size = std::get<Integer>(info_dict.at("length").get_variant());
-            info.files.push_back({std::filesystem::path(info.name), info.total_size, true});
-        } else {
-            const List* file_list = std::get_if<std::unique_ptr<List>>(&info_dict.at("files").get_variant())->get();
-            for (const auto& file_val : *file_list) {
-                const Dict* file_dict = std::get_if<std::unique_ptr<Dict>>(&file_val.get_variant())->get();
-                uint64_t length = std::get<Integer>(file_dict->at("length").get_variant());
-                const List* path_list = std::get_if<std::unique_ptr<List>>(&file_dict->at("path").get_variant())->get();
-                std::filesystem::path file_path;
-                for (const std::string& part : *path_list | std::views::transform(
-                        [](const Value& pv) { return std::get<String>(pv.get_variant()); })) {
-                    file_path /= part;
-                }
-                info.files.push_back({file_path, length, true});
-                info.total_size += length;
-            }
-        }
-
-        size_t num_pieces = info.pieces.size() / 20;
-        state_->init_pieces(num_pieces);
+        state_->load_metadata(metadata_buffer_);
+        const auto& info = state_->torrent_info();
+        size_t num_pieces = state_->num_pieces();
 
         LOGINFO("Metadata received and parsed: {} ({} pieces, {} bytes)",
                 info.name, num_pieces, info.total_size);
@@ -1574,7 +1647,7 @@ asio::awaitable<void> TorrentSession::on_metadata_complete() {
                                   [this](size_t i) { state_->piece_status(i, PieceStatus::Have); });
             state_->completed_pieces(num_pieces);
             state_->is_download_complete(true);
-            co_await piece_manager_->build_piece_rarity();
+            piece_manager_->build_piece_rarity();
         } else if (mode_ == Mode::Hybrid) {
             // Combined approach: preallocate files, then verify any pieces
             // that were already on disk (marked Have during init()).
@@ -1589,7 +1662,7 @@ asio::awaitable<void> TorrentSession::on_metadata_complete() {
                 state_->is_download_complete(true);
                 LOGINFO("Metadata received: all pieces verified on disk.");
             } else {
-                co_await piece_manager_->build_piece_rarity();
+                piece_manager_->build_piece_rarity();
                 LOGINFO("Metadata received: partial data on disk, downloading remaining pieces.");
             }
         } else {
@@ -1597,7 +1670,7 @@ asio::awaitable<void> TorrentSession::on_metadata_complete() {
                 LOGERR("Failed to preallocate files after metadata download");
                 co_return;
             }
-            co_await piece_manager_->build_piece_rarity();
+            piece_manager_->build_piece_rarity();
         }
 
         if (mode_ != Mode::Seed) {
@@ -1651,12 +1724,12 @@ asio::awaitable<void> TorrentSession::on_metadata_complete() {
 
         metadata_download_active_ = false;
         metadata_buffer_.clear();
-        metadata_pieces_received_ = 0;
+        metadata_pieces_received_.store(0, std::memory_order_relaxed);
 
     } catch (const std::exception& e) {
         LOGERR("Failed to parse received metadata: {}", e.what());
         metadata_download_active_ = false;
         metadata_buffer_.clear();
-        metadata_pieces_received_ = 0;
+        metadata_pieces_received_.store(0, std::memory_order_relaxed);
     }
 }
