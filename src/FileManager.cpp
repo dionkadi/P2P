@@ -134,8 +134,17 @@ void FileManager::build_maps() {
     const uint32_t piece_size = info.piece_size;
     const uint64_t total_torrent_size = info.total_size;
 
-    piece_to_files_map_.resize(num_pieces);
-    file_to_pieces_map_.resize(info.files.size());
+    // Clear and rebuild maps with proper shared_ptrs (not null).
+    piece_to_files_map_.clear();
+    piece_to_files_map_.reserve(num_pieces);
+    for (size_t i = 0; i < num_pieces; ++i) {
+        piece_to_files_map_.push_back(std::make_shared<std::vector<PieceFileOverlap>>());
+    }
+    file_to_pieces_map_.clear();
+    file_to_pieces_map_.reserve(info.files.size());
+    for (size_t i = 0; i < info.files.size(); ++i) {
+        file_to_pieces_map_.push_back(std::make_shared<std::vector<size_t>>());
+    }
 
     uint64_t current_total_offset = 0;
     for (size_t file_idx = 0; file_idx < info.files.size(); ++file_idx) {
@@ -476,6 +485,10 @@ asio::awaitable<std::optional<std::vector<std::byte>>> FileManager::load_resume_
 asio::awaitable<bool> FileManager::preallocate_files() {
     const auto& info = state_->torrent_info();
     const size_t num_pieces = state_->num_pieces();
+
+    // Rebuild piece-to-file maps (needed after magnet metadata load,
+    // where the constructor built them with num_pieces=0).
+    build_maps();
 
     try {
         auto base_save_path = state_->save_path();
