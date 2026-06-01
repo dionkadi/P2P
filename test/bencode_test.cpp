@@ -156,6 +156,23 @@ TEST(BencodeTest, DictEncodingDecoding) {
     EXPECT_EQ(std::get<Integer>(list3[0].get_variant()), 1);
 }
 
+TEST(BencodeTest, DecodePrefixAllowsTrailingData) {
+    auto bytes = string_to_bytes("d8:msg_typei1e5:piecei0eeXYZ");
+
+    size_t consumed = 0;
+    Value decoded = decode_prefix(bytes, consumed);
+
+    ASSERT_TRUE(std::holds_alternative<std::unique_ptr<Dict>>(decoded.get_variant()));
+    const Dict& dict = *std::get<std::unique_ptr<Dict>>(decoded.get_variant());
+    EXPECT_EQ(std::get<Integer>(dict.at("msg_type").get_variant()), 1);
+    EXPECT_EQ(std::get<Integer>(dict.at("piece").get_variant()), 0);
+    EXPECT_EQ(consumed, std::string("d8:msg_typei1e5:piecei0ee").size());
+
+    std::vector<std::byte> trailing(bytes.begin() + static_cast<std::ptrdiff_t>(consumed), bytes.end());
+    EXPECT_EQ(bytes_to_string(trailing), "XYZ");
+    EXPECT_THROW(decode(bytes), std::runtime_error);
+}
+
 TEST(BencodeTest, InvalidBencodeStrings) {
     // Missing 'e' for integer
     EXPECT_THROW(decode(string_to_bytes("i123")), std::runtime_error);

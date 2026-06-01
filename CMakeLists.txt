@@ -59,6 +59,7 @@ add_executable(p2p_test
     test/backoff_test.cpp
     test/bencode_test.cpp
     test/buffer_test.cpp
+    test/clientapp_test.cpp
     test/config_test.cpp
     test/crypto_test.cpp
     test/dht_test.cpp

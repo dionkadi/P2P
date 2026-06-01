@@ -1,5 +1,9 @@
 #include "helper.hpp"
 
+#include <fstream>
+#include <future>
+#include <thread>
+
 TEST(HandshakeTest, SerializeDeserializeBasic) {
     Handshake original_hs;
     original_hs.info_hash_bytes = hex_string_to_info_hash("e29fc0e5dceeefea80401e32723796c0a86a8695");
@@ -89,6 +93,338 @@ TEST(RequestPayloadTest, DeserializeInvalidSize) {
     EXPECT_NO_THROW(RequestPayload::deserialize(just_right_empty));
 }
 
+namespace {
+
+using tcp = asio::ip::tcp;
+
+struct ConnectedSockets {
+    tcp::socket client;
+    tcp::socket server;
+};
+
+PeerId make_fixed_peer_id(const std::string& suffix) {
+    PeerId id{};
+    std::string text = "-PT0001-" + suffix;
+    text.resize(PEER_ID_SIZE, '_');
+    std::transform(text.begin(), text.end(), id.begin(),
+                   [](char c) { return static_cast<std::byte>(c); });
+    return id;
+}
+
+std::shared_ptr<SessionState> make_protocol_test_state() {
+    InfoHash dummy_hash{};
+    dummy_hash.fill(std::byte{0});
+    return std::make_shared<SessionState>(
+        dummy_hash,
+        std::vector<std::vector<std::string>>{},
+        std::filesystem::temp_directory_path() / "p2p_protocol_test"
+    );
+}
+
+ConnectedSockets make_connected_sockets(asio::io_context& io) {
+    tcp::acceptor acceptor(io, tcp::endpoint(asio::ip::make_address("127.0.0.1"), 0));
+    tcp::socket client(io);
+    client.connect(tcp::endpoint(asio::ip::make_address("127.0.0.1"), acceptor.local_endpoint().port()));
+    tcp::socket server = acceptor.accept();
+    return ConnectedSockets{std::move(client), std::move(server)};
+}
+
+struct RecordingPeerEvents : public IPeerConnectionEvents {
+    std::promise<void> piece_promise;
+    size_t piece_index = 0;
+    uint32_t begin = 0;
+    std::vector<std::byte> block_data;
+    bool piece_received = false;
+
+    asio::awaitable<void> on_piece_block(
+        std::shared_ptr<PeerConnection>,
+        size_t received_piece_index,
+        uint32_t received_begin,
+        std::span<const std::byte> received_block_data
+    ) override {
+        piece_index = received_piece_index;
+        begin = received_begin;
+        block_data.assign(received_block_data.begin(), received_block_data.end());
+        if (!piece_received) {
+            piece_received = true;
+            piece_promise.set_value();
+        }
+        co_return;
+    }
+
+    asio::awaitable<void> on_block_request(std::shared_ptr<PeerConnection>, size_t, uint32_t, uint32_t) override { co_return; }
+    asio::awaitable<void> on_peer_has_piece(std::shared_ptr<PeerConnection>, size_t) override { co_return; }
+    asio::awaitable<void> on_peer_has_all(std::shared_ptr<PeerConnection>) override { co_return; }
+    asio::awaitable<void> on_peer_has_none(std::shared_ptr<PeerConnection>) override { co_return; }
+    asio::awaitable<void> on_peer_bitfield(std::shared_ptr<PeerConnection>, std::span<const std::byte>) override { co_return; }
+    asio::awaitable<void> on_choke_status_changed(std::shared_ptr<PeerConnection>, bool) override { co_return; }
+    asio::awaitable<void> on_piece_rejected(std::shared_ptr<PeerConnection>, size_t, uint32_t, uint32_t) override { co_return; }
+    asio::awaitable<void> on_disconnect(std::shared_ptr<PeerConnection>) override { co_return; }
+    asio::awaitable<void> on_extended_message(std::shared_ptr<PeerConnection>, std::span<const std::byte>) override { co_return; }
+};
+
+struct ConnectedTestPeerConn : public PeerConnection {
+    ConnectedTestPeerConn(asio::io_context& io, AsyncSocket socket, const std::string& addr)
+        : PeerConnection(io, std::move(socket), addr, nullptr, nullptr) {}
+
+    void set_upload_limiter(std::shared_ptr<AsyncRateLimiter<>> limiter) {
+        upload_limiter_ = std::move(limiter);
+    }
+
+    void set_download_limiter(std::shared_ptr<AsyncRateLimiter<>> limiter) {
+        download_limiter_ = std::move(limiter);
+    }
+};
+
+class TorrentSessionHaveTest : public ::testing::Test {
+protected:
+    std::filesystem::path temp_dir;
+    std::filesystem::path torrent_path;
+    std::filesystem::path source_path;
+    std::filesystem::path download_dir;
+
+    void SetUp() override {
+        temp_dir = std::filesystem::temp_directory_path() / "torrentsession_have_test_temp";
+        std::filesystem::remove_all(temp_dir);
+        std::filesystem::create_directories(temp_dir);
+        torrent_path = temp_dir / "test.torrent";
+        source_path = temp_dir / "source.bin";
+        download_dir = temp_dir / "download";
+        std::filesystem::create_directories(download_dir);
+
+        std::ofstream source_file(source_path, std::ios::binary);
+        ASSERT_TRUE(source_file.is_open());
+        std::string data(9 * BLOCK_SIZE, 'x');
+        source_file.write(data.data(), static_cast<std::streamsize>(data.size()));
+        source_file.close();
+
+        ASSERT_TRUE(MetaInfo::create_from_file(
+            source_path,
+            torrent_path,
+            {"http://127.0.0.1:1/announce"},
+            BLOCK_SIZE
+        ));
+    }
+
+    void TearDown() override {
+        std::filesystem::remove_all(temp_dir);
+    }
+};
+
+} // namespace
+
+TEST(PeerConnectionPieceMessageTest, ParsesStandardPieceMessageFromPeer) {
+    asio::io_context io;
+    auto sockets = make_connected_sockets(io);
+    auto state = make_protocol_test_state();
+    auto events = std::make_shared<RecordingPeerEvents>();
+    auto piece_future = events->piece_promise.get_future();
+
+    std::promise<std::shared_ptr<PeerConnection>> connection_promise;
+    auto connection_future = connection_promise.get_future();
+
+    PeerId my_id = make_fixed_peer_id("localPeer");
+    std::string peer_addr = sockets.client.local_endpoint().address().to_string() + ":" +
+                            std::to_string(sockets.client.local_endpoint().port());
+
+    asio::co_spawn(
+        io,
+        PeerConnection::create(io, AsyncSocket(std::move(sockets.client)), peer_addr, my_id, state, events),
+        [&connection_promise](std::exception_ptr e, std::shared_ptr<PeerConnection> conn) mutable {
+            if (e) {
+                connection_promise.set_exception(e);
+            } else {
+                connection_promise.set_value(std::move(conn));
+            }
+        }
+    );
+
+    std::jthread io_thread([&io] { io.run(); });
+
+    std::vector<std::byte> handshake_buffer(HANDSHAKE_BASE_LEN);
+    asio::read(sockets.server, asio::buffer(handshake_buffer));
+
+    Handshake peer_handshake;
+    peer_handshake.info_hash_bytes.fill(std::byte{0});
+    peer_handshake.peer_id_bytes = make_fixed_peer_id("remoteOne");
+    peer_handshake.extended = false;
+    peer_handshake.fast_extension = false;
+    auto peer_handshake_bytes = peer_handshake.serialize();
+    asio::write(sockets.server, asio::buffer(peer_handshake_bytes));
+
+    auto conn = connection_future.get();
+    ASSERT_NE(conn, nullptr);
+
+    std::vector<std::byte> expected_block = string_to_bytes("piece-data");
+    std::vector<std::byte> msg_body(1, static_cast<std::byte>(MessageType::Piece));
+    BufferWriter writer(msg_body);
+    writer.write(asio::detail::socket_ops::host_to_network_long(7));
+    writer.write(asio::detail::socket_ops::host_to_network_long(2 * BLOCK_SIZE));
+    msg_body.insert(msg_body.end(), expected_block.begin(), expected_block.end());
+
+    uint32_t message_length = asio::detail::socket_ops::host_to_network_long(static_cast<uint32_t>(msg_body.size()));
+    std::array<asio::const_buffer, 2> buffers = {
+        asio::buffer(&message_length, sizeof(message_length)),
+        asio::buffer(msg_body)
+    };
+    asio::write(sockets.server, buffers);
+
+    ASSERT_EQ(piece_future.wait_for(2s), std::future_status::ready);
+    EXPECT_EQ(events->piece_index, 7U);
+    EXPECT_EQ(events->begin, 2U * BLOCK_SIZE);
+    EXPECT_EQ(events->block_data, expected_block);
+
+    conn->close();
+    sockets.server.close();
+    io.stop();
+}
+
+TEST(PeerConnectionPieceMessageTest, SendsStandardPieceMessageToPeer) {
+    asio::io_context io;
+    auto sockets = make_connected_sockets(io);
+
+    auto conn = std::make_shared<ConnectedTestPeerConn>(
+        io,
+        AsyncSocket(std::move(sockets.client)),
+        "127.0.0.1:6881"
+    );
+    conn->set_upload_limiter(std::make_shared<AsyncRateLimiter<>>(io, 0));
+    conn->set_download_limiter(std::make_shared<AsyncRateLimiter<>>(io, 0));
+
+    std::vector<std::byte> expected_block = string_to_bytes("piece-wire-format");
+    RunAsync(io, conn->send_piece(11, 3 * BLOCK_SIZE, expected_block));
+
+    uint32_t net_length = 0;
+    asio::read(sockets.server, asio::buffer(&net_length, sizeof(net_length)));
+    uint32_t message_length = asio::detail::socket_ops::network_to_host_long(net_length);
+    ASSERT_EQ(message_length, 1U + 8U + expected_block.size());
+
+    std::vector<std::byte> msg_body(message_length);
+    asio::read(sockets.server, asio::buffer(msg_body));
+    ASSERT_FALSE(msg_body.empty());
+    EXPECT_EQ(msg_body.front(), static_cast<std::byte>(MessageType::Piece));
+
+    BufferReader reader(std::span<const std::byte>(msg_body.data() + 1, msg_body.size() - 1));
+    uint32_t piece_index = asio::detail::socket_ops::network_to_host_long(reader.read<uint32_t>());
+    uint32_t piece_begin = asio::detail::socket_ops::network_to_host_long(reader.read<uint32_t>());
+    std::span<const std::byte> block_data = reader.read_all();
+
+    EXPECT_EQ(piece_index, 11U);
+    EXPECT_EQ(piece_begin, 3U * BLOCK_SIZE);
+    EXPECT_TRUE(std::ranges::equal(block_data, expected_block));
+
+    sockets.server.close();
+}
+
+TEST(PeerConnectionRequestQueueTest, QueuedRequestsDoNotFlushWhileChoked) {
+    asio::io_context io;
+    auto sockets = make_connected_sockets(io);
+
+    auto conn = std::make_shared<ConnectedTestPeerConn>(
+        io,
+        AsyncSocket(std::move(sockets.client)),
+        "127.0.0.1:6881"
+    );
+
+    std::atomic<int> sent_count{0};
+    conn->set_request_sent_hook([&sent_count](uint32_t, uint32_t, uint32_t, const PeerId&) {
+        sent_count.fetch_add(1, std::memory_order_relaxed);
+    });
+    conn->peer_is_choking(false);
+
+    RunAsync(io, [&]() -> asio::awaitable<void> {
+        for (uint32_t block = 0; block < 6; ++block) {
+            co_await conn->send_request(7, block * BLOCK_SIZE, BLOCK_SIZE);
+        }
+    });
+
+    EXPECT_EQ(sent_count.load(std::memory_order_relaxed), 5);
+    EXPECT_EQ(conn->pending_request_count(), 1U);
+
+    conn->peer_is_choking(true);
+    conn->on_request_completed(BLOCK_SIZE);
+    io.restart();
+    io.run_for(20ms);
+    EXPECT_EQ(sent_count.load(std::memory_order_relaxed), 5);
+    EXPECT_EQ(conn->pending_request_count(), 1U);
+
+    conn->peer_is_choking(false);
+    conn->on_request_completed(BLOCK_SIZE);
+    io.restart();
+    io.run_for(20ms);
+    EXPECT_EQ(sent_count.load(std::memory_order_relaxed), 6);
+    EXPECT_EQ(conn->pending_request_count(), 0U);
+
+    sockets.server.close();
+}
+
+TEST(PieceResumeRecoveryTest, EnsureResumeReRequestsOrphanedBlock) {
+    asio::io_context io;
+    auto state = make_protocol_test_state();
+    state->init_pieces(1);
+    state->piece_status(0, PieceStatus::InProgress);
+
+    auto piece_manager = std::make_shared<PieceManager>(io, state);
+    auto progress = std::make_shared<InProgressPiece>(BLOCK_SIZE);
+    piece_manager->emplace_in_progress_pieces(0, progress);
+
+    auto sockets = make_connected_sockets(io);
+    auto conn = std::make_shared<ConnectedTestPeerConn>(
+        io,
+        AsyncSocket(std::move(sockets.client)),
+        "127.0.0.1:6881"
+    );
+    conn->peer_is_choking(false);
+
+    std::atomic<int> sent_count{0};
+    conn->set_request_sent_hook([&sent_count](uint32_t, uint32_t, uint32_t, const PeerId&) {
+        sent_count.fetch_add(1, std::memory_order_relaxed);
+    });
+
+    piece_manager->set_callback([conn](size_t) -> asio::awaitable<std::vector<std::shared_ptr<PeerConnection>>> {
+        co_return std::vector<std::shared_ptr<PeerConnection>>{conn};
+    });
+
+    piece_manager->ensure_resume_piece_download(0);
+    piece_manager->ensure_resume_piece_download(0);
+
+    io.run_for(1500ms);
+
+    EXPECT_EQ(sent_count.load(std::memory_order_relaxed), 1);
+    {
+        std::lock_guard lock(progress->piece_mutex_);
+        EXPECT_FALSE(progress->resume_task_active);
+    }
+
+    sockets.server.close();
+}
+
+TEST_F(TorrentSessionHaveTest, HaveMessageMarksPiecesBeyondFirstBitfieldByte) {
+    asio::io_context io;
+    auto session = std::make_shared<TorrentSession>(
+        io,
+        generate_peer_id(),
+        torrent_path,
+        download_dir,
+        6881,
+        Mode::Leech,
+        0,
+        0
+    );
+    session->get_state()->piece_status(8, PieceStatus::Have);
+
+    auto conn = std::make_shared<ConnectedTestPeerConn>(
+        io,
+        AsyncSocket(asio::ip::tcp::socket(io)),
+        "1.2.3.4:6881"
+    );
+    conn->bitfield(std::vector<uint8_t>((session->get_state()->num_pieces() + 7) / 8, 0));
+
+    RunAsync(io, session->on_peer_has_piece(conn, 8));
+
+    EXPECT_TRUE(conn->has_piece(8));
+}
+
 TEST(UdpConnectRequestTest, StructSizeAndEndianness) {
     UdpConnectRequest req;
     // Protocol ID is a fixed value, check its endian conversion
@@ -135,8 +471,8 @@ TEST(UdpAnnounceResponseTest, StructSizeAndEndianness) {
 TEST(ExtendedMessageTypeTest, ToExtendedType) {
     EXPECT_EQ(to_extended_type("ut_pex"), ExtendedMessageType::ut_pex);
     EXPECT_EQ(to_extended_type("ut_metadata"), ExtendedMessageType::ut_metadata);
-    // Test for an unknown string
-    EXPECT_THROW(to_extended_type("unknown_ext"), std::invalid_argument);
+    // Unknown extensions return UNKNOWN instead of throwing
+    EXPECT_EQ(to_extended_type("unknown_ext"), ExtendedMessageType::UNKNOWN);
 }
 
 // Added a quick test for this as it's directly used in PeerConnection
@@ -572,9 +908,11 @@ TEST(PerPeerRateLimitTest, DownloadRateLimitingAppliesBackpressure) {
 
 TEST(BEP6FastExtensionTest, MessageTypeValues) {
     EXPECT_EQ(static_cast<uint8_t>(MessageType::Reject), 16);
-    EXPECT_EQ(static_cast<uint8_t>(MessageType::HaveNone), 17);
-    EXPECT_EQ(static_cast<uint8_t>(MessageType::HaveAll), 18);
-    EXPECT_EQ(static_cast<uint8_t>(MessageType::AllowedFast), 19);
+    // BEP 52: have_none = 15, have_all = 14
+    // BEP 36: reject = 16, allowed_fast = 17
+    EXPECT_EQ(static_cast<uint8_t>(MessageType::HaveNone), 15);
+    EXPECT_EQ(static_cast<uint8_t>(MessageType::HaveAll), 14);
+    EXPECT_EQ(static_cast<uint8_t>(MessageType::AllowedFast), 17);
 }
 
 TEST(BEP6FastExtensionTest, HandshakeSerializeFastExtensionFlag) {
@@ -1000,6 +1338,7 @@ TEST(RequestPipeliningTest, QueuedRequestFlushedOnPieceReceived) {
     auto conn = std::make_shared<TestPeerConn>(io, "1.2.3.4:6881", pid);
 
     conn->set_pipeline_state(5, 5 * BLOCK_SIZE, 0);
+    conn->peer_is_choking(false);
     asio::co_spawn(io, [&]() -> asio::awaitable<void> {
         co_await conn->send_request(0, 0, BLOCK_SIZE);
     }, asio::detached);
@@ -1021,6 +1360,7 @@ TEST(RequestPipeliningTest, QueuedRequestFlushedOnRejectReceived) {
 
     uint64_t req_bytes = 5 * BLOCK_SIZE;
     conn->set_pipeline_state(5, req_bytes, 0);
+    conn->peer_is_choking(false);
     asio::co_spawn(io, [&]() -> asio::awaitable<void> {
         co_await conn->send_request(1, 0, BLOCK_SIZE);
     }, asio::detached);
@@ -1055,6 +1395,7 @@ TEST(RequestPipeliningTest, MultipleRequestsQueuedAndFlushedInOrder) {
     auto conn = std::make_shared<TestPeerConn>(io, "1.2.3.4:6881", pid);
 
     conn->set_pipeline_state(5, 5 * BLOCK_SIZE, 0);
+    conn->peer_is_choking(false);
     bool sent3 = true, sent4 = true, sent5 = true;
     asio::co_spawn(io, [&]() -> asio::awaitable<void> {
         sent3 = co_await conn->send_request(3, 0, BLOCK_SIZE);

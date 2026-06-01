@@ -5,6 +5,7 @@
 
 #include "MagnetUri.hpp"
 #include "SessionState.hpp"
+#include "TorrentSession.hpp"
 
 // ==================== Magnet URI Parsing Tests ====================
 
@@ -184,4 +185,52 @@ TEST(SessionStateMagnetTest, InitPiecesAfterMetadata) {
     EXPECT_EQ(state.num_pieces(), 2);
     EXPECT_EQ(state.piece_status(0), PieceStatus::Needed);
     EXPECT_EQ(state.piece_status(1), PieceStatus::Needed);
+}
+
+TEST(SessionStateMagnetTest, LoadMetadataFromInfoBencoded) {
+    Dict info_dict;
+    info_dict["name"] = Value(String("persisted-magnet"));
+    info_dict["piece length"] = Value(static_cast<Integer>(16384));
+    info_dict["length"] = Value(static_cast<Integer>(32768));
+    info_dict["pieces"] = Value(String(std::string(40, 'A')));
+
+    auto info_bencoded = encode(Value(info_dict));
+    auto expected_hash = Crypto::calculate_sha1_hash_data(info_bencoded);
+
+    InfoHash info_hash{};
+    std::copy_n(expected_hash.begin(), std::min(expected_hash.size(), info_hash.size()), info_hash.begin());
+    SessionState state(info_hash, {{"http://tracker.example.com/announce"}}, "/tmp/test");
+
+    ASSERT_NO_THROW(state.load_metadata(info_bencoded));
+    EXPECT_EQ(state.torrent_info().name, "persisted-magnet");
+    EXPECT_EQ(state.torrent_info().piece_size, 16384U);
+    EXPECT_EQ(state.torrent_info().total_size, 32768U);
+    EXPECT_EQ(state.num_pieces(), 2U);
+    EXPECT_EQ(state.info_hash(), expected_hash);
+    EXPECT_TRUE(state.has_metadata());
+}
+
+TEST(TorrentSessionMagnetMetadataTest, CreateFromMagnetWithMetadata) {
+    Dict info_dict;
+    info_dict["name"] = Value(String("restored-magnet"));
+    info_dict["piece length"] = Value(static_cast<Integer>(16384));
+    info_dict["length"] = Value(static_cast<Integer>(32768));
+    info_dict["pieces"] = Value(String(std::string(40, 'B')));
+
+    auto info_bencoded = encode(Value(info_dict));
+    auto expected_hash = Crypto::calculate_sha1_hash_data(info_bencoded);
+    std::string magnet_uri = "magnet:?xt=urn:btih:" + Crypto::bytes_to_hex(expected_hash) + "&dn=restored-magnet";
+
+    asio::io_context io;
+    PeerId peer_id{};
+    auto session = TorrentSession::create_from_magnet_with_metadata(
+        io, peer_id, magnet_uri, "/tmp/test", 6881, Mode::Leech, info_bencoded, 0, 0
+    );
+
+    ASSERT_NE(session, nullptr);
+    EXPECT_EQ(session->get_torrent_info().name, "restored-magnet");
+    EXPECT_EQ(session->get_torrent_info().piece_size, 16384U);
+    EXPECT_EQ(session->get_torrent_info().total_size, 32768U);
+    EXPECT_EQ(session->get_state()->num_pieces(), 2U);
+    EXPECT_FALSE(session->get_torrent_info().pieces.empty());
 }
