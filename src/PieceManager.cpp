@@ -138,7 +138,7 @@ asio::awaitable<bool> PieceManager::try_piece_download(size_t piece_index) {
     
     // Update rarity map - remove from current rarity
     uint32_t current_rarity = piece_availability(piece_index);
-    co_await update_piece_rarity(piece_index, current_rarity, IN_PROGRESS_RARITY_GROUP_ID);
+    update_piece_rarity(piece_index, current_rarity, IN_PROGRESS_RARITY_GROUP_ID);
     
     emplace_in_progress_pieces(piece_index, std::make_shared<InProgressPiece>(piece_size));
     auto piece_progress = in_progress_piece(piece_index);
@@ -158,9 +158,6 @@ asio::awaitable<bool> PieceManager::try_piece_download(size_t piece_index) {
             }, 
             asio::detached
         );
-        
-        piece_progress->outstanding_requests[block_idx].push_back(peer_conn->peer_id());
-        piece_progress->request_times[block_idx] = std::chrono::steady_clock::now();
     }
     
     asio::co_spawn(io_context_, self->check_and_enter_endgame(), asio::detached);
@@ -233,11 +230,7 @@ asio::awaitable<void> PieceManager::broadcast_outstanding_requests() {
                 if (piece_progress->blocks_received[block_idx]) {
                     continue;
                 }
-                for (const auto& peer_conn : unchoked_peers_with_piece) {
-                    piece_progress->outstanding_requests[block_idx].push_back(peer_conn->peer_id());
-                }
                 target_peers = unchoked_peers_with_piece;
-                piece_progress->request_times[block_idx] = std::chrono::steady_clock::now();
             }
 
             for (const auto& peer_conn : target_peers) {
@@ -259,15 +252,21 @@ asio::awaitable<void> PieceManager::return_piece_to_queue(size_t piece_index) {
     }
     
     state_->piece_status(piece_index, PieceStatus::Needed);
-    co_await update_piece_rarity(piece_index, IN_PROGRESS_RARITY_GROUP_ID, piece_availability_->at(piece_index));
+    update_piece_rarity(piece_index, IN_PROGRESS_RARITY_GROUP_ID, piece_availability_->at(piece_index));
     piece_request_trigger_.cancel_one();
     co_return;
 }
 
-asio::awaitable<void> PieceManager::update_piece_rarity(size_t piece_index, uint32_t old_rarity, uint32_t new_rarity) {
-    // Remove from the old rarity set (post to strand ensures we're on strand upon return)
-    co_await remove_piece_rarity(piece_index, old_rarity);
-    // Add to the new rarity set
+void PieceManager::update_piece_rarity(size_t piece_index, uint32_t old_rarity, uint32_t new_rarity) {
+    std::lock_guard lock(mutex_);
+
+    if (auto it = pieces_by_rarity_->find(old_rarity); it != pieces_by_rarity_->end()) {
+        it->second->erase(static_cast<int>(piece_index));
+        if (it->second->empty()) {
+            pieces_by_rarity_->erase(it);
+        }
+    }
+
     auto& set_ptr = (*pieces_by_rarity_)[new_rarity];
     if (!set_ptr) {
         set_ptr = std::make_shared<std::unordered_set<int>>();
@@ -275,8 +274,8 @@ asio::awaitable<void> PieceManager::update_piece_rarity(size_t piece_index, uint
     set_ptr->insert(static_cast<int>(piece_index));
 }
 
-asio::awaitable<void> PieceManager::remove_piece_rarity(size_t piece_index, uint32_t rarity) {
-    co_await asio::post(strand_, asio::use_awaitable);
+void PieceManager::remove_piece_rarity(size_t piece_index, uint32_t rarity) {
+    std::lock_guard lock(mutex_);
     if (auto it = pieces_by_rarity_->find(rarity); it != pieces_by_rarity_->end()) {
         it->second->erase(piece_index);
         // If the set for the old rarity is now empty, remove the map entry
@@ -286,10 +285,17 @@ asio::awaitable<void> PieceManager::remove_piece_rarity(size_t piece_index, uint
     }
 }
 
-asio::awaitable<void> PieceManager::build_piece_rarity() {
-    co_await asio::dispatch(strand_, asio::use_awaitable);
+void PieceManager::build_piece_rarity() {
+    std::lock_guard lock(mutex_);
+
+    // Resize if metadata was loaded after construction (magnet link case).
+    size_t num_pieces = state_->num_pieces();
+    if (piece_availability_->size() < num_pieces) {
+        piece_availability_->resize(num_pieces, 0);
+    }
+
     pieces_by_rarity_->clear();
-    for (size_t i : std::views::iota(0UL, state_->num_pieces())) {
+    for (size_t i : std::views::iota(0UL, num_pieces)) {
         PieceStatus status = state_->piece_status(i);
         uint32_t target_rarity;
         if (status == PieceStatus::Have) {
@@ -310,6 +316,39 @@ asio::awaitable<void> PieceManager::build_piece_rarity() {
         }
         set_ptr->insert(static_cast<int>(i));
     }
+}
+
+void PieceManager::ensure_resume_piece_download(size_t piece_index) {
+    auto progress = in_progress_piece(piece_index);
+    if (!progress || shutting_down_.load()) {
+        return;
+    }
+
+    {
+        std::lock_guard lock(progress->piece_mutex_);
+        if (progress->resume_task_active) {
+            return;
+        }
+        progress->resume_task_active = true;
+    }
+
+    auto self = shared_from_this();
+    asio::co_spawn(io_context_,
+        [self, piece_index]() -> asio::awaitable<void> {
+            try {
+                co_await self->resume_piece_download(piece_index);
+            } catch (const std::exception& e) {
+                LOGWARN("Resumer for piece {} failed: {}", piece_index, e.what());
+            }
+
+            auto progress = self->in_progress_piece(piece_index);
+            if (progress) {
+                std::lock_guard lock(progress->piece_mutex_);
+                progress->resume_task_active = false;
+            }
+        },
+        asio::detached
+    );
 }
 
 asio::awaitable<void> PieceManager::resume_piece_download(size_t piece_index) {
@@ -358,6 +397,7 @@ asio::awaitable<void> PieceManager::resume_piece_download(size_t piece_index) {
             std::lock_guard lock(piece_progress->piece_mutex_);
             for (uint32_t block_idx = 0; block_idx < piece_progress->total_blocks; ++block_idx) {
                 if (piece_progress->blocks_received[block_idx]) continue;
+                if (!piece_progress->outstanding_requests[block_idx].empty()) continue;
                 uint32_t offset = block_idx * BLOCK_SIZE;
                 uint32_t length = (block_idx == piece_progress->total_blocks - 1)
                     ? (piece_progress->data.size() - offset)
@@ -367,7 +407,6 @@ asio::awaitable<void> PieceManager::resume_piece_download(size_t piece_index) {
                     // In endgame mode, request from all unchoked peers
                     for (const auto& peer_conn : available_peers) {
                         if (peer_conn->peer_is_choking()) continue;
-                        piece_progress->outstanding_requests[block_idx].push_back(peer_conn->peer_id());
                         asio::co_spawn(io_context_,
                             [peer_conn, piece_index, offset, length]() -> asio::awaitable<void> {
                                 co_await peer_conn->send_request(piece_index, offset, length);
@@ -378,7 +417,6 @@ asio::awaitable<void> PieceManager::resume_piece_download(size_t piece_index) {
                 } else {
                     size_t peer_idx = block_idx % available_peers.size();
                     auto& peer_conn = available_peers[peer_idx];
-                    piece_progress->outstanding_requests[block_idx].push_back(peer_conn->peer_id());
                     asio::co_spawn(io_context_,
                         [peer_conn, piece_index, offset, length]() -> asio::awaitable<void> {
                             co_await peer_conn->send_request(piece_index, offset, length);
@@ -386,7 +424,6 @@ asio::awaitable<void> PieceManager::resume_piece_download(size_t piece_index) {
                         asio::detached
                     );
                 }
-                piece_progress->request_times[block_idx] = std::chrono::steady_clock::now();
             }
         }
 
@@ -456,13 +493,8 @@ asio::awaitable<void> PieceManager::check_block_timeouts() {
                     },
                     asio::detached
                 );
-
-                // Re-lock to update outstanding requests
-                {
-                    std::lock_guard lock(piece_progress->piece_mutex_);
-                    piece_progress->outstanding_requests[block_idx].push_back(new_peer->peer_id());
-                    piece_progress->request_times[block_idx] = now;
-                }
+            } else {
+                ensure_resume_piece_download(piece_idx);
             }
         }
     }

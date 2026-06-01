@@ -76,11 +76,12 @@ public:
         (*piece_availability_)[piece_index] += val; 
     }
 
-    asio::awaitable<void> update_piece_rarity(size_t piece_index, uint32_t old_rarity, uint32_t new_rarity);
-    asio::awaitable<void> remove_piece_rarity(size_t piece_index, uint32_t rarity);
-    asio::awaitable<void> build_piece_rarity();
+    void update_piece_rarity(size_t piece_index, uint32_t old_rarity, uint32_t new_rarity);
+    void remove_piece_rarity(size_t piece_index, uint32_t rarity);
+    void build_piece_rarity();
 
     asio::awaitable<void> resume_piece_download(size_t piece_index);
+    void ensure_resume_piece_download(size_t piece_index);
     asio::awaitable<void> broadcast_outstanding_requests();
     
     asio::awaitable<void> downloader();  
