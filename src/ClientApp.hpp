@@ -38,6 +38,9 @@ public:
     // Stop a single torrent by display index (0-based iteration order)
     void stop_torrent(size_t index);
 
+    // Resume a previously stopped torrent
+    void resume_torrent(size_t index);
+
     // Remove a single torrent by display index (stop + remove from torrents_)
     void remove_torrent(size_t index);
 
@@ -65,6 +68,10 @@ public:
     void add_torrent_magnet(const std::string& magnet_uri,
                             const std::filesystem::path& save_path,
                             uint16_t port);
+    void add_torrent_magnet(const std::string& magnet_uri,
+                            const std::filesystem::path& save_path,
+                            uint16_t port,
+                            const std::vector<std::byte>& info_bencoded);
 
     // Add a tracker URL to every active session AND store globally for future torrents
     void add_tracker_to_all(const std::string& url);
@@ -84,6 +91,15 @@ public:
     // Expose io_context for cross-thread command dispatch
     asio::io_context& get_io_context() noexcept { return io_context_; }
 
+    bool is_stopping() const noexcept { return stopping_.load(std::memory_order_acquire); }
+
+    // Check persisted stopped flag (set by explicit user commands, survives restart).
+    bool is_torrent_stopped(const InfoHash& hash) const {
+        std::lock_guard lock(torrents_mutex_);
+        auto it = torrent_meta_.find(hash);
+        return it != torrent_meta_.end() && it->second.stopped;
+    }
+
     // Persist/restore active torrent metadata for restart
     void save_state(const std::filesystem::path& path) const;
     void load_state(const std::filesystem::path& path, uint16_t port);
@@ -93,6 +109,7 @@ private:
         std::string source;
         std::string save_path;
         bool is_magnet;
+        bool stopped{false};
     };
     std::map<InfoHash, TorrentEntry> torrent_meta_;
     asio::io_context io_context_;

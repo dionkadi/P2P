@@ -171,6 +171,11 @@ void ClientApp::stop_all() {
         snapshot = torrents_;
     }
 
+    if (snapshot.empty()) {
+        io_context_.stop();
+        return;
+    }
+
     // Harvest peers from active sessions into cache before stopping
     for (auto& [hash, session] : snapshot) {
         if (!session) continue;
@@ -180,9 +185,22 @@ void ClientApp::stop_all() {
         }
     }
 
+    auto remaining = std::make_shared<std::atomic<size_t>>(snapshot.size());
     for (auto& [hash, session] : snapshot) {
         if (session) {
-            asio::co_spawn(io_context_, session->stop(), asio::detached);
+            asio::co_spawn(io_context_, session->stop(), [this, remaining](std::exception_ptr e) {
+                if (e) {
+                    try {
+                        std::rethrow_exception(e);
+                    } catch (const std::exception& ex) {
+                        LOGERR("ClientApp: session stop failed: {}", ex.what());
+                    }
+                }
+
+                if (remaining->fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                    io_context_.stop();
+                }
+            });
         }
     }
 
@@ -318,6 +336,45 @@ void ClientApp::add_torrent_magnet(const std::string& magnet_uri,
     LOGINFO("Added magnet torrent: {} on port {}", session->get_display_name(), port);
 }
 
+void ClientApp::add_torrent_magnet(const std::string& magnet_uri,
+                                    const std::filesystem::path& save_path,
+                                    uint16_t port,
+                                    const std::vector<std::byte>& info_bencoded) {
+    PeerId peer_id = generate_id(PEER_ID_PREFIX);
+    auto session = TorrentSession::create_from_magnet_with_metadata(
+        io_context_, peer_id, magnet_uri, save_path, port, Mode::Hybrid,
+        info_bencoded, config_.upload_rate_limit, config_.download_rate_limit
+    );
+
+    const auto& hash_vec = session->get_info_hash();
+    InfoHash info_hash{};
+    std::copy_n(hash_vec.begin(), std::min(hash_vec.size(), info_hash.size()), info_hash.begin());
+
+    seed_session_from_cache(info_hash, session);
+    apply_global_trackers(session);
+
+    {
+        std::lock_guard lock(torrents_mutex_);
+        auto [it, inserted] = torrents_.emplace(info_hash, session);
+        if (!inserted) {
+            LOGWARN("Torrent with info_hash already exists");
+            return;
+        }
+    }
+
+    {
+        std::lock_guard lock(torrents_mutex_);
+        torrent_meta_[info_hash] = TorrentEntry{
+            .source = magnet_uri,
+            .save_path = save_path.string(),
+            .is_magnet = true
+        };
+    }
+
+    spawn_session(session);
+    LOGINFO("Restored magnet torrent with metadata: {} on port {}", session->get_display_name(), port);
+}
+
 std::shared_ptr<TorrentSession> ClientApp::torrent_by_index(size_t index) const {
     std::lock_guard lock(torrents_mutex_);
     if (index >= torrents_.size()) return nullptr;
@@ -333,7 +390,105 @@ void ClientApp::stop_torrent(size_t index) {
         return;
     }
     LOGINFO("Stopping torrent at index {}: {}", index, session->get_display_name());
+    // Mark stopped in metadata so it persists across restarts
+    {
+        std::lock_guard lock(torrents_mutex_);
+        for (auto& [hash, entry] : torrent_meta_) {
+            if (torrents_.find(hash) != torrents_.end() &&
+                torrents_.at(hash) == session) {
+                entry.stopped = true;
+                break;
+            }
+        }
+    }
     asio::co_spawn(io_context_, session->stop(), asio::detached);
+}
+
+void ClientApp::resume_torrent(size_t index) {
+    InfoHash hash{};
+    TorrentEntry entry_copy;
+    std::vector<std::byte> old_info;
+    uint64_t old_downloaded = 0, old_uploaded = 0;
+    {
+        std::lock_guard lock(torrents_mutex_);
+        if (index >= torrent_meta_.size()) {
+            LOGWARN("No torrent at index {}", index);
+            return;
+        }
+        auto it = torrent_meta_.begin();
+        std::advance(it, index);
+        hash = it->first;
+        entry_copy = it->second;
+        // If not actually stopped (e.g. already running), nothing to do
+        auto session_it = torrents_.find(hash);
+        if (session_it != torrents_.end()) {
+            if (!session_it->second->is_stopped()) {
+                LOGINFO("Torrent {} is already running.", entry_copy.source);
+                return;
+            }
+            // Capture metadata and stats from the old stopped session
+            // before erasing it.
+            auto st = session_it->second->get_state();
+            if (st) {
+                old_downloaded = st->total_bytes_downloaded();
+                old_uploaded = st->total_bytes_uploaded();
+                if (st->has_metadata()) {
+                    old_info = st->info().get_info_bencoded();
+                }
+            }
+        }
+    }
+    LOGINFO("Resuming torrent at index {}: {}", index, entry_copy.source);
+    // Remove old stopped session and re-create
+    {
+        std::lock_guard lock(torrents_mutex_);
+        torrents_.erase(hash);
+    }
+    try {
+        if (entry_copy.is_magnet) {
+            // If we have cached metadata from the stopped session, pass it
+            // so the new session has the name and piece layout immediately.
+            if (!old_info.empty()) {
+                add_torrent_magnet(entry_copy.source, entry_copy.save_path,
+                                   config_.peer_port, old_info);
+            } else {
+                add_torrent_magnet(entry_copy.source, entry_copy.save_path,
+                                   config_.peer_port);
+            }
+        } else {
+            add_torrent(Mode::Hybrid, entry_copy.source, entry_copy.save_path,
+                        config_.peer_port);
+        }
+        // Seed the new session with the old DL/UL byte counts so the TUI
+        // shows accumulated totals immediately (not 0).
+        if (old_downloaded > 0 || old_uploaded > 0) {
+            std::lock_guard lock(torrents_mutex_);
+            auto session_it = torrents_.find(hash);
+            if (session_it != torrents_.end()) {
+                auto st = session_it->second->get_state();
+                if (st) {
+                    st->add_total_bytes_downloaded(old_downloaded);
+                    st->add_total_bytes_uploaded(old_uploaded);
+                }
+            }
+        }
+        // Clear the stopped flag
+        {
+            std::lock_guard lock(torrents_mutex_);
+            auto meta_it = torrent_meta_.find(hash);
+            if (meta_it != torrent_meta_.end()) {
+                meta_it->second.stopped = false;
+            }
+        }
+    } catch (const std::exception& e) {
+        LOGERR("Failed to resume torrent '{}': {}", entry_copy.source, e.what());
+        // Restore stopped entry state
+        std::lock_guard lock(torrents_mutex_);
+        auto meta_it = torrent_meta_.find(hash);
+        if (meta_it != torrent_meta_.end()) {
+            meta_it->second.stopped = true;
+        }
+    }
 }
 
 void ClientApp::remove_torrent(size_t index) {
@@ -359,7 +514,7 @@ void ClientApp::remove_torrent(size_t index) {
 void ClientApp::apply_global_trackers(std::shared_ptr<TorrentSession> session) {
     std::lock_guard lock(torrents_mutex_);
     for (const auto& url : global_trackers_) {
-        session->add_tracker_url(url);
+        session->add_tracker_url_direct(url);
     }
 }
 
@@ -401,6 +556,51 @@ void ClientApp::save_state(const std::filesystem::path& path) const {
         entry_dict["source"] = Value{entry.source};
         entry_dict["dest"] = Value{entry.save_path};
         entry_dict["type"] = Value{entry.is_magnet ? String("magnet") : String("file")};
+
+        // Persist stopped/paused status from the metadata entry
+        // (set by explicit user stop/resume commands, not shutdown).
+        entry_dict["stopped"] = Value{static_cast<Integer>(entry.stopped ? 1 : 0)};
+
+        // Persist info_hash as hex so load_state can look up the session
+        // without re-parsing source.
+        std::string hash_hex;
+        hash_hex.reserve(hash.size() * 2);
+        for (auto b : hash) {
+            hash_hex += std::format("{:02x}", static_cast<unsigned>(b));
+        }
+        entry_dict["hash"] = Value{hash_hex};
+
+        if (entry.is_magnet) {
+            auto it = torrents_.find(hash);
+            if (it == torrents_.end()) {
+                continue;
+            }
+            auto state = it->second->get_state();
+            // Always save the magnet entry, even without metadata yet.
+            // On restore we'll re-initiate metadata download from peers.
+            if (state && state->has_metadata()) {
+                const auto& info_bencoded = state->info().get_info_bencoded();
+                entry_dict["info"] = Value(String(
+                    reinterpret_cast<const char*>(info_bencoded.data()),
+                    info_bencoded.size()
+                ));
+            }
+        }
+
+        // Persist DL/UL byte counters so they survive restart
+        {
+            auto sit = torrents_.find(hash);
+            if (sit != torrents_.end()) {
+                auto st = sit->second->get_state();
+                if (st) {
+                    entry_dict["downloaded"] =
+                        Value{static_cast<Integer>(st->total_bytes_downloaded())};
+                    entry_dict["uploaded"] =
+                        Value{static_cast<Integer>(st->total_bytes_uploaded())};
+                }
+            }
+        }
+
         torrents_list.push_back(Value{std::move(entry_dict)});
     }
     root["torrents"] = Value{std::move(torrents_list)};
@@ -483,11 +683,92 @@ void ClientApp::load_state(const std::filesystem::path& path, uint16_t port) {
         const auto* type = std::get_if<String>(&type_it->second.get_variant());
         if (!source || !dest || !type) continue;
 
+        // Read persisted info_hash (optional — absent in legacy state files)
+        InfoHash hash{};
+        bool have_hash = false;
+        auto hash_it = entry.find("hash");
+        if (hash_it != entry.end()) {
+            const auto* hash_str = std::get_if<String>(&hash_it->second.get_variant());
+            if (hash_str && hash_str->size() == HASH_SIZE * 2) {
+                hash = decode_hex_info_hash(*hash_str);
+                have_hash = true;
+            }
+        }
+
+        // Read persisted DL/UL byte counters (optional — absent in legacy)
+        uint64_t saved_dl = 0, saved_ul = 0;
+        auto dl_it = entry.find("downloaded");
+        if (dl_it != entry.end()) {
+            try { saved_dl = static_cast<uint64_t>(std::get<Integer>(dl_it->second.get_variant())); } catch (...) {}
+        }
+        auto ul_it = entry.find("uploaded");
+        if (ul_it != entry.end()) {
+            try { saved_ul = static_cast<uint64_t>(std::get<Integer>(ul_it->second.get_variant())); } catch (...) {}
+        }
+
+        // Read persisted stopped status (default to false for legacy state)
+        bool was_stopped = false;
+        auto stopped_it = entry.find("stopped");
+        if (stopped_it != entry.end()) {
+            was_stopped = std::get<Integer>(stopped_it->second.get_variant()) != 0;
+        }
+
         try {
             if (*type == "magnet") {
-                add_torrent_magnet(*source, *dest, port);
+                auto info_it = entry.find("info");
+                if (info_it != entry.end()) {
+                    const auto* info = std::get_if<String>(&info_it->second.get_variant());
+                    if (info && !info->empty()) {
+                        std::vector<std::byte> info_bencoded(info->size());
+                        std::transform(info->begin(), info->end(), info_bencoded.begin(),
+                                       [](char c) { return static_cast<std::byte>(c); });
+                        add_torrent_magnet(*source, *dest, port, info_bencoded);
+                    } else {
+                        // Metadata not yet downloaded; re-initiate from magnet URI
+                        add_torrent_magnet(*source, *dest, port);
+                    }
+                } else {
+                    // No metadata stored yet; re-initiate metadata download
+                    add_torrent_magnet(*source, *dest, port);
+                }
             } else {
                 add_torrent(Mode::Hybrid, *source, *dest, port);
+            }
+
+            // Restore DL/UL byte counters into the new session so the TUI
+            // shows accumulated totals from the start.
+            if ((saved_dl > 0 || saved_ul > 0) && have_hash) {
+                std::lock_guard lock(torrents_mutex_);
+                auto sit = torrents_.find(hash);
+                if (sit != torrents_.end()) {
+                    auto st = sit->second->get_state();
+                    if (st) {
+                        st->add_total_bytes_downloaded(saved_dl);
+                        st->add_total_bytes_uploaded(saved_ul);
+                    }
+                }
+            }
+
+            // If this torrent was stopped before shutdown, spawn a deferred
+            // stop after the io_context starts.  Use the saved hash when
+            // available (robust) and fall back to the last map element for
+            // legacy state files.
+            if (was_stopped) {
+                asio::post(io_context_, [this, hash, have_hash] {
+                    std::lock_guard lock(torrents_mutex_);
+                    InfoHash target = hash;
+                    if (!have_hash) {
+                        if (torrents_.empty()) return;
+                        target = std::prev(torrents_.end())->first;
+                    }
+                    auto it = torrents_.find(target);
+                    if (it == torrents_.end()) return;
+                    asio::co_spawn(io_context_, it->second->stop(), asio::detached);
+                    auto meta = torrent_meta_.find(target);
+                    if (meta != torrent_meta_.end()) {
+                        meta->second.stopped = true;
+                    }
+                });
             }
         } catch (const std::exception& e) {
             LOGWARN("Failed to restore torrent '{}': {}", *source, e.what());
