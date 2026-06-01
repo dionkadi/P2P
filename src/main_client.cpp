@@ -404,6 +404,7 @@ int main(int argc, char* argv[]) {
                             "  t <url>             - Add tracker to all torrents\n"
                             "  f <url>             - Fetch trackers list from URL\n"
                             "  s <idx>             - Stop torrent at index\n"
+                            "  p <idx>             - Resume stopped torrent\n"
                             "  r <idx>             - Remove torrent at index\n"
                             "  q                   - Quit\n"
                             "  h                   - This help"
@@ -453,6 +454,16 @@ int main(int argc, char* argv[]) {
                                 command_log.warning("Fetch threw for " + url);
                             }
                         }).detach();
+                    } else if (cmd_line[0] == 'p' && cmd_line.size() > 1) {
+                        std::string idx_str = trim(cmd_line.substr(1));
+                        char* end = nullptr;
+                        long idx = std::strtol(idx_str.c_str(), &end, 10);
+                        if (end == idx_str.c_str() || idx < 0) {
+                            command_log.warning("Usage: p <index>");
+                        } else {
+                            app.resume_torrent(static_cast<size_t>(idx));
+                            command_log.info("Resumed torrent at index " + idx_str);
+                        }
                     } else if ((cmd_line[0] == 's' || cmd_line[0] == 'r') && cmd_line.size() > 1) {
                         std::string idx_str = trim(cmd_line.substr(1));
                         char* end = nullptr;
@@ -494,9 +505,10 @@ int main(int argc, char* argv[]) {
         double up_speed{0};
         bool first_sample{true};
     };
-    auto speed = std::make_shared<SpeedState>();
+    // Per-torrent speed tracking keyed by InfoHash
+    std::map<InfoHash, SpeedState> speeds;
 
-    display.add_slot([&app, speed, &input_buffer, &input_mutex,
+    display.add_slot([&app, &speeds, &input_buffer, &input_mutex,
                       &command_log, input_active, &cursor_pos]() -> std::string {
         auto now = std::chrono::steady_clock::now();
         size_t term_w = Terminal::width();
@@ -518,28 +530,47 @@ int main(int argc, char* argv[]) {
             size_t peers = session->peer_manager()->connection_count();
             double progress = total > 0 ? (100.0 * completed / total) : 0.0;
 
-            auto elapsed = std::chrono::duration_cast<std::chrono::duration<double>>(now - speed->last_time).count();
+            auto& sp = speeds[hash];
+            // Detect session replacement (stop + resume creates a new session
+            // with the same InfoHash but fresh byte counters).  Reset speed
+            // tracking to avoid a huge negative raw rate.
+            if (!sp.first_sample && downloaded < sp.last_down) {
+                sp = SpeedState{};
+            }
+            auto elapsed = std::chrono::duration_cast<std::chrono::duration<double>>(now - sp.last_time).count();
             if (elapsed >= 0.5) {
-                if (speed->first_sample) {
-                    speed->down_speed = 0;
-                    speed->up_speed = 0;
-                    speed->first_sample = false;
+                if (sp.first_sample) {
+                    sp.down_speed = 0;
+                    sp.up_speed = 0;
+                    sp.first_sample = false;
                 } else {
-                    double raw_down = (downloaded - speed->last_down) / elapsed;
-                    double raw_up = (uploaded - speed->last_up) / elapsed;
-                    speed->down_speed = kEmaAlpha * raw_down + (1.0 - kEmaAlpha) * speed->down_speed;
-                    speed->up_speed = kEmaAlpha * raw_up + (1.0 - kEmaAlpha) * speed->up_speed;
+                    double raw_down = (downloaded - sp.last_down) / elapsed;
+                    double raw_up = (uploaded - sp.last_up) / elapsed;
+                    sp.down_speed = kEmaAlpha * raw_down + (1.0 - kEmaAlpha) * sp.down_speed;
+                    sp.up_speed = kEmaAlpha * raw_up + (1.0 - kEmaAlpha) * sp.up_speed;
                 }
-                speed->last_time = now;
-                speed->last_down = downloaded;
-                speed->last_up = uploaded;
+                sp.last_time = now;
+                sp.last_down = downloaded;
+                sp.last_up = uploaded;
             }
 
-            // Badge
-            if (state->is_download_complete()) {
-                torrents_body += Text{" ● SEED "}.color(style::green).bold().str();
+            // Badge (reads persisted stopped flag, not runtime state)
+            // if (app.is_stopping()) {
+            //     // Global shutdown in progress — don't flip to stopped
+            //     if (state->is_download_complete()) {
+            //         torrents_body += Text{" ✅ SEED "}.color(style::green).bold().str();
+            //     } else if (app.is_torrent_stopped(hash)) {
+            //         torrents_body += Text{" ⏸ STOPPED "}.color(style::yellow).bold().str();
+            //     } else {
+            //         torrents_body += Text{" ⬇ DOWNLOAD "}.color(style::cyan).bold().str();
+            //     }
+            // } else 
+            if (app.is_torrent_stopped(hash)) {
+                torrents_body += Text{" ⏸ STOPPED "}.color(style::yellow).bold().str();
+            } else if (state->is_download_complete()) {
+                torrents_body += Text{" ✅ SEED "}.color(style::green).bold().str();
             } else {
-                torrents_body += Text{" ▓ DOWNLOAD "}.color(style::cyan).bold().str();
+                torrents_body += Text{" ⬇ DOWNLOAD "}.color(style::cyan).bold().str();
             }
 
             size_t max_name = term_w > 60 ? term_w - 60 : 20;
@@ -554,25 +585,31 @@ int main(int argc, char* argv[]) {
             size_t filled = static_cast<size_t>(bar_w * progress / 100.0);
             if (filled > bar_w) filled = bar_w;
 
-            torrents_body += "  [";
+            torrents_body += "[";
             for (size_t i = 0; i < bar_w; ++i) {
                 if (i < filled) {
                     auto c = Gradient{{RGB{220,50,50}, RGB{220,180,30}, RGB{50,200,50}}}
                         .at(bar_w > 1 ? static_cast<double>(i) / (bar_w - 1) : 1.0);
-                    torrents_body += c.to_ansi_foreground() + "█" + std::string(style::reset);
+                    torrents_body += c.to_ansi_foreground() + "😎" + std::string(style::reset);
                 } else {
-                    torrents_body += Text{"░"}.color(style::bright_black).str();
+                    torrents_body += Text{" "}.color(style::bright_black).str();
                 }
             }
-            torrents_body += "] ";
+            torrents_body += "]";
 
-            torrents_body += Text{std::format("{:5.1f}%", progress)}.color(style::yellow).str() + "  ";
+            torrents_body += Text{std::format(" {:5.1f}%", progress)}.color(style::yellow).str();
+            if (app.is_torrent_stopped(hash)) {
+                torrents_body += "\n\n";
+                ++tor_idx;
+                continue;
+            }
+            torrents_body += "  |  ";
             size_t trackers = session->connected_tracker_count();
-            torrents_body += Text{std::format("Peers: {}  Trackers: {}", peers, trackers)}.color(style::bright_black).str() + " |";
+            torrents_body += Text{std::format("Peers: {}  Trackers: {}", peers, trackers)}.color(style::bright_black).str() + " | ";
 
             torrents_body += "  ";
-            torrents_body += Text{std::format("↓ {}/s", fmt_bytes(static_cast<uint64_t>(speed->down_speed)))}.color(style::blue).str() + "  ";
-            torrents_body += Text{std::format("↑ {}/s", fmt_bytes(static_cast<uint64_t>(speed->up_speed)))}.color(style::magenta).str() + "  ";
+            torrents_body += Text{std::format("↓ {}/s", fmt_bytes(static_cast<uint64_t>(sp.down_speed)))}.color(style::blue).str() + "  ";
+            torrents_body += Text{std::format("↑ {}/s", fmt_bytes(static_cast<uint64_t>(sp.up_speed)))}.color(style::magenta).str() + "  ";
             torrents_body += std::format("DL: {}  UL: {}", fmt_bytes(downloaded), fmt_bytes(uploaded));
             if (!state->is_download_complete()) {
                 size_t needed = state->needed_pieces();
