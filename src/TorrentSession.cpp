@@ -164,6 +164,7 @@ std::shared_ptr<TorrentSession> TorrentSession::create_from_magnet_with_metadata
 }
 
 asio::awaitable<bool> TorrentSession::init() {
+    CTRACK_ASYNC("TorrentSession::init");
     // Magnet link mode: no metadata yet, skip file operations
     if (state_->num_pieces() == 0) {
         LOGINFO("Session started in metadata-download mode (magnet link). Waiting for metadata from peers...");
@@ -216,6 +217,7 @@ asio::awaitable<bool> TorrentSession::init() {
 }
 
 asio::awaitable<void> TorrentSession::run() {
+    CTRACK_ASYNC("TorrentSession::run");
     if (!co_await init()) {
         LOGERR("Failed to initialize");
         co_return ;
@@ -238,7 +240,10 @@ asio::awaitable<void> TorrentSession::run() {
     }
 
     if (peer_server_) {
-        asio::co_spawn(self->io_context_, [self]() -> asio::awaitable<void> {
+        auto weak_server = weak_from_this();
+        asio::co_spawn(self->io_context_, [weak_server]() -> asio::awaitable<void> {
+            auto self = weak_server.lock();
+            if (!self) co_return;
             LOGINFO("Listening for incoming connections on port {}", self->peer_port_);
             while (!self->shutting_down_) {
                 try {
@@ -270,13 +275,17 @@ asio::awaitable<void> TorrentSession::run() {
     }
     asio::co_spawn(io_context_, peer_manager_->choke_loop(), asio::detached);
     if (mode_ != Mode::Seed) {
-        auto self = shared_from_this();
-        piece_manager_->set_callback([self] (size_t piece_index) 
-                                             -> asio::awaitable<std::vector<std::shared_ptr<PeerConnection>>> 
-                                         { co_return co_await self->peer_manager_->available_peers(piece_index); }
-                                     );
-        piece_manager_->set_block_timeout_callback([self](uint32_t piece_index, uint32_t block_index)
+        auto weak_cb = weak_from_this();
+        piece_manager_->set_callback([weak_cb] (size_t piece_index) 
+                                             -> asio::awaitable<std::vector<std::shared_ptr<PeerConnection>>> {
+                                         auto self = weak_cb.lock();
+                                         if (!self) co_return std::vector<std::shared_ptr<PeerConnection>>{};
+                                         co_return co_await self->peer_manager_->available_peers(piece_index);
+                                     });
+        piece_manager_->set_block_timeout_callback([weak_cb](uint32_t piece_index, uint32_t block_index)
                                                          -> asio::awaitable<void> {
+                                                     auto self = weak_cb.lock();
+                                                     if (!self) co_return;
                                                      co_await self->send_cancel_for_block(piece_index, block_index, PeerId{});
                                                  });
         asio::co_spawn(io_context_, piece_manager_->downloader(), asio::detached);
@@ -303,6 +312,7 @@ asio::awaitable<void> TorrentSession::run() {
 }
 
 asio::awaitable<void> TorrentSession::stop() {
+    CTRACK_ASYNC("TorrentSession::stop");
     using namespace boost::asio::experimental::awaitable_operators;
     auto self = shared_from_this();
     (void)self;
@@ -450,34 +460,34 @@ asio::awaitable<void> TorrentSession::handle_new_connection(AsyncSocket socket, 
 }
 
 asio::awaitable<void> TorrentSession::tracker_announce_loop() {
-    auto self = shared_from_this();
-    (void)self;
+    auto weak_this = weak_from_this();
     std::string event = "started";
     bool completed_event_sent = false;
-    std::random_device rd;
-    std::mt19937 g(rd());
 
     while (true) {
-        bool is_completed = state_->is_download_complete();
+        auto self = weak_this.lock();
+        if (!self) co_return;
 
-        if (is_completed && mode_ == Mode::Leech) {
+        bool is_completed = self->state_->is_download_complete();
+
+        if (is_completed && self->mode_ == Mode::Leech) {
             LOGINFO("Download complete. Stopping tracker announcements.");
             co_return;
         }
 
-        if (is_completed && !completed_event_sent && mode_ != Mode::Seed) {
+        if (is_completed && !completed_event_sent && self->mode_ != Mode::Seed) {
             event = "completed";
             completed_event_sent = true;
         }
 
-        co_await announce_tracker_for(event);
+        co_await self->announce_tracker_for(event);
         event = "";
- 
-        tracker_announce_timer_.expires_after(tracker_announce_interval_);
+
+        self->tracker_announce_timer_.expires_after(self->tracker_announce_interval_);
         boost::system::error_code ec;
-        co_await tracker_announce_timer_.async_wait(asio::redirect_error(asio::use_awaitable, ec)); // Wait on timer
+        co_await self->tracker_announce_timer_.async_wait(asio::redirect_error(asio::use_awaitable, ec));
         if (ec == asio::error::operation_aborted) {
-            if (shutting_down_) {
+            if (self->shutting_down_) {
                 LOGDBG("Tracker announce timer aborted during shutdown.");
                 co_return;
             }
@@ -488,30 +498,33 @@ asio::awaitable<void> TorrentSession::tracker_announce_loop() {
 }
 
 asio::awaitable<void> TorrentSession::announce_tracker_for(std::string event) {
-    auto self = shared_from_this();
-    (void)self;
+    auto weak_this = weak_from_this();
+
+    auto self = weak_this.lock();
+    if (!self) co_return;
+
     uint64_t left = 0;
-    if (state_->is_download_complete()) {
+    if (self->state_->is_download_complete()) {
         left = 0; // Seeder or completed download
     } else {
-        uint64_t total_size = state_->torrent_info().total_size;
-        uint64_t downloaded = static_cast<uint64_t>(state_->completed_pieces()) * state_->torrent_info().piece_size;
+        uint64_t total_size = self->state_->torrent_info().total_size;
+        uint64_t downloaded = static_cast<uint64_t>(self->state_->completed_pieces()) * self->state_->torrent_info().piece_size;
         left = (downloaded >= total_size) ? 0 : (total_size - downloaded);
     }
 
     AnnounceRequestParams params {
-        .info_hash_bytes = state_->info_hash(),
-        .peer_id = my_peer_id_,
+        .info_hash_bytes = self->state_->info_hash(),
+        .peer_id = self->my_peer_id_,
         .event = event,
-        .port = peer_port_,
-        .uploaded = state_->total_bytes_uploaded(),
-        .downloaded = state_->total_bytes_downloaded(),
+        .port = self->peer_port_,
+        .uploaded = self->state_->total_bytes_uploaded(),
+        .downloaded = self->state_->total_bytes_downloaded(),
         .left = left,
     };
 
     bool announce_successful = false;
-    co_await asio::dispatch(strand_, asio::use_awaitable);
-    for (auto& tier : tracker_clients_by_tier_) {
+    co_await asio::dispatch(self->strand_, asio::use_awaitable);
+    for (auto& tier : self->tracker_clients_by_tier_) {
         for (const auto& tracker_client : tier) {
             if (!tracker_client) {
                 continue;
@@ -520,9 +533,9 @@ asio::awaitable<void> TorrentSession::announce_tracker_for(std::string event) {
 
             // Check backoff for this tracker URL
             {
-                std::lock_guard lock(tracker_backoff_mutex_);
-                auto it = tracker_backoff_states_.find(url);
-                if (it != tracker_backoff_states_.end()) {
+                std::lock_guard lock(self->tracker_backoff_mutex_);
+                auto it = self->tracker_backoff_states_.find(url);
+                if (it != self->tracker_backoff_states_.end()) {
                     it->second.check_and_reset_if_idle();
                     if (it->second.is_in_backoff()) {
                         LOGDBG("announce_tracker_for: skipping tracker {} (in backoff, attempt {})",
@@ -538,24 +551,23 @@ asio::awaitable<void> TorrentSession::announce_tracker_for(std::string event) {
                 announce_successful = true;
 
                 {
-                    std::lock_guard lock(tracker_backoff_mutex_);
-                    tracker_backoff_states_[url].on_success();
+                    std::lock_guard lock(self->tracker_backoff_mutex_);
+                    self->tracker_backoff_states_[url].on_success();
                 }
-                
-                tracker_announce_interval_ = std::chrono::seconds(result.interval_seconds);
+
+                self->tracker_announce_interval_ = std::chrono::seconds(result.interval_seconds);
                 if (event != "stopped") {
-                    auto weak_self = weak_from_this();
-                    auto peer_manager = peer_manager_;
+                    auto peer_manager = self->peer_manager_;
                     for (const auto& peer_addr : result.peers) {
                         std::string ip = PeerManager::extract_ip_from_addr(peer_addr);
-                        bool already_connected = peer_manager_->contains_peer_addr(peer_addr)
-                                                 || peer_manager_->contains_peer_ip(ip);
+                        bool already_connected = self->peer_manager_->contains_peer_addr(peer_addr)
+                                                 || self->peer_manager_->contains_peer_ip(ip);
                         if (!already_connected) {
-                            asio::co_spawn(io_context_, 
-                                [peer_addr, weak_self, peer_manager] () -> asio::awaitable<void> {
+                            asio::co_spawn(self->io_context_, 
+                                [peer_addr, weak_this, peer_manager] () -> asio::awaitable<void> {
                                     auto socket = co_await peer_manager->connect_to_peer(peer_addr);
                                     if (socket) {
-                                        if (auto self = weak_self.lock()) {
+                                        if (auto self = weak_this.lock()) {
                                             co_await self->handle_new_connection(std::move(*socket), peer_addr);
                                         }
                                     }
@@ -570,14 +582,14 @@ asio::awaitable<void> TorrentSession::announce_tracker_for(std::string event) {
             } catch (const std::exception& e) {
                 LOGERR("Failed to announce to tracker: {}.", e.what());
                 {
-                    std::lock_guard lock(tracker_backoff_mutex_);
-                    tracker_backoff_states_[url].on_failure(tracker_announce_interval_);
+                    std::lock_guard lock(self->tracker_backoff_mutex_);
+                    self->tracker_backoff_states_[url].on_failure(self->tracker_announce_interval_);
                 }
             }
         }
 
         if (announce_successful) {
-            break ;
+            break;
         }
     }
 
@@ -601,8 +613,9 @@ void TorrentSession::add_tracker_url(const std::string& url) {
         LOGERR("Failed to create tracker client for URL: {}", url);
         return;
     }
-    asio::dispatch(strand_, [self = shared_from_this(), client = std::move(client), url]() mutable {
-        if (self->shutting_down_) {
+    asio::dispatch(strand_, [weak_self = weak_from_this(), client = std::move(client), url]() mutable {
+        auto self = weak_self.lock();
+        if (!self || self->shutting_down_) {
             return;
         }
         if (self->tracker_clients_by_tier_.empty()) {
@@ -744,6 +757,7 @@ asio::awaitable<void> TorrentSession::await_download_tokens(size_t amount) {
 }
 
 asio::awaitable<void> TorrentSession::on_piece_block(std::shared_ptr<PeerConnection> conn, size_t piece_index, uint32_t begin, std::span<const std::byte> block_data) {
+    CTRACK_ASYNC("TorrentSession::on_piece_block");
     co_await await_download_tokens(block_data.size());
 
     conn->last_data_received(std::chrono::steady_clock::now());
@@ -1059,6 +1073,9 @@ asio::awaitable<void> TorrentSession::on_choke_status_changed(std::shared_ptr<Pe
 }
 
 asio::awaitable<void> TorrentSession::on_disconnect(std::shared_ptr<PeerConnection> conn) {
+    // During shutdown signal_shutdown() clears piece_availability_ and other
+    // manager data.  Skip cleanup to avoid UAF / noexcept violations.
+    if (shutting_down_.load()) co_return;
     for (size_t i = 0; i < state_->num_pieces(); ++i) {
         if (conn->has_piece(i)) {
             uint32_t old_rarity = piece_manager_->piece_availability(i);
@@ -1706,15 +1723,19 @@ asio::awaitable<void> TorrentSession::on_metadata_complete() {
 
         // Start download loops that were skipped in init()
         if (mode_ != Mode::Seed) {
-            auto meta_self = shared_from_this();
+            auto weak_meta = weak_from_this();
             asio::co_spawn(io_context_, peer_manager_->choke_loop(), asio::detached);
-            piece_manager_->set_callback([meta_self](size_t piece_index)
+            piece_manager_->set_callback([weak_meta](size_t piece_index)
                 -> asio::awaitable<std::vector<std::shared_ptr<PeerConnection>>> {
-                    co_return co_await meta_self->peer_manager_->available_peers(piece_index);
+                    auto self = weak_meta.lock();
+                    if (!self) co_return std::vector<std::shared_ptr<PeerConnection>>{};
+                    co_return co_await self->peer_manager_->available_peers(piece_index);
                 });
-            piece_manager_->set_block_timeout_callback([meta_self](uint32_t piece_index, uint32_t block_index)
+            piece_manager_->set_block_timeout_callback([weak_meta](uint32_t piece_index, uint32_t block_index)
                                                             -> asio::awaitable<void> {
-                                                        co_await meta_self->send_cancel_for_block(piece_index, block_index, PeerId{});
+                                                        auto self = weak_meta.lock();
+                                                        if (!self) co_return;
+                                                        co_await self->send_cancel_for_block(piece_index, block_index, PeerId{});
                                                     });
             asio::co_spawn(io_context_, piece_manager_->downloader(), asio::detached);
             asio::co_spawn(strand_, periodically_save(), asio::detached);

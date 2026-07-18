@@ -26,6 +26,7 @@
 #include <openssl/evp.h>
 #include <openssl/sha.h>
 #include "Bencode.hpp"
+#include "ctrack.hpp"
 
 using namespace std::chrono_literals;
 
@@ -311,6 +312,7 @@ inline std::vector<std::byte> hex_to_bytes(const std::string &hex) {
 
 
 inline std::vector<std::byte> calculate_sha1_hash_data(std::span<const std::byte> data) {
+    CTRACK;
     unsigned char hash[SHA_DIGEST_LENGTH];
     if (!(SHA1(reinterpret_cast<const unsigned char*>(data.data()), data.size(), hash))) {
         throw std::runtime_error("SHA1 failed");

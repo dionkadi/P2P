@@ -508,7 +508,16 @@ void ClientApp::remove_torrent(size_t index) {
         torrent_meta_.erase(hash);
     }
     LOGINFO("Removed torrent: {} (will stop async)", session->get_display_name());
-    asio::co_spawn(io_context_, session->stop(), asio::detached);
+    // Keep the session alive until stop() completes by chaining a
+    // completion handler that holds the shared_ptr.  This avoids a
+    // use-after-free when the lazy awaitable (initial_suspend = suspend_always)
+    // hasn't yet been pumped by the io_context.
+    asio::co_spawn(
+        io_context_,
+        session->stop(),
+        [session](std::exception_ptr) mutable {
+            session.reset();
+        });
 }
 
 void ClientApp::apply_global_trackers(std::shared_ptr<TorrentSession> session) {

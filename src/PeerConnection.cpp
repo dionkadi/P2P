@@ -10,6 +10,7 @@ PeerConnection::create(
     const PeerId& my_id, std::shared_ptr<SessionState> state,
     std::shared_ptr<IPeerConnectionEvents> events
 ) {
+    CTRACK_ASYNC("PeerConnection::create");
     struct EnableMakeShared : public PeerConnection {
         EnableMakeShared(
             asio::io_context& io_context, AsyncSocket socket, std::string peer_addr, 
@@ -176,6 +177,7 @@ void PeerConnection::start_loops() {
 }
 
 asio::awaitable<void> PeerConnection::message_loop() {
+    CTRACK_ASYNC("PeerConnection::message_loop");
     auto self = shared_from_this();
     try {
         while (true) {
@@ -297,6 +299,7 @@ asio::awaitable<void> PeerConnection::message_loop() {
 }
 
 asio::awaitable<void> PeerConnection::keep_alive_loop() {
+    CTRACK_ASYNC("PeerConnection::keep_alive_loop");
     auto self = shared_from_this();
 
     while (true) {
@@ -444,6 +447,7 @@ void PeerConnection::on_request_rejected(uint32_t length) {
 }
 
 asio::awaitable<void> PeerConnection::send_piece(size_t index, uint32_t begin, std::span<const std::byte> block_data) {
+    CTRACK_ASYNC("PeerConnection::send_piece");
     co_await upload_limiter_->await_tokens(block_data.size());
     std::vector<std::byte> msg_body(1, static_cast<std::byte>(MessageType::Piece));
     BufferWriter writer(msg_body);

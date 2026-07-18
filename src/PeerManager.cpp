@@ -97,6 +97,7 @@ std::string PeerManager::extract_ip_from_addr(const std::string& peer_addr) {
 }
 
 asio::awaitable<std::optional<AsyncSocket>> PeerManager::connect_to_peer(const std::string& peer_addr) {
+    CTRACK_ASYNC("PeerManager::connect_to_peer");
     if (shutting_down_.load(std::memory_order_acquire)) {
         co_return std::nullopt;
     }
@@ -169,7 +170,29 @@ asio::awaitable<std::optional<AsyncSocket>> PeerManager::connect_to_peer(const s
                 co_return std::nullopt;
             }
 
-            co_await asio::async_connect(*raw_socket, endpoints, asio::redirect_error(asio::use_awaitable, ec));
+            // Connect with a timeout — TCP connect can block for minutes otherwise
+            {
+                asio::steady_timer connect_timer(io_context_);
+                connect_timer.expires_after(std::chrono::seconds(15));
+                bool connect_timed_out = false;
+
+                connect_timer.async_wait([&raw_socket, &connect_timed_out](boost::system::error_code timer_ec) {
+                    if (!timer_ec) {
+                        connect_timed_out = true;
+                        if (raw_socket->is_open()) {
+                            boost::system::error_code close_ec;
+                            raw_socket->close(close_ec);
+                        }
+                    }
+                });
+
+                co_await asio::async_connect(*raw_socket, endpoints, asio::redirect_error(asio::use_awaitable, ec));
+                connect_timer.cancel();
+
+                if (connect_timed_out && !ec) {
+                    ec = asio::error::timed_out;
+                }
+            }
             remove_pending_socket();
 
             if (ec || shutting_down_.load(std::memory_order_acquire)) {
@@ -262,6 +285,7 @@ void PeerManager::report_connection_failure(const std::string& peer_addr) {
 }
 
 asio::awaitable<void> PeerManager::choke_loop() {
+    CTRACK_ASYNC("PeerManager::choke_loop");
     auto self = shared_from_this();
     std::mt19937 rng(std::random_device{}());
     
@@ -430,6 +454,7 @@ asio::awaitable<std::vector<std::shared_ptr<PeerConnection>>> PeerManager::avail
 }
 
 asio::awaitable<void> PeerManager::pex_loop() {
+    CTRACK_ASYNC("PeerManager::pex_loop");
     auto self = shared_from_this();
     
     while (true) {
@@ -605,6 +630,7 @@ void PeerManager::report_timeout(const std::string& peer_addr) {
 }
 
 asio::awaitable<void> PeerManager::ban_cleanup_loop() {
+    CTRACK_ASYNC("PeerManager::ban_cleanup_loop");
     auto self = shared_from_this();
 
     while (true) {

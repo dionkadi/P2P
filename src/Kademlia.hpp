@@ -445,6 +445,31 @@ auto DHTNode::async_ping(String tid, udp::endpoint target, CompletionToken&& tok
             auto query = std::make_shared<PendingQuery>();
             query->remote = target;
             query->expiry = std::chrono::steady_clock::now() + KRPC_QUERY_TIMEOUT;
+
+            // Register cancellation slot: when the parallel_group cancels this op,
+            // clean up the pending query and invoke completion with operation_aborted.
+            // This is required because parallel_group waits for ALL operations to
+            // complete before invoking the final handler (outstanding_ == 0).
+            auto cancel_slot = asio::get_associated_cancellation_slot(handler);
+            if (cancel_slot.is_connected()) {
+                cancel_slot.assign([this, tid, query] (asio::cancellation_type_t type) mutable {
+                    if (type != asio::cancellation_type::none) {
+                        std::shared_ptr<PendingQuery> extracted;
+                        {
+                            std::lock_guard lock(queries_mutex_);
+                            auto it = pending_queries_.find(tid);
+                            if (it != pending_queries_.end()) {
+                                extracted = std::move(it->second);
+                                pending_queries_.erase(it);
+                            }
+                        }
+                        if (extracted && extracted->completion) {
+                            extracted->completion(asio::error::operation_aborted, Value{});
+                        }
+                    }
+                });
+            }
+
             query->completion = [handler = std::move(handler)] (auto ec, auto value) mutable {
                 handler(ec, value);
             };
@@ -460,6 +485,7 @@ auto DHTNode::async_ping(String tid, udp::endpoint target, CompletionToken&& tok
 }
 
 inline asio::awaitable<void> DHTNode::send_ping(const udp::endpoint& target_endpoint) {
+    CTRACK_ASYNC("DHTNode::send_ping");
     if (shuting_down_) {
         co_return;
     }
@@ -509,6 +535,29 @@ auto DHTNode::async_find_nodes(String tid, BucketEntry node, NodeId target_id, C
             auto query = std::make_shared<PendingQuery>();
             query->remote = node.endpoint;
             query->expiry = std::chrono::steady_clock::now() + KRPC_QUERY_TIMEOUT;
+
+            {
+                auto cancel_slot = asio::get_associated_cancellation_slot(handler);
+                if (cancel_slot.is_connected()) {
+                    cancel_slot.assign([this, tid, query] (asio::cancellation_type_t type) mutable {
+                        if (type != asio::cancellation_type::none) {
+                            std::shared_ptr<PendingQuery> extracted;
+                            {
+                                std::lock_guard lock(queries_mutex_);
+                                auto it = pending_queries_.find(tid);
+                                if (it != pending_queries_.end()) {
+                                    extracted = std::move(it->second);
+                                    pending_queries_.erase(it);
+                                }
+                            }
+                            if (extracted && extracted->completion) {
+                                extracted->completion(asio::error::operation_aborted, Value{});
+                            }
+                        }
+                    });
+                }
+            }
+
             query->completion = [handler = std::move(handler)] (auto ec, auto value) mutable {
                 handler(ec, value);
             };
@@ -524,6 +573,7 @@ auto DHTNode::async_find_nodes(String tid, BucketEntry node, NodeId target_id, C
 }
 
 inline asio::awaitable<std::vector<BucketEntry>> DHTNode::find_nodes(const NodeId& target_id, uint count) {
+    CTRACK_ASYNC("DHTNode::find_nodes");
     if (shuting_down_) {
         co_return std::vector<BucketEntry>{};
     }
@@ -656,6 +706,29 @@ auto DHTNode::async_get_peers(String tid, BucketEntry node, InfoHash info_hash, 
             auto query = std::make_shared<PendingQuery>();
             query->remote = node.endpoint;
             query->expiry = std::chrono::steady_clock::now() + KRPC_QUERY_TIMEOUT;
+
+            {
+                auto cancel_slot = asio::get_associated_cancellation_slot(handler);
+                if (cancel_slot.is_connected()) {
+                    cancel_slot.assign([this, tid, query] (asio::cancellation_type_t type) mutable {
+                        if (type != asio::cancellation_type::none) {
+                            std::shared_ptr<PendingQuery> extracted;
+                            {
+                                std::lock_guard lock(queries_mutex_);
+                                auto it = pending_queries_.find(tid);
+                                if (it != pending_queries_.end()) {
+                                    extracted = std::move(it->second);
+                                    pending_queries_.erase(it);
+                                }
+                            }
+                            if (extracted && extracted->completion) {
+                                extracted->completion(asio::error::operation_aborted, Value{});
+                            }
+                        }
+                    });
+                }
+            }
+
             query->completion = [handler = std::move(handler)] (auto ec, auto value) mutable {
                 handler(ec, value);
             };
@@ -671,6 +744,7 @@ auto DHTNode::async_get_peers(String tid, BucketEntry node, InfoHash info_hash, 
 }
 
 inline asio::awaitable<std::vector<EndPoint>> DHTNode::get_peers(const InfoHash& info_hash, uint count) {
+    CTRACK_ASYNC("DHTNode::get_peers");
     if (shuting_down_) {
         co_return std::vector<EndPoint>{};
     }
@@ -828,6 +902,29 @@ auto DHTNode::async_announce_peer(String tid, BucketEntry node, InfoHash info_ha
             auto query = std::make_shared<PendingQuery>();
             query->remote = node.endpoint;
             query->expiry = std::chrono::steady_clock::now() + KRPC_QUERY_TIMEOUT;
+
+            {
+                auto cancel_slot = asio::get_associated_cancellation_slot(handler);
+                if (cancel_slot.is_connected()) {
+                    cancel_slot.assign([this, tid, query] (asio::cancellation_type_t type) mutable {
+                        if (type != asio::cancellation_type::none) {
+                            std::shared_ptr<PendingQuery> extracted;
+                            {
+                                std::lock_guard lock(queries_mutex_);
+                                auto it = pending_queries_.find(tid);
+                                if (it != pending_queries_.end()) {
+                                    extracted = std::move(it->second);
+                                    pending_queries_.erase(it);
+                                }
+                            }
+                            if (extracted && extracted->completion) {
+                                extracted->completion(asio::error::operation_aborted, Value{});
+                            }
+                        }
+                    });
+                }
+            }
+
             query->completion = [handler = std::move(handler)] (auto ec, auto value) mutable {
                 handler(ec, value);
             };
@@ -843,6 +940,7 @@ auto DHTNode::async_announce_peer(String tid, BucketEntry node, InfoHash info_ha
 }
 
 inline asio::awaitable<void> DHTNode::announce_peer(const InfoHash& info_hash, uint16_t client_port) {
+    CTRACK_ASYNC("DHTNode::announce_peer");
     if (shuting_down_) {
         co_return;
     }
@@ -1260,6 +1358,7 @@ inline asio::awaitable<void> DHTNode::handle_error(const Dict& error_dict, const
 }
 
 inline asio::awaitable<void> DHTNode::udp_listen_loop() {
+    CTRACK_ASYNC("DHTNode::udp_listen_loop");
     auto self = shared_from_this();
     while (!shuting_down_) {
         try {
@@ -1277,6 +1376,7 @@ inline asio::awaitable<void> DHTNode::udp_listen_loop() {
 }
 
 inline asio::awaitable<void> DHTNode::bootstrap(const std::vector<std::string>& bootstrap_nodes_addrs) {
+    CTRACK_ASYNC("DHTNode::bootstrap");
     LOGINFO("Bootstrapping DHT with {} nodes", bootstrap_nodes_addrs.size());
 
     for (const auto& addr : bootstrap_nodes_addrs) {

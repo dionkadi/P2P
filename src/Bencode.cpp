@@ -1,4 +1,5 @@
 #include "Bencode.hpp"
+#include "ctrack.hpp"
 #include <charconv>
 #include <format>
 #include <algorithm>
@@ -160,6 +161,7 @@ Value decode_prefix(std::span<const std::byte> data, size_t& consumed) {
 }
 
 Value decode(std::span<const std::byte> data) {
+    CTRACK;
     size_t consumed = 0;
     Value result = decode_prefix(data, consumed);
     if (consumed != data.size()) {
@@ -169,6 +171,7 @@ Value decode(std::span<const std::byte> data) {
 }
 
 std::vector<std::byte> encode(const Value &value) {
+    CTRACK;
     std::string encode_str;
     std::visit(overloaded {
         [&](Integer i) {

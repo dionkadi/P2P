@@ -118,9 +118,14 @@ int main(int argc, char* argv[]) {
         LOGINFO("Tracker started. HTTP on {}, UDP on {}, data dir: {}",
                 http_port, udp_port, data_dir.string());
 
-        ioc.run();
+        {
+            CTRACK;
+            ioc.run();
+        }
 
         display.stop();
+
+        ctrack::result_print();
 
     } catch (const std::exception& e) {
         LOGCRITICAL("Tracker failed to initialize: {}", e.what());

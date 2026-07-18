@@ -107,6 +107,7 @@ static std::vector<std::string> http_get_trackers(Stream& stream, const std::str
 }
 
 static std::vector<std::string> fetch_tracker_list(const std::string& url_str) {
+    LOGINFO("Fetching trackers...");
     try {
         using namespace boost::beast;
         using tcp = boost::asio::ip::tcp;
@@ -120,6 +121,8 @@ static std::vector<std::string> fetch_tracker_list(const std::string& url_str) {
         tcp::resolver resolver(ioc);
         auto const results = resolver.resolve(host, port);
 
+        constexpr auto op_timeout = 5s;
+
         if (u.scheme() == "https") {
             boost::asio::ssl::context ssl_ctx(boost::asio::ssl::context::tlsv12_client);
             ssl_ctx.set_default_verify_paths();
@@ -130,18 +133,25 @@ static std::vector<std::string> fetch_tracker_list(const std::string& url_str) {
                 LOGWARN("HTTPS SNI failure for {}: {}", host, ec.message());
                 return {};
             }
+            beast::get_lowest_layer(stream).expires_after(op_timeout);
             beast::get_lowest_layer(stream).connect(results);
+            beast::get_lowest_layer(stream).expires_after(op_timeout);
             stream.handshake(asio::ssl::stream_base::client);
+            beast::get_lowest_layer(stream).expires_after(op_timeout);
             auto trackers = http_get_trackers(stream, host, target);
             beast::error_code ec;
             stream.shutdown(ec);
+            LOGINFO("Fetching done...");
             return trackers;
         } else {
             beast::tcp_stream stream(ioc);
+            stream.expires_after(op_timeout);
             stream.connect(results);
+            stream.expires_after(op_timeout);
             auto trackers = http_get_trackers(stream, host, target);
             beast::error_code ec;
             stream.socket().shutdown(tcp::socket::shutdown_both, ec);
+            LOGINFO("Fetching done...");
             return trackers;
         }
     } catch (const std::exception& e) {
@@ -658,13 +668,19 @@ int main(int argc, char* argv[]) {
 
     display.start();
 
-    int result = app.run();
+    int result;
+    {
+        CTRACK;
+        result = app.run();
+    }
 
     display.stop();
     input_active->store(false);
     raw_tty.disable();
 
     app.save_state(state_path);
+
+    ctrack::result_print();
 
     return result;
 }

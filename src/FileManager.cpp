@@ -33,6 +33,7 @@ FileManager::~FileManager() {
 }
 
 asio::awaitable<std::vector<std::byte>> FileManager::read_block(size_t piece_index, uint32_t begin, uint32_t length) {
+    CTRACK_ASYNC("FileManager::read_block");
     CacheKey key(piece_index, begin);
 
     // Check cache first
@@ -97,6 +98,7 @@ asio::awaitable<std::vector<std::byte>> FileManager::read_block(size_t piece_ind
 }
 
 asio::awaitable<void> FileManager::write_piece(size_t piece_index, std::span<const std::byte> piece_data) {
+    CTRACK_ASYNC("FileManager::write_piece");
     uint32_t offset = 0;
     while (offset < piece_data.size()) {
         uint32_t block_size = std::min(static_cast<uint32_t>(BLOCK_SIZE), static_cast<uint32_t>(piece_data.size() - offset));
@@ -344,6 +346,7 @@ asio::awaitable<std::vector<std::byte>> FileManager::async_read_from_file(const 
 }
 
 asio::awaitable<bool> FileManager::verify_piece(size_t piece_index) {
+    CTRACK_ASYNC("FileManager::verify_piece");
     const auto& info = state_->torrent_info();
     const size_t num_pieces = state_->num_pieces();
 
@@ -357,6 +360,7 @@ asio::awaitable<bool> FileManager::verify_piece(size_t piece_index) {
 }
 
 asio::awaitable<void> FileManager::verify_pieces() {
+    CTRACK_ASYNC("FileManager::verify_pieces");
     const size_t num_pieces = state_->num_pieces();
 
     for (size_t i : std::views::iota(0UL, num_pieces) 
@@ -383,6 +387,7 @@ asio::awaitable<void> FileManager::verify_pieces() {
 }
 
 asio::awaitable<bool> FileManager::verify_seed_data() {
+    CTRACK_ASYNC("FileManager::verify_seed_data");
     const auto& info = state_->torrent_info();
     const size_t num_pieces = state_->num_pieces();
     
@@ -429,6 +434,7 @@ asio::awaitable<bool> FileManager::verify_seed_data() {
 }
 
 asio::awaitable<void> FileManager::save_resume_data(std::span<const std::byte> data) {
+    CTRACK_ASYNC("FileManager::save_resume_data");
     std::filesystem::path p = get_resume_file_path();
     std::filesystem::path temp_path = p;
     temp_path += ".tmp";
@@ -483,6 +489,7 @@ asio::awaitable<std::optional<std::vector<std::byte>>> FileManager::load_resume_
 }
 
 asio::awaitable<bool> FileManager::preallocate_files() {
+    CTRACK_ASYNC("FileManager::preallocate_files");
     const auto& info = state_->torrent_info();
     const size_t num_pieces = state_->num_pieces();
 

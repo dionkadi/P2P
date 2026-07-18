@@ -266,6 +266,7 @@ inline std::shared_ptr<ITrackerClient> create_tracker_client(asio::io_context& i
 }
 
 inline asio::awaitable<bool> UdpTrackerClient::connect_to_tracker() {
+    CTRACK_ASYNC("UdpTrackerClient::connect_to_tracker");
     auto self = shared_from_this();
 
     int n = 0;
@@ -314,6 +315,7 @@ inline asio::awaitable<bool> UdpTrackerClient::connect_to_tracker() {
 }
 
 inline asio::awaitable<TrackerAnnounceResult> UdpTrackerClient::announce(const AnnounceRequestParams& params) {
+    CTRACK_ASYNC("UdpTrackerClient::announce");
     auto self = shared_from_this();
 
     if (connection_id_ == 0 || std::chrono::steady_clock::now() >= connection_id_expiry_) {
@@ -389,6 +391,7 @@ inline asio::awaitable<TrackerAnnounceResult> UdpTrackerClient::announce(const A
 }
 
 inline asio::awaitable<TrackerAnnounceResult> HttpTrackerClient::announce(const AnnounceRequestParams& params) {
+    CTRACK_ASYNC("HttpTrackerClient::announce");
     auto self = shared_from_this();
     beast::tcp_stream stream(io_context_);
     active_stream_ = &stream;
@@ -416,6 +419,7 @@ inline asio::awaitable<TrackerAnnounceResult> HttpTrackerClient::announce(const 
 }
 
 inline asio::awaitable<TrackerAnnounceResult> HttpsTrackerClient::announce(const AnnounceRequestParams& params) {
+    CTRACK_ASYNC("HttpsTrackerClient::announce");
     auto self = shared_from_this();
     boost::asio::ssl::context ssl_ctx(boost::asio::ssl::context::tlsv12_client);
     ssl_ctx.set_default_verify_paths();

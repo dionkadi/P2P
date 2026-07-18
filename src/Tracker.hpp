@@ -213,6 +213,7 @@ private:
     HttpHandler create_announce_handler();
     
     asio::awaitable<void> cleanup_loop() {
+        CTRACK_ASYNC("Tracker::cleanup_loop");
         auto executor = co_await asio::this_coro::executor;
         asio::steady_timer timer(executor);
 
@@ -320,6 +321,7 @@ inline std::map<std::string, std::string> parse_query_params(std::string_view qu
 
 inline HttpHandler Tracker::create_announce_handler() {
     return [this](HttpRequest req) -> asio::awaitable<HttpResponse> {
+        CTRACK_ASYNC("Tracker::handle_announce");
         HttpResponse res{http::status::ok, req.version()};
         res.set(http::field::server, BOOST_BEAST_VERSION_STRING);
         res.set(http::field::content_type, "text/plain");
@@ -421,6 +423,7 @@ inline HttpHandler Tracker::create_announce_handler() {
 }
 
 inline asio::awaitable<void> Tracker::udp_listen_loop(int port) {
+    CTRACK_ASYNC("Tracker::udp_listen_loop");
     auto executor = co_await asio::this_coro::executor;
     udp_socket_ = std::make_unique<asio::ip::udp::socket>(executor, asio::ip::udp::endpoint(asio::ip::udp::v4(), port));
     udp_socket_->set_option(asio::ip::udp::socket::reuse_address(true));
@@ -460,6 +463,7 @@ inline void Tracker::stop_udp_listener() {
 }
 
 inline asio::awaitable<void> Tracker::handle_udp_request(asio::ip::udp::endpoint remote_endpoint, std::span<const char> request, asio::ip::udp::socket& socket) {
+    CTRACK_ASYNC("Tracker::handle_udp_request");
     if (request.size() < sizeof(UdpConnectRequest)) {
         LOGWARN("Received too-small UDP packet from {}", remote_endpoint.address().to_string());
         co_return;

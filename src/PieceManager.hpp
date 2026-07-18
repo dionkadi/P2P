@@ -57,9 +57,10 @@ public:
         std::lock_guard lock(mutex_);
         return piece_availability_; 
     }
-    size_t piece_availability(size_t piece_index) const noexcept { 
+    size_t piece_availability(size_t piece_index) const {
         assert(piece_index < state_->num_pieces());
         std::lock_guard lock(mutex_);
+        if (piece_index >= piece_availability_->size()) return 0;
         return piece_availability_->at(piece_index); 
     }
     RarityType pieces_by_rarity() const { 
@@ -129,6 +130,12 @@ public:
         // without clearing them TorrentSession never destructs → FileManager cache_ leaks.
         get_available_peers_ = nullptr;
         block_timeout_callback_ = nullptr;
+        // Free heap-allocated data structures immediately so memory is released
+        // even if the PieceManager itself is not destroyed (e.g. due to reference
+        // cycles keeping TorrentSession alive past shutdown).
+        pieces_by_rarity_->clear();
+        piece_availability_->clear();
+        in_progress_pieces_->clear();
     }
 
 private:

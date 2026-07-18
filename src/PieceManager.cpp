@@ -30,6 +30,7 @@ std::map<std::string, std::string> PieceManager::get_in_progress_for_resume() co
 }
 
 asio::awaitable<void> PieceManager::downloader() {
+    CTRACK_ASYNC("PieceManager::downloader");
     auto self = shared_from_this();
     const int max_in_progress_pieces = 5;
 
@@ -66,6 +67,7 @@ asio::awaitable<void> PieceManager::downloader() {
 }
 
 asio::awaitable<void> PieceManager::request_one_piece() {
+    CTRACK_ASYNC("PieceManager::request_one_piece");
     if (state_->is_download_complete()) {
         co_return;
     }
@@ -116,6 +118,7 @@ asio::awaitable<void> PieceManager::request_one_piece() {
 }
 
 asio::awaitable<bool> PieceManager::try_piece_download(size_t piece_index) {
+    CTRACK_ASYNC("PieceManager::try_piece_download");
     auto self = shared_from_this();
 
     if (state_->piece_status(piece_index) != PieceStatus::Needed) {
@@ -184,6 +187,7 @@ asio::awaitable<void> PieceManager::check_and_enter_endgame() {
 }
 
 asio::awaitable<void> PieceManager::broadcast_outstanding_requests() {
+    CTRACK_ASYNC("PieceManager::broadcast_outstanding_requests");
     if (state_->is_download_complete()) {
         co_return;
     }
@@ -242,6 +246,7 @@ asio::awaitable<void> PieceManager::broadcast_outstanding_requests() {
 }
 
 asio::awaitable<void> PieceManager::return_piece_to_queue(size_t piece_index) {
+    CTRACK_ASYNC("PieceManager::return_piece_to_queue");
     auto self = shared_from_this();
 
     co_await asio::dispatch(strand_, asio::use_awaitable);
@@ -352,6 +357,7 @@ void PieceManager::ensure_resume_piece_download(size_t piece_index) {
 }
 
 asio::awaitable<void> PieceManager::resume_piece_download(size_t piece_index) {
+    CTRACK_ASYNC("PieceManager::resume_piece_download");
     asio::steady_timer timer(io_context_);
 
     while (true) {
@@ -432,6 +438,7 @@ asio::awaitable<void> PieceManager::resume_piece_download(size_t piece_index) {
 }
 
 asio::awaitable<void> PieceManager::check_block_timeouts() {
+    CTRACK_ASYNC("PieceManager::check_block_timeouts");
     auto self = shared_from_this();
     co_await asio::dispatch(strand_, asio::use_awaitable);
 
@@ -501,6 +508,7 @@ asio::awaitable<void> PieceManager::check_block_timeouts() {
 }
 
 asio::awaitable<void> PieceManager::block_timeout_loop() {
+    CTRACK_ASYNC("PieceManager::block_timeout_loop");
     auto self = shared_from_this();
 
     while (!state_->is_download_complete() && !shutting_down_.load()) {
