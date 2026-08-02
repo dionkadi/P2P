@@ -210,12 +210,14 @@ std::filesystem::path FileManager::get_full_path_for_file(const FileInfo& file_i
 std::filesystem::path FileManager::get_resume_file_path() const {
     const auto& info = state_->torrent_info();
     const auto& data_file_path = state_->save_path();
+    // Use the info_hash hex to make the resume file unique per torrent,
+    // avoiding races when multiple single-file torrents use the same directory.
+    std::string hash_hex = Crypto::bytes_to_hex(state_->info_hash());
     std::filesystem::path p;
     if (info.files.size() > 1) {
-        p = data_file_path / info.name / ".resume";
+        p = data_file_path / info.name / (hash_hex + ".resume");
     } else {
-        // For single file, place .resume alongside the file
-        p = data_file_path.parent_path() / (data_file_path.filename().string() + ".resume");
+        p = data_file_path.parent_path() / (hash_hex + ".resume");
     }
     return p;
 }
@@ -465,14 +467,14 @@ asio::awaitable<void> FileManager::save_resume_data(std::span<const std::byte> d
             throw std::runtime_error(std::format("filesystem error: cannot rename: {} [{}] [{}]", ec.message(), temp_path.string(), p.string()));
         }
         
-        LOGDBG("Progress saved successfully to {}", p.string());
+        LOGINFO("Progress saved successfully to {}", p.string());
     } catch(const std::exception& e) {
         LOGERR("Failed to save resume file: {}", e.what());
         
         std::error_code ec;
         std::filesystem::remove(temp_path, ec);
         if (ec) {
-            LOGDBG("Could not remove temporary resume file {}: {}", temp_path.string(), ec.message());
+            LOGWARN("Could not remove temporary resume file {}: {}", temp_path.string(), ec.message());
         }
         throw;
     }

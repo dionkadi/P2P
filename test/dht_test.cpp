@@ -3,6 +3,8 @@
 #include <vector>
 #include <chrono>
 #include <random>
+#include <cstdlib>
+#include <atomic>
 #include <boost/asio.hpp>
 
 #include "Kademlia.hpp"
@@ -412,3 +414,180 @@ TEST_F(DHTIntegrationTest, TokenValidation) {
     SUCCEED() << "Token validation test structure validated";
     node->stop();
 }
+
+// Regression stress test for the 2026-08-01 release crash: SIGABRT (glibc
+// malloc corruption) detected in DHTNode::find_nodes frame teardown while the
+// routing-table refresh loop was running ~13 concurrent find_nodes (3
+// iterations x 3 parallel children each) plus per-torrent get_peers/announce
+// churn — i.e. hundreds of concurrent pending KRPC queries on a single
+// un-stranded UDP socket, with 2-byte transaction IDs (collisions),
+// response-vs-timer races and parallel-group cancellations.
+//
+// This test recreates that load in-process. It is a *stress* test: it does not
+// assert on lookup results; it exists so AddressSanitizer (enabled in Debug
+// builds) catches the corrupting write if the bug reproduces. Duration is
+// configurable via P2P_DHT_STRESS_SECONDS (default 30).
+TEST_F(DHTIntegrationTest, StressConcurrentLookups) {
+    constexpr int NODE_COUNT = 8;
+    constexpr uint16_t BASE_PORT = 18901;
+    constexpr int WAVE_NODES = 13;   // matches the observed refresh burst
+    constexpr int WORKER_THREADS = 8;
+
+    int duration_s = 30;
+    if (const char* env = std::getenv("P2P_DHT_STRESS_SECONDS")) {
+        duration_s = std::max(1, std::atoi(env));
+    }
+
+    std::vector<std::shared_ptr<DHTNode>> nodes;
+    nodes.reserve(NODE_COUNT);
+
+    // Dedicated io_context + worker pool (like the client's 17-thread pool),
+    // so the stress run is self-contained and tearable. Declared before
+    // `nodes` so nodes are destroyed while the context is still alive.
+    asio::io_context stress_io;
+    auto stress_guard = asio::make_work_guard(stress_io);
+    std::vector<std::jthread> workers;
+    workers.reserve(WORKER_THREADS);
+    for (int i = 0; i < WORKER_THREADS; ++i) {
+        workers.emplace_back([&stress_io] {
+            try { stress_io.run(); }
+            catch (const std::exception& e) {
+                LOGCRITICAL("DHT stress worker thread failed: {}", e.what());
+            }
+        });
+    }
+
+    for (int i = 0; i < NODE_COUNT; ++i) {
+        nodes.push_back(std::make_shared<DHTNode>(
+            stress_io, static_cast<uint16_t>(BASE_PORT + i), generate_id(NODE_ID_PREFIX)));
+    }
+    for (auto& n : nodes) {
+        n->start();
+    }
+
+    std::this_thread::sleep_for(200ms);
+
+    // Bootstrap: every node pings every other so routing tables have entries.
+    // Note: the endpoint must live inside a coroutine frame — send_ping takes
+    // a const-ref and the awaitable holds it across suspension.
+    for (int i = 0; i < NODE_COUNT; ++i) {
+        for (int j = 0; j < NODE_COUNT; ++j) {
+            if (i == j) continue;
+            auto node = nodes[i];
+            uint16_t port = static_cast<uint16_t>(BASE_PORT + j);
+            asio::co_spawn(stress_io, [node, port]() -> asio::awaitable<void> {
+                udp::endpoint ep(asio::ip::make_address_v4("127.0.0.1"), port);
+                co_await node->send_ping(ep);
+            }, asio::detached);
+        }
+    }
+
+    std::atomic<uint64_t> lookups{0};
+    std::atomic<uint64_t> failures{0};
+    std::atomic<bool> stop_flag{false};
+
+    // Wave loop: periodically launch a burst of concurrent find_nodes +
+    // get_peers + announce_peer across all nodes, like the refresh burst.
+    asio::co_spawn(stress_io, [&]() -> asio::awaitable<void> {
+        while (!stop_flag.load()) {
+            for (auto& n : nodes) {
+                for (int w = 0; w < WAVE_NODES; ++w) {
+                    NodeId target = generate_id("");
+                    asio::co_spawn(stress_io, [n, target, &lookups, &failures]() -> asio::awaitable<void> {
+                        try {
+                            co_await n->find_nodes(target, 8);
+                            lookups.fetch_add(1);
+                        } catch (const std::exception& e) {
+                            failures.fetch_add(1);
+                            LOGWARN("find_nodes stress failed: {}", e.what());
+                        }
+                    }, asio::detached);
+                }
+            }
+            // Peer-discovery churn: random info hashes.
+            for (auto& n : nodes) {
+                InfoHash hash{};
+                std::ranges::fill(hash, static_cast<std::byte>(rand() & 0xFF));
+                asio::co_spawn(stress_io, [n, hash]() -> asio::awaitable<void> {
+                    try {
+                        auto peers = co_await n->get_peers(hash, 8);
+                        (void)peers;
+                        co_await n->announce_peer(hash, 6881);
+                    } catch (...) { /* churn is best-effort */ }
+                }, asio::detached);
+            }
+            asio::steady_timer t(stress_io);
+            t.expires_after(std::chrono::milliseconds(300));
+            co_await t.async_wait(asio::use_awaitable);
+        }
+    }, asio::detached);
+
+    // Chaos sender: spray garbage/malformed datagrams at all nodes to exercise
+    // the decode/parser error paths concurrently with lookups.
+    asio::co_spawn(stress_io, [&stress_io, &stop_flag]() -> asio::awaitable<void> {
+        std::mt19937 rng(12345);
+        std::uniform_int_distribution<int> len_dist(1, 900);
+        std::uniform_int_distribution<int> byte_dist(0, 255);
+        while (!stop_flag.load()) {
+            for (int ni = 0; ni < NODE_COUNT; ++ni) {
+                udp::endpoint ep(asio::ip::make_address_v4("127.0.0.1"),
+                                 static_cast<uint16_t>(BASE_PORT + ni));
+                std::vector<std::byte> garbage(static_cast<size_t>(len_dist(rng)));
+                for (auto& b : garbage) {
+                    b = static_cast<std::byte>(byte_dist(rng));
+                }
+                asio::co_spawn(stress_io,
+                    [&stress_io, garbage = std::move(garbage), ep]() -> asio::awaitable<void> {
+                        asio::ip::udp::socket s(stress_io);
+                        boost::system::error_code ec;
+                        s.open(asio::ip::udp::v4());
+                        s.send_to(asio::buffer(garbage), ep, 0, ec);
+                        s.close();
+                        co_return;
+                    }, asio::detached);
+            }
+            asio::steady_timer t(stress_io);
+            t.expires_after(std::chrono::milliseconds(50));
+            co_await t.async_wait(asio::use_awaitable);
+        }
+    }, asio::detached);
+
+    std::this_thread::sleep_for(std::chrono::seconds(duration_s));
+    stop_flag.store(true);
+    std::this_thread::sleep_for(500ms);  // drain in-flight waves
+
+    // Stop nodes FIRST: DHTNode::stop() aborts every pending query, so all
+    // suspended lookup coroutines unwind (and their `||` timeout timers are
+    // cancelled). Then drain the io_context NATURALLY — a forcible
+    // stress_io.stop() would freeze any still-suspended coroutine, leaking its
+    // frame and the shared_ptr<DHTNode> it holds (plus the node's
+    // peer_storage_/routing-table contents) until LSan reports them.
+    for (auto& n : nodes) {
+        n->stop();
+    }
+    stress_guard.reset();
+
+    // Drain: with the queries aborted and sockets closed, the remaining work
+    // unwinds quickly. Every query is now self-bounded (its expiry timer
+    // completes it within KRPC_QUERY_TIMEOUT + 1s even if it was orphaned from
+    // pending_queries_), so a blocking run() would eventually return — but a
+    // bounded poll loop is safer and deterministic for a test. Poll for a few
+    // seconds to let completions unwind, then stop() to release the workers.
+    auto drain_t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < 200; ++i) {
+        stress_io.poll();
+        std::this_thread::sleep_for(100ms);
+    }
+    stress_io.stop();
+    for (auto& t : workers) {
+        t.join();
+    }
+    auto drain_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - drain_t0).count();
+    LOGINFO("DHT stress drain: {} ms ({} lookups, {} failures)",
+            drain_ms, lookups.load(), failures.load());
+
+    GTEST_LOG_(INFO) << "DHT stress: " << lookups.load() << " lookups, "
+                     << failures.load() << " exceptions";
+}
+

@@ -5,6 +5,13 @@
 #include <limits>
 #include <random>
 
+// Global fail cache: peer_addr → time before which retry is blocked.
+// Shared across all PeerManager instances so failures discovered by one session
+// suppress reconnection attempts from other sessions.
+static std::mutex g_fail_cache_mutex;
+static std::unordered_map<std::string, TimePoint> g_fail_cache;
+static std::unordered_map<std::string, int> g_fail_count;
+
 PeerManager::PeerManager(asio::io_context& io_context, std::shared_ptr<SessionState> state, std::chrono::milliseconds choke_interval) noexcept
     : io_context_(io_context), strand_(asio::make_strand(io_context)), pex_timer_(io_context_), choke_timer_(io_context_),
     state_(state), choke_interval_(choke_interval), backoff_retry_timer_(io_context_), ban_cleanup_timer_(io_context_)
@@ -21,6 +28,16 @@ bool PeerManager::add_connection(const PeerId& id, std::shared_ptr<PeerConnectio
     // with ban_peer_by_ip which locks ban_mutex_ then mutex_)
     std::string ip = extract_ip_from_addr(conn->peer_addr());
     if (is_banned(ip)) {
+        conn->close();
+        return false;
+    }
+
+    // Shutdown guard: stop() may have run remove_all_connections() while this
+    // connection was mid-handshake. Adding it now would leave the
+    // session -> peer_manager_ -> connection -> events_ (session) shared_ptr
+    // cycle unbroken, leaking the whole session graph until process exit
+    // (LSan: indirect leaks, no direct root).
+    if (shutting_down_.load(std::memory_order_acquire)) {
         conn->close();
         return false;
     }
@@ -102,6 +119,21 @@ asio::awaitable<std::optional<AsyncSocket>> PeerManager::connect_to_peer(const s
         co_return std::nullopt;
     }
 
+    // Check global fail cache (shared across all sessions)
+    {
+        std::lock_guard lock(g_fail_cache_mutex);
+        auto it = g_fail_cache.find(peer_addr);
+        if (it != g_fail_cache.end()) {
+            if (std::chrono::steady_clock::now() < it->second) {
+                LOGDBG("connect_to_peer: skipping {}: in global fail cache", peer_addr);
+                co_return std::nullopt;
+            } else {
+                // Expired entry — remove it
+                g_fail_cache.erase(it);
+            }
+        }
+    }
+
     // Check backoff state before attempting
     {
         std::lock_guard lock(backoff_mutex_);
@@ -127,11 +159,31 @@ asio::awaitable<std::optional<AsyncSocket>> PeerManager::connect_to_peer(const s
         }
     }
 
-    // Check half-open connection limit before attempting
-    if (half_open_connections_.load() >= max_half_open_connections_) {
-        LOGWARN("connect_to_peer: rejecting {}: max half-open connections ({}) reached",
-                peer_addr, max_half_open_connections_);
+    // Wait for a half-open slot instead of rejecting — avoids flooding
+    // when a tracker returns 60+ peers at once.
+    if (max_half_open_connections_ == 0) {
+        // Zero limit means reject immediately (don't spin forever in the
+        // while loop where 0 >= 0 is always true).
         co_return std::nullopt;
+    }
+    int wait_loops = 0;
+    while (half_open_connections_.load() >= max_half_open_connections_) {
+        if (shutting_down_.load(std::memory_order_acquire)) {
+            co_return std::nullopt;
+        }
+        if (wait_loops == 0 || wait_loops % 25 == 0) {
+            LOGDBG("connect_to_peer: waiting for half-open slot for {} (current={}, max={}, waited={}ms)",
+                   peer_addr, half_open_connections_.load(), max_half_open_connections_, wait_loops * 200);
+        }
+        ++wait_loops;
+        asio::steady_timer slot_timer(io_context_);
+        slot_timer.expires_after(std::chrono::milliseconds(200));
+        boost::system::error_code ec;
+        co_await slot_timer.async_wait(asio::redirect_error(asio::use_awaitable, ec));
+    }
+
+    if (wait_loops > 0) {
+        LOGDBG("connect_to_peer: acquired half-open slot for {} (waited {} ms)", peer_addr, wait_loops * 200);
     }
 
     ++half_open_connections_;
@@ -145,6 +197,7 @@ asio::awaitable<std::optional<AsyncSocket>> PeerManager::connect_to_peer(const s
             int port = std::stoi(peer_addr.substr(colon_pos + 1));
 
             auto raw_socket = std::make_shared<asio::ip::tcp::socket>(io_context_);
+            auto socket_closed = std::make_shared<std::atomic<bool>>(false);
             {
                 std::lock_guard lock(pending_connect_mutex_);
                 pending_connect_sockets_.push_back(raw_socket);
@@ -174,12 +227,13 @@ asio::awaitable<std::optional<AsyncSocket>> PeerManager::connect_to_peer(const s
             {
                 asio::steady_timer connect_timer(io_context_);
                 connect_timer.expires_after(std::chrono::seconds(15));
-                bool connect_timed_out = false;
+                auto connect_timed_out = std::make_shared<bool>(false);
 
-                connect_timer.async_wait([&raw_socket, &connect_timed_out](boost::system::error_code timer_ec) {
+                connect_timer.async_wait([raw_socket, connect_timed_out, socket_closed](boost::system::error_code timer_ec) {
                     if (!timer_ec) {
-                        connect_timed_out = true;
-                        if (raw_socket->is_open()) {
+                        *connect_timed_out = true;
+                        bool expected = false;
+                        if (socket_closed->compare_exchange_strong(expected, true)) {
                             boost::system::error_code close_ec;
                             raw_socket->close(close_ec);
                         }
@@ -189,16 +243,19 @@ asio::awaitable<std::optional<AsyncSocket>> PeerManager::connect_to_peer(const s
                 co_await asio::async_connect(*raw_socket, endpoints, asio::redirect_error(asio::use_awaitable, ec));
                 connect_timer.cancel();
 
-                if (connect_timed_out && !ec) {
+                if (*connect_timed_out && !ec) {
                     ec = asio::error::timed_out;
                 }
             }
             remove_pending_socket();
 
             if (ec || shutting_down_.load(std::memory_order_acquire)) {
-                if (raw_socket->is_open()) {
-                    boost::system::error_code close_ec;
-                    raw_socket->close(close_ec);
+                bool expected = false;
+                if (socket_closed->compare_exchange_strong(expected, true)) {
+                    if (raw_socket->is_open()) {
+                        boost::system::error_code close_ec;
+                        raw_socket->close(close_ec);
+                    }
                 }
                 if (half_open_connections_.load() > 0) {
                     --half_open_connections_;
@@ -238,11 +295,32 @@ asio::awaitable<std::optional<AsyncSocket>> PeerManager::connect_to_peer(const s
 }
 
 void PeerManager::report_connection_success(const std::string& peer_addr) {
+    // Forgive accumulated global fail count on success so a flaky peer that recovers
+    // doesn't keep escalating backoff from its old failure history.
+    {
+        std::lock_guard lock(g_fail_cache_mutex);
+        g_fail_cache.erase(peer_addr);
+        g_fail_count.erase(peer_addr);
+    }
     std::lock_guard lock(backoff_mutex_);
     backoff_states_[peer_addr].on_success();
 }
 
 void PeerManager::report_connection_failure(const std::string& peer_addr) {
+    // Update the global fail cache with short exponential backoff.
+    // Transient handshake failures (NAT, offline clients, EOF during handshake) are
+    // extremely common in public swarms. A 60s->30min blackout (the old values) caused
+    // the connectable peer pool to collapse: 285 unique peers failed once in a 5min
+    // run and 126 reconnection attempts were skipped because they were in the cache.
+    // 5s->2min lets genuinely-down peers back off while letting flaky peers recover.
+    {
+        std::lock_guard lock(g_fail_cache_mutex);
+        int count = ++g_fail_count[peer_addr];
+        auto delay = std::chrono::seconds(5) * (1 << std::min(count, 5)); // up to 2^5 * 5s = 160s
+        if (delay > std::chrono::minutes(2)) delay = std::chrono::minutes(2);
+        g_fail_cache[peer_addr] = std::chrono::steady_clock::now() + delay;
+    }
+
     std::lock_guard lock(backoff_mutex_);
     auto& state = backoff_states_[peer_addr];
     state.on_failure();
@@ -602,7 +680,7 @@ void PeerManager::report_protocol_violation(const std::string& peer_addr) {
         std::lock_guard lock(ban_mutex_);
         auto& m = peer_misbehavior_[ip];
         m.protocol_violations++;
-        LOGDBG("PeerManager: peer {} reported {} protocol violations", peer_addr, m.protocol_violations);
+        // LOGDBG("PeerManager: peer {} reported {} protocol violations", peer_addr, m.protocol_violations);
         if (m.has_exceeded_thresholds()) {
             should_ban = true;
         }
@@ -619,7 +697,7 @@ void PeerManager::report_timeout(const std::string& peer_addr) {
         std::lock_guard lock(ban_mutex_);
         auto& m = peer_misbehavior_[ip];
         m.timeouts++;
-        LOGDBG("PeerManager: peer {} reported {} timeouts", peer_addr, m.timeouts);
+        // LOGDBG("PeerManager: peer {} reported {} timeouts", peer_addr, m.timeouts);
         if (m.has_exceeded_thresholds()) {
             should_ban = true;
         }
@@ -646,7 +724,7 @@ asio::awaitable<void> PeerManager::ban_cleanup_loop() {
 
         if (ec == asio::error::operation_aborted || shutting_down_.load(std::memory_order_acquire)) {
             if (ec == asio::error::operation_aborted) {
-                LOGDBG("Ban cleanup loop aborted");
+                LOGWARN("Ban cleanup loop aborted");
             }
             co_return;
         }
@@ -656,6 +734,6 @@ asio::awaitable<void> PeerManager::ban_cleanup_loop() {
         std::erase_if(banned_peers_, [&](const auto& pair) {
             return now >= pair.second.expiry_time;
         });
-        LOGDBG("Ban cleanup: {} active bans", banned_peers_.size());
+        LOGINFO("Ban cleanup: {} active bans", banned_peers_.size());
     }
 }

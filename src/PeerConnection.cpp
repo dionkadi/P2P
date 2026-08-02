@@ -294,6 +294,14 @@ asio::awaitable<void> PeerConnection::message_loop() {
         LOGINFO("Connection to {} lost or closed: {}", peer_id_, e.what());
     }
 
+    // The connection is dead, so tear down the keep-alive loop as well.
+    // Otherwise its `self = shared_from_this()` keeps this PeerConnection
+    // (and through events_ the whole session) alive until the next 2-minute
+    // tick. If this conn is no longer in the PeerManager map (peer dropped
+    // earlier), nothing else will ever close its socket or cancel this timer,
+    // so the entire session graph leaks at process exit (LSan: indirect leaks
+    // with no direct root — a pure shared_ptr cycle).
+    keep_alive_timer_.cancel();
     co_await events_->on_disconnect(self);
     co_return ;
 }
@@ -424,7 +432,18 @@ void PeerConnection::flush_pending_requests() {
 void PeerConnection::on_request_completed(uint32_t length) {
     std::lock_guard lock(pipeline_mutex_);
 
-    total_bytes_received_ += length;
+    // Endgame re-requests can deliver duplicate blocks (or blocks for
+    // already-complete pieces) whose request was never counted in
+    // total_bytes_requested_. Crediting them unconditionally makes
+    // total_bytes_received_ exceed total_bytes_requested_, and the
+    // unsigned pipeline_bytes = requested - received underflows to ~2^64,
+    // permanently blocking flush_pending_requests (pipeline looks "full"
+    // forever) -> silent download stall. Clamp to the requested total.
+    if (total_bytes_received_ + length > total_bytes_requested_) {
+        total_bytes_received_ = total_bytes_requested_;
+    } else {
+        total_bytes_received_ += length;
+    }
     if (outstanding_request_count_ > 0) {
         --outstanding_request_count_;
     }

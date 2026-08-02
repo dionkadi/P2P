@@ -11,8 +11,11 @@
 
 struct ClientConfig {
     uint16_t peer_port = 6881;
-    uint64_t upload_rate_limit = 512 * 1024;
-    uint64_t download_rate_limit = 2 * 1024 * 1024;
+    // 0 means unlimited. A low upload cap hurts download speed under BitTorrent's
+    // tit-for-tat: peers only unchoke us in proportion to what we upload to them,
+    // so capping upload directly throttles the number of peers willing to send us data.
+    uint64_t upload_rate_limit = 0;
+    uint64_t download_rate_limit = 0;
     uint32_t max_connections = 200;
     uint32_t max_connections_per_ip = 2;
     uint32_t max_half_open = 40;

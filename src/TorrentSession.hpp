@@ -70,8 +70,19 @@ public:
     void set_tracker_announce_interval(std::chrono::seconds interval) { tracker_announce_interval_ = interval; }
     void set_enable_dht(bool enabled) noexcept { enable_dht_ = enabled; }
     void set_enable_lsd(bool enabled) noexcept { enable_lsd_ = enabled; }
+    // Use a shared DHT node (managed externally by ClientApp) instead of creating one.
+    // The external node must already be started and will not be stopped by this session.
+    void set_shared_dht_node(std::shared_ptr<DHTNode> node) noexcept { dht_node_ = node; external_dht_node_ = node; }
 
     const std::shared_ptr<PeerManager>& peer_manager() const noexcept { return peer_manager_; }
+    // Apply connection-limit config from ClientConfig. Without this the PeerManager
+    // keeps hardcoded defaults (200/2/40) and --max-connections / --max-half-open /
+    // --max-connections-per-ip on the CLI/config are silently ignored.
+    void set_connection_limits(size_t max_total, size_t max_per_ip, size_t max_half_open) noexcept {
+        peer_manager_->set_max_total_connections(max_total);
+        peer_manager_->set_max_connections_per_ip(max_per_ip);
+        peer_manager_->set_max_half_open_connections(max_half_open);
+    }
     std::shared_ptr<SessionState> get_state() const noexcept { return state_; }
     Mode get_mode() const noexcept { return mode_; }
     uint16_t get_port() const noexcept { return peer_port_; }
@@ -133,6 +144,7 @@ private:
     asio::awaitable<void> periodically_save();
     asio::awaitable<void> dht_announce_loop();
     asio::awaitable<void> request_metadata_from_peer(std::shared_ptr<PeerConnection> conn);
+    asio::awaitable<void> metadata_retry_loop();
     asio::awaitable<void> on_metadata_complete();
 
     asio::awaitable<void> send_cancel_for_block(uint32_t piece_index, uint32_t block_index, const PeerId& exclude_peer_id);
@@ -158,8 +170,10 @@ private:
     std::unique_ptr<AsyncServerSocket> peer_server_;
     std::unique_ptr<FileManager> file_manager_;
     std::shared_ptr<DHTNode> dht_node_;
+    std::shared_ptr<DHTNode> external_dht_node_; // non-owning: lifecycle managed by ClientApp
     std::shared_ptr<LsdDiscovery> lsd_discovery_;
     asio::steady_timer dht_announce_timer_;
+    int empty_dht_lookups_{0}; // consecutive get_peers returning 0 peers
     std::vector<std::string> dht_bootstrap_nodes_;
     bool enable_dht_{true};
     bool enable_lsd_{true};
@@ -168,10 +182,12 @@ private:
     std::vector<std::byte> metadata_buffer_;
     std::atomic<size_t> metadata_pieces_received_{0};
     std::once_flag metadata_buffer_init_flag_;
+    asio::steady_timer metadata_retry_timer_;
     AsyncRateLimiter<> upload_limiter_;
     AsyncRateLimiter<> download_limiter_;
     std::atomic<bool> shutting_down_{false};
     asio::steady_timer completion_timer_;
     std::function<void()> on_complete_;
     std::chrono::seconds tracker_announce_interval_;
+    int peerless_announces_{0}; // consecutive fast re-announces while peerless
 };

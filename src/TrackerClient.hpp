@@ -39,12 +39,10 @@ public:
 class UdpTrackerClient: public ITrackerClient, public std::enable_shared_from_this<UdpTrackerClient> {
 public:
     UdpTrackerClient(asio::io_context& io_context, std::string host, int port)
-        : io_context_(io_context), socket_(io_context), url_str_(std::format("{}:{}", host, port)) 
+        : io_context_(io_context), socket_(io_context),
+          host_(std::move(host)), port_(port),
+          url_str_(std::format("{}:{}", host_, port_))
     {
-        asio::ip::udp::resolver resolver(io_context_);
-        tracker_endpoint_ = *resolver.resolve(host, std::to_string(port)).begin();
-        socket_.open(tracker_endpoint_.protocol());
-
         std::random_device rd;
         next_transaction_id_ = rd();
     }
@@ -57,11 +55,15 @@ public:
     }
 
 private:
+    asio::awaitable<void> ensure_resolved();
     asio::awaitable<bool> connect_to_tracker();
 
     asio::io_context& io_context_;
     asio::ip::udp::socket socket_;
+    std::string host_;
+    int port_;
     asio::ip::udp::endpoint tracker_endpoint_;
+    bool resolved_{false};
 
     asio::steady_timer::time_point connection_id_expiry_;
     uint32_t next_transaction_id_{0};
@@ -265,6 +267,15 @@ inline std::shared_ptr<ITrackerClient> create_tracker_client(asio::io_context& i
     }
 }
 
+inline asio::awaitable<void> UdpTrackerClient::ensure_resolved() {
+    if (resolved_) co_return;
+    asio::ip::udp::resolver resolver(io_context_);
+    auto results = co_await resolver.async_resolve(host_, std::to_string(port_), asio::use_awaitable);
+    tracker_endpoint_ = *results.begin();
+    socket_.open(tracker_endpoint_.protocol());
+    resolved_ = true;
+}
+
 inline asio::awaitable<bool> UdpTrackerClient::connect_to_tracker() {
     CTRACK_ASYNC("UdpTrackerClient::connect_to_tracker");
     auto self = shared_from_this();
@@ -317,6 +328,8 @@ inline asio::awaitable<bool> UdpTrackerClient::connect_to_tracker() {
 inline asio::awaitable<TrackerAnnounceResult> UdpTrackerClient::announce(const AnnounceRequestParams& params) {
     CTRACK_ASYNC("UdpTrackerClient::announce");
     auto self = shared_from_this();
+
+    co_await ensure_resolved();
 
     if (connection_id_ == 0 || std::chrono::steady_clock::now() >= connection_id_expiry_) {
         bool connected = co_await connect_to_tracker();

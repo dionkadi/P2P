@@ -28,7 +28,11 @@ struct PeerMisbehavior {
     uint32_t connection_failures{0};
 
     bool has_exceeded_thresholds() const noexcept {
-        return corrupt_pieces >= 3 || protocol_violations >= 5 || timeouts >= 10 || connection_failures >= 5;
+        // connection_failures raised from 5 to 10: transient handshake/NAT failures are
+        // extremely common in public swarms and should not trigger a 1h ban. The global
+        // fail-cache (in report_connection_failure) already backs off dead peers; the
+        // ban is reserved for peers that persistently fail across many attempts.
+        return corrupt_pieces >= 3 || protocol_violations >= 5 || timeouts >= 10 || connection_failures >= 10;
     }
 };
 
@@ -218,6 +222,8 @@ private:
     std::unordered_map<std::string, BackoffState> backoff_states_;
     mutable std::mutex backoff_mutex_;
     asio::steady_timer backoff_retry_timer_;
+
+
     mutable std::mutex pending_connect_mutex_;
     std::vector<std::shared_ptr<asio::ip::tcp::socket>> pending_connect_sockets_;
 

@@ -306,7 +306,7 @@ inline asio::awaitable<void> LsdDiscovery::send_announce() {
             multicast_endpoint_,
             asio::use_awaitable
         );
-        LOGDBG("LSD: Sent announcement for {}", LsdCrypto::base32_encode(info_hash_vec));
+        LOGINFO("LSD: Sent announcement for {}", LsdCrypto::base32_encode(info_hash_vec));
     } catch (const std::exception& e) {
         LOGERR("LSD: Failed to send announcement: {}", e.what());
     }
@@ -383,7 +383,7 @@ inline void LsdDiscovery::parse_and_add_peer(
     uint16_t port = parsed->port;
 
     if (port == listening_port_) {
-        LOGDBG("LSD: Ignoring self-announcement from {} (port matches listening port)", sender_addr.to_string());
+        LOGWARN("LSD: Ignoring self-announcement from {} (port matches listening port)", sender_addr.to_string());
         return;
     }
 
@@ -393,5 +393,5 @@ inline void LsdDiscovery::parse_and_add_peer(
 
     asio::ip::tcp::endpoint ep(sender_addr, port);
     peer_manager_->add_discovered_peer(ep);
-    LOGDBG("LSD: Discovered peer {}:{} via LSD", sender_addr.to_string(), port);
+    LOGINFO("LSD: Discovered peer {}:{} via LSD", sender_addr.to_string(), port);
 }

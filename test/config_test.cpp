@@ -22,8 +22,8 @@ static std::vector<char*> make_argv(std::initializer_list<const char*> args) {
 TEST(ClientConfigTest, DefaultValues) {
     ClientConfig cfg;
     EXPECT_EQ(cfg.peer_port, 6881);
-    EXPECT_EQ(cfg.upload_rate_limit, 512 * 1024);
-    EXPECT_EQ(cfg.download_rate_limit, 2ULL * 1024 * 1024);
+    EXPECT_EQ(cfg.upload_rate_limit, 0u);
+    EXPECT_EQ(cfg.download_rate_limit, 0u);
     EXPECT_EQ(cfg.max_connections, 200u);
     EXPECT_EQ(cfg.max_connections_per_ip, 2u);
     EXPECT_EQ(cfg.max_half_open, 40u);

@@ -200,6 +200,8 @@ public:
     void metadata_ext_id(uint8_t id) noexcept { metadata_ext_id_ = id; }
     int32_t metadata_size() const noexcept { return metadata_size_; }
     void metadata_size(int32_t size) noexcept { metadata_size_ = size; }
+    bool metadata_requested() const noexcept { return metadata_requested_; }
+    void metadata_requested(bool v) noexcept { metadata_requested_ = v; }
 
 protected:
     PeerConnection(
@@ -266,6 +268,7 @@ private:
     bool fast_extension_supported_{false};
     uint8_t metadata_ext_id_{0};
     int32_t metadata_size_{0};
+    bool metadata_requested_{false};
     bool inventory_pending_metadata_{false};
     bool peer_has_all_hint_{false};
 

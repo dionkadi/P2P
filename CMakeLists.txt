@@ -24,7 +24,7 @@ find_package(Boost REQUIRED COMPONENTS url)
 find_package(GTest REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(spdlog REQUIRED)
-
+find_package(TBB REQUIRED)
 
 add_library(p2p_common
     src/Bencode.cpp  
@@ -44,6 +44,7 @@ target_link_libraries(p2p_common PUBLIC
     Boost::url
     OpenSSL::SSL
     OpenSSL::Crypto
+    TBB::tbb
 )
 
 target_include_directories(p2p_common PUBLIC include)

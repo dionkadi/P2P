@@ -106,6 +106,7 @@ public:
     std::vector<BucketEntry> find_closest_nodes(const NodeId& target, size_t k) const;
     bool needs_refresh(size_t bucket_idx) const;
     void touch(size_t bucket_idx);
+    size_t size() const;
 private:
     NodeId my_node_id_;
     std::array<KBucket, 160> buckets_;    
@@ -134,11 +135,15 @@ public:
     void start();
     void stop();
 
-    // KRPC Query methods (DHT Client functionality)
-    asio::awaitable<void> send_ping(const udp::endpoint& target_endpoint); // Pings a node and updates routing table
-    asio::awaitable<std::vector<BucketEntry>> find_nodes(const NodeId& target_id, uint count = K);
-    asio::awaitable<std::vector<EndPoint>> get_peers(const InfoHash& info_hash, uint count = K);
-    asio::awaitable<void> announce_peer(const InfoHash& info_hash, uint16_t client_port);
+    // KRPC Query methods (DHT Client functionality).
+    // NOTE: coroutines keep their arguments alive across suspension points in
+    // their own frame, but callers can pass stack/temporary objects whose
+    // lifetime ends before the coroutine runs — so these take their target by
+    // VALUE (NodeId/InfoHash are 20-byte arrays, endpoint is 28 bytes).
+    asio::awaitable<void> send_ping(udp::endpoint target_endpoint); // Pings a node and updates routing table
+    asio::awaitable<std::vector<BucketEntry>> find_nodes(NodeId target_id, uint count = K);
+    asio::awaitable<std::vector<EndPoint>> get_peers(InfoHash info_hash, uint count = K);
+    asio::awaitable<void> announce_peer(InfoHash info_hash, uint16_t client_port);
     const NodeId& get_node_id() const { return my_node_id_; }
     uint16_t get_port() const { return socket_.local_endpoint().port(); }
     // Bootstrap function to discover initial nodes
@@ -154,6 +159,7 @@ private:
     std::atomic_bool shuting_down_{false};
 
     std::mt19937_64 rng_{std::random_device{}()};
+    std::mutex rng_mutex_;
     String generate_transaction_id();
     String generate_token(const udp::endpoint& remote_endpoint) const;
 
@@ -161,7 +167,41 @@ private:
         std::move_only_function<void(boost::system::error_code, Value)> completion;
         udp::endpoint remote;
         TimePoint expiry;
+        // Guarantees the completion is invoked exactly once even when several
+        // completion paths race (KRPC response, protocol error, group
+        // cancellation, stop() abort, and the expiry timer below).
+        std::atomic<bool> completed{false};
+        // Self-bound: fires at expiry and completes the query even if it was
+        // orphaned from pending_queries_ (tid collision overwrite, cancellation
+        // racing registration, or registration after stop()'s abort sweep).
+        // Without it, the query branch of a `||` composition can suspend
+        // forever, leaking the child + group frames and hanging the caller.
+        std::shared_ptr<asio::steady_timer> expiry_timer;
     };
+
+    // Builds a pending query with the self-bound expiry timer armed. The
+    // expiry fires KRPC_QUERY_TIMEOUT + 1s so the `||` composition's own 10s
+    // timer normally wins the timeout race and the error paths stay clean
+    // (the timer branch reports the timeout via index 1).
+    std::shared_ptr<PendingQuery> create_pending_query(udp::endpoint remote) {
+        auto query = std::make_shared<PendingQuery>();
+        query->remote = std::move(remote);
+        query->expiry = std::chrono::steady_clock::now()
+            + KRPC_QUERY_TIMEOUT + std::chrono::seconds(1);
+        auto timer = std::make_shared<asio::steady_timer>(io_context_);
+        timer->expires_at(query->expiry);
+        query->expiry_timer = timer;
+        timer->async_wait([q = query](boost::system::error_code ec) {
+            if (ec) {
+                return;  // cancelled: the query completed via another path
+            }
+            if (q->completion) {
+                q->completion(asio::error::timed_out, Value{});
+            }
+        });
+        return query;
+    }
+
     std::map<String, std::shared_ptr<PendingQuery>> pending_queries_;  // transaction_id -> pending query
     mutable std::mutex queries_mutex_;
 
@@ -235,7 +275,7 @@ inline bool KBucket::add(const BucketEntry& entry) {
         });
         if (it != bucket.end()) {
             // Replace bad node
-            LOGDBG("Replacing bad node {} with new node {} in K-bucket", Crypto::bytes_to_hex(it->id), Crypto::bytes_to_hex(entry.id));
+            // LOGDBG("Replacing bad node {} with new node {} in K-bucket", Crypto::bytes_to_hex(it->id), Crypto::bytes_to_hex(entry.id));
             *it = entry;
             bucket.splice(bucket.end(), bucket, it); // Move new node to back
             last_changed = std::chrono::steady_clock::now();
@@ -278,8 +318,8 @@ inline void RouteTable::insert(const BucketEntry& entry) {
         // A real DHT would ping the oldest node here and potentially replace it.
         // For simplicity, we just log and ignore the new entry for now,
         // but the refresh mechanism will eventually handle stale entries.
-        LOGDBG("Bucket {} is full and all nodes are good. Cannot add node {}. Will ping oldest later.",
-                idx, Crypto::bytes_to_hex(entry.id));
+        // LOGDBG("Bucket {} is full and all nodes are good. Cannot add node {}. Will ping oldest later.",
+        //         idx, Crypto::bytes_to_hex(entry.id));
     }
 }
 
@@ -380,6 +420,15 @@ inline void RouteTable::touch(size_t bucket_idx) {
     buckets_[bucket_idx].last_changed = std::chrono::steady_clock::now();
 }
 
+inline size_t RouteTable::size() const {
+    std::lock_guard lock(mutex_);
+    size_t total = 0;
+    for (const auto& kb : buckets_) {
+        total += kb.bucket.size();
+    }
+    return total;
+}
+
 inline void DHTNode::start() {
     auto self = shared_from_this();
     asio::co_spawn(io_context_, self->udp_listen_loop(), asio::detached);
@@ -421,6 +470,7 @@ inline String DHTNode::generate_transaction_id() {
     // Generate a random 2-byte transaction ID.
     // In a production environment, you might want something more robust
     // like a counter or a cryptographically secure random number.
+    std::lock_guard lock(rng_mutex_);
     uint16_t tid = static_cast<uint16_t>(rng_() & 0xFFFF);
     return std::string(reinterpret_cast<char*>(&tid), sizeof(tid));
 }
@@ -442,9 +492,7 @@ auto DHTNode::async_ping(String tid, udp::endpoint target, CompletionToken&& tok
             auto ping_query = create_ping_query(tid, my_node_id_);
             auto encoded = encode(ping_query);
 
-            auto query = std::make_shared<PendingQuery>();
-            query->remote = target;
-            query->expiry = std::chrono::steady_clock::now() + KRPC_QUERY_TIMEOUT;
+            auto query = create_pending_query(target);
 
             // Register cancellation slot: when the parallel_group cancels this op,
             // clean up the pending query and invoke completion with operation_aborted.
@@ -470,8 +518,12 @@ auto DHTNode::async_ping(String tid, udp::endpoint target, CompletionToken&& tok
                 });
             }
 
-            query->completion = [handler = std::move(handler)] (auto ec, auto value) mutable {
-                handler(ec, value);
+            query->completion = [handler = std::move(handler), timer = query->expiry_timer, q = query.get()] (auto ec, auto value) mutable {
+                if (q->completed.exchange(true)) {
+                    return;  // already completed (response, cancel, abort, or expiry)
+                }
+                timer->cancel();
+                handler(ec, std::move(value));
             };
 
             {
@@ -479,12 +531,14 @@ auto DHTNode::async_ping(String tid, udp::endpoint target, CompletionToken&& tok
                 pending_queries_[tid] = query;
             }
 
-            asio::co_spawn(io_context_, socket_.send_to(encoded, target), asio::detached);
+            asio::co_spawn(io_context_, [encoded = std::move(encoded), &socket = socket_, ep = target]() mutable -> asio::awaitable<void> {
+                co_await socket.send_to(encoded, ep);
+            }(), asio::detached);
         }
     , token);
 }
 
-inline asio::awaitable<void> DHTNode::send_ping(const udp::endpoint& target_endpoint) {
+inline asio::awaitable<void> DHTNode::send_ping(udp::endpoint target_endpoint) {
     CTRACK_ASYNC("DHTNode::send_ping");
     if (shuting_down_) {
         co_return;
@@ -529,12 +583,10 @@ template<typename CompletionToken>
 auto DHTNode::async_find_nodes(String tid, BucketEntry node, NodeId target_id, CompletionToken&& token) {
     return asio::async_initiate<CompletionToken, void(boost::system::error_code, Value)>(
         [this, tid = std::move(tid), node = std::move(node), target_id = std::move(target_id)] (auto handler) {
-            auto find_node_query = create_find_node_query(tid, node.id, target_id);
+            auto find_node_query = create_find_node_query(tid, my_node_id_, target_id);
             auto encoded = encode(find_node_query);
 
-            auto query = std::make_shared<PendingQuery>();
-            query->remote = node.endpoint;
-            query->expiry = std::chrono::steady_clock::now() + KRPC_QUERY_TIMEOUT;
+            auto query = create_pending_query(node.endpoint);
 
             {
                 auto cancel_slot = asio::get_associated_cancellation_slot(handler);
@@ -558,8 +610,12 @@ auto DHTNode::async_find_nodes(String tid, BucketEntry node, NodeId target_id, C
                 }
             }
 
-            query->completion = [handler = std::move(handler)] (auto ec, auto value) mutable {
-                handler(ec, value);
+            query->completion = [handler = std::move(handler), timer = query->expiry_timer, q = query.get()] (auto ec, auto value) mutable {
+                if (q->completed.exchange(true)) {
+                    return;  // already completed (response, cancel, abort, or expiry)
+                }
+                timer->cancel();
+                handler(ec, std::move(value));
             };
 
             {
@@ -567,12 +623,14 @@ auto DHTNode::async_find_nodes(String tid, BucketEntry node, NodeId target_id, C
                 pending_queries_[tid] = query;
             }
 
-            asio::co_spawn(io_context_, socket_.send_to(encoded, node.endpoint), asio::detached);
+            asio::co_spawn(io_context_, [encoded = std::move(encoded), &socket = socket_, ep = node.endpoint]() mutable -> asio::awaitable<void> {
+                co_await socket.send_to(encoded, ep);
+            }(), asio::detached);
         }    
     , token);
 }
 
-inline asio::awaitable<std::vector<BucketEntry>> DHTNode::find_nodes(const NodeId& target_id, uint count) {
+inline asio::awaitable<std::vector<BucketEntry>> DHTNode::find_nodes(NodeId target_id, uint count) {
     CTRACK_ASYNC("DHTNode::find_nodes");
     if (shuting_down_) {
         co_return std::vector<BucketEntry>{};
@@ -595,6 +653,9 @@ inline asio::awaitable<std::vector<BucketEntry>> DHTNode::find_nodes(const NodeI
     if (nodes_to_query.size() > ALPHA) {
         nodes_to_query.resize(ALPHA);
     }
+    LOGDBG("find_nodes: routing table has {} nodes, {} usable, querying {} initially",
+            routing_table_.size(), result.size(), nodes_to_query.size());
+
     std::set<NodeId> queried_nodes;
     for (const auto& n : nodes_to_query) {
         queried_nodes.insert(n.id);
@@ -608,13 +669,19 @@ inline asio::awaitable<std::vector<BucketEntry>> DHTNode::find_nodes(const NodeI
             break;
         }
 
+        LOGDBG("find_nodes iteration {}: querying {} nodes, {} in result so far", i, nodes_to_query.size(), result.size());
+
         std::vector<BucketEntry> discovered;
         std::mutex mutex;
-        auto find_nodes_coro = [this, &target_id, &discovered, &mutex, &queried_nodes] (const BucketEntry& node) -> asio::awaitable<void> {
+        // `target_id` is a by-value parameter, so it lives in this coroutine
+        // frame for the whole run; the child captures a copy so it stays valid
+        // even if it outlives this coroutine (parallel-group losers linger).
+        auto find_nodes_coro = [this, target_id, &discovered, &mutex, &queried_nodes] (const BucketEntry& node) -> asio::awaitable<void> {
             if (shuting_down_) {
                 co_return;
             }
             auto transaction_id = generate_transaction_id();
+            auto query_start = std::chrono::steady_clock::now();
             try {
                 asio::steady_timer timer(io_context_);
                 timer.expires_after(KRPC_QUERY_TIMEOUT);
@@ -633,6 +700,10 @@ inline asio::awaitable<std::vector<BucketEntry>> DHTNode::find_nodes(const NodeI
 
                     routing_table_.insert({responder_id, node.endpoint, NodeStatus::Good, std::chrono::steady_clock::now(), std::chrono::steady_clock::now()});
                     std::vector<BucketEntry> discovered_from_node = from_compact_node_info(compact_nodes_str);
+                    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - query_start);
+                    LOGDBG("find_node to {} responded in {} ms with {} nodes", node.endpoint.address().to_string(),
+                            elapsed.count(), discovered_from_node.size());
                     std::lock_guard lock(mutex);
                     for (const auto& n : discovered_from_node) {
                         if (n.id != my_node_id_ && !queried_nodes.count(n.id)) {
@@ -640,10 +711,13 @@ inline asio::awaitable<std::vector<BucketEntry>> DHTNode::find_nodes(const NodeI
                         }
                     }
                 } else {  // timeout
+                    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - query_start);
+                    LOGDBG("find_node to {} timed out after {} ms", node.endpoint.address().to_string(), elapsed.count());
                     routing_table_.update_status(node.id, NodeStatus::Bad);
                 }
             } catch (const std::exception& e) {
-                LOGDBG("find_node query to {} failed: {}", node.endpoint.address().to_string(), e.what());
+                LOGWARN("find_node query to {} failed: {}", node.endpoint.address().to_string(), e.what());
                 routing_table_.update_status(node.id, NodeStatus::Bad);
             }
             {
@@ -700,12 +774,10 @@ template<typename CompletionToken>
 auto DHTNode::async_get_peers(String tid, BucketEntry node, InfoHash info_hash, CompletionToken&& token) {
     return asio::async_initiate<CompletionToken, void(boost::system::error_code, Value)>(
         [this, tid = std::move(tid), node = std::move(node), info_hash = std::move(info_hash)] (auto handler) {
-            auto get_peers_query = create_get_peers_query(tid, node.id, info_hash);
+            auto get_peers_query = create_get_peers_query(tid, my_node_id_, info_hash);
             auto encoded = encode(get_peers_query);
 
-            auto query = std::make_shared<PendingQuery>();
-            query->remote = node.endpoint;
-            query->expiry = std::chrono::steady_clock::now() + KRPC_QUERY_TIMEOUT;
+            auto query = create_pending_query(node.endpoint);
 
             {
                 auto cancel_slot = asio::get_associated_cancellation_slot(handler);
@@ -729,8 +801,12 @@ auto DHTNode::async_get_peers(String tid, BucketEntry node, InfoHash info_hash, 
                 }
             }
 
-            query->completion = [handler = std::move(handler)] (auto ec, auto value) mutable {
-                handler(ec, value);
+            query->completion = [handler = std::move(handler), timer = query->expiry_timer, q = query.get()] (auto ec, auto value) mutable {
+                if (q->completed.exchange(true)) {
+                    return;  // already completed (response, cancel, abort, or expiry)
+                }
+                timer->cancel();
+                handler(ec, std::move(value));
             };
 
             {
@@ -738,12 +814,14 @@ auto DHTNode::async_get_peers(String tid, BucketEntry node, InfoHash info_hash, 
                 pending_queries_[tid] = query;
             }
 
-            asio::co_spawn(io_context_, socket_.send_to(encoded, node.endpoint), asio::detached);            
+            asio::co_spawn(io_context_, [encoded = std::move(encoded), &socket = socket_, ep = node.endpoint]() mutable -> asio::awaitable<void> {
+                co_await socket.send_to(encoded, ep);
+            }(), asio::detached);
         }    
     , token);
 }
 
-inline asio::awaitable<std::vector<EndPoint>> DHTNode::get_peers(const InfoHash& info_hash, uint count) {
+inline asio::awaitable<std::vector<EndPoint>> DHTNode::get_peers(InfoHash info_hash, uint count) {
     CTRACK_ASYNC("DHTNode::get_peers");
     if (shuting_down_) {
         co_return std::vector<EndPoint>{};
@@ -766,7 +844,14 @@ inline asio::awaitable<std::vector<EndPoint>> DHTNode::get_peers(const InfoHash&
         }
     }
 
+    if (routing_table_.size() == 0) {
+        LOGWARN("get_peers: routing table is empty, cannot query DHT for peers");
+        co_return discovered;
+    }
     auto nodes_to_query = routing_table_.find_closest_nodes(info_hash, count);
+    LOGDBG("get_peers: {} known peers cached, routing table has {} entries, {} closest nodes to query",
+            discovered.size(), routing_table_.size(), nodes_to_query.size());
+
     std::set<NodeId> queried_nodes;
     for (const auto& node : nodes_to_query) {
         queried_nodes.insert(node.id);
@@ -780,15 +865,18 @@ inline asio::awaitable<std::vector<EndPoint>> DHTNode::get_peers(const InfoHash&
             break;
         }
 
+        LOGDBG("get_peers iteration {}: querying up to {} nodes, {} peers found so far", i, ALPHA, discovered.size());
+
         std::mutex query_result_mutex;
         std::vector<EndPoint> current_peers;
         std::vector<BucketEntry> current_nodes;
 
-        auto get_peers_coro = [this, &info_hash, &query_result_mutex, &current_peers, &current_nodes] (const BucketEntry& node) -> asio::awaitable<void> {
+        auto get_peers_coro = [this, info_hash, &query_result_mutex, &current_peers, &current_nodes] (const BucketEntry& node) -> asio::awaitable<void> {
             if (shuting_down_) {
                 co_return;
             }
             auto tid = generate_transaction_id();
+            auto query_start = std::chrono::steady_clock::now();
             try {
                 asio::steady_timer timer(io_context_);
                 timer.expires_after(KRPC_QUERY_TIMEOUT);
@@ -806,12 +894,14 @@ inline asio::awaitable<std::vector<EndPoint>> DHTNode::get_peers(const InfoHash&
                     NodeId responder_id = Crypto::from_string(std::get<String>(r_values.at("id").get_variant()));
                     routing_table_.insert({responder_id, node.endpoint, NodeStatus::Good, std::chrono::steady_clock::now(), std::chrono::steady_clock::now()});
                     
+                    int n_peers = 0, n_nodes = 0;
                     if (r_values.count("values")) {
                         const List& compact_peers_list = *std::get<std::unique_ptr<List>>(r_values.at("values").get_variant());
                         std::lock_guard lock(query_result_mutex);
                         for (const auto& val : compact_peers_list) {
                             std::string compact_peer_str = std::get<String>(val.get_variant());
                             std::vector<EndPoint> peers_from_node = from_compact_peer_info(compact_peer_str);
+                            n_peers += peers_from_node.size();
                             for (const auto& peer_ep : peers_from_node) {
                                 current_peers.push_back(peer_ep);
                             }
@@ -819,6 +909,7 @@ inline asio::awaitable<std::vector<EndPoint>> DHTNode::get_peers(const InfoHash&
                     } else if (r_values.count("nodes")) {
                         std::string compact_nodes_str = std::get<String>(r_values.at("nodes").get_variant());
                         std::vector<BucketEntry> nodes_from_node = from_compact_node_info(compact_nodes_str);
+                        n_nodes = nodes_from_node.size();
                         std::lock_guard lock(query_result_mutex);
                         for (auto& n : nodes_from_node) {
                             current_nodes.push_back(n);
@@ -830,11 +921,20 @@ inline asio::awaitable<std::vector<EndPoint>> DHTNode::get_peers(const InfoHash&
                         std::lock_guard lock(tokens_mutex_);
                         tokens_issued_[info_hash][node.endpoint] = {token_val, std::chrono::steady_clock::now() + ANNOUNCE_TOKEN_LIFETIME};
                     }
+
+                    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - query_start);
+                    LOGDBG("get_peers query to {} responded in {} ms: {} peers, {} nodes, has_token={}",
+                            node.endpoint.address().to_string(), elapsed.count(), n_peers, n_nodes, r_values.count("token"));
                 } else {  // timeout
+                    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - query_start);
+                    LOGDBG("get_peers query to {} timed out after {} ms",
+                            node.endpoint.address().to_string(), elapsed.count());
                     routing_table_.update_status(node.id, NodeStatus::Bad);
                 }
             } catch (const std::exception& e) {
-                LOGDBG("get_peers query to {} failed: {}", node.endpoint.address().to_string(), e.what());
+                LOGWARN("get_peers query to {} failed: {}", node.endpoint.address().to_string(), e.what());
                 routing_table_.update_status(node.id, NodeStatus::Bad);
             }
             {
@@ -889,6 +989,7 @@ inline asio::awaitable<std::vector<EndPoint>> DHTNode::get_peers(const InfoHash&
             break;
         }
     }
+    LOGDBG("get_peers complete: found {} peers total from DHT (routing table now has {} entries)", discovered.size(), routing_table_.size());
     co_return discovered;
 }
 
@@ -896,12 +997,10 @@ template<typename CompletionToken>
 auto DHTNode::async_announce_peer(String tid, BucketEntry node, InfoHash info_hash, uint16_t port, String announce_token, CompletionToken&& token) {
     return asio::async_initiate<CompletionToken, void(boost::system::error_code, Value)>(
         [this, tid = std::move(tid), node = std::move(node), info_hash = std::move(info_hash), port, announce_token = std::move(announce_token)] (auto handler) {
-            auto announce_query = create_announce_peer_query(tid, node.id, info_hash, port, announce_token);
+            auto announce_query = create_announce_peer_query(tid, my_node_id_, info_hash, port, announce_token);
             auto encoded = encode(announce_query);
 
-            auto query = std::make_shared<PendingQuery>();
-            query->remote = node.endpoint;
-            query->expiry = std::chrono::steady_clock::now() + KRPC_QUERY_TIMEOUT;
+            auto query = create_pending_query(node.endpoint);
 
             {
                 auto cancel_slot = asio::get_associated_cancellation_slot(handler);
@@ -925,8 +1024,12 @@ auto DHTNode::async_announce_peer(String tid, BucketEntry node, InfoHash info_ha
                 }
             }
 
-            query->completion = [handler = std::move(handler)] (auto ec, auto value) mutable {
-                handler(ec, value);
+            query->completion = [handler = std::move(handler), timer = query->expiry_timer, q = query.get()] (auto ec, auto value) mutable {
+                if (q->completed.exchange(true)) {
+                    return;  // already completed (response, cancel, abort, or expiry)
+                }
+                timer->cancel();
+                handler(ec, std::move(value));
             };
 
             {
@@ -934,19 +1037,23 @@ auto DHTNode::async_announce_peer(String tid, BucketEntry node, InfoHash info_ha
                 pending_queries_[tid] = query;
             }
 
-            asio::co_spawn(io_context_, socket_.send_to(encoded, node.endpoint), asio::detached);
+            asio::co_spawn(io_context_, [encoded = std::move(encoded), &socket = socket_, ep = node.endpoint]() mutable -> asio::awaitable<void> {
+                co_await socket.send_to(encoded, ep);
+            }(), asio::detached);
         }
     , token);
 }
 
-inline asio::awaitable<void> DHTNode::announce_peer(const InfoHash& info_hash, uint16_t client_port) {
+inline asio::awaitable<void> DHTNode::announce_peer(InfoHash info_hash, uint16_t client_port) {
     CTRACK_ASYNC("DHTNode::announce_peer");
     if (shuting_down_) {
         co_return;
     }
 
     auto closest = routing_table_.find_closest_nodes(info_hash, K);
+    LOGDBG("announce_peer: {} closest nodes for announce (routing table has {} entries)", closest.size(), routing_table_.size());
 
+    int announced_count = 0;
     for (const auto& node : closest) {
         if (shuting_down_) {
             co_return;
@@ -983,7 +1090,7 @@ inline asio::awaitable<void> DHTNode::announce_peer(const InfoHash& info_hash, u
                     routing_table_.update_status(node.id, NodeStatus::Bad);
                 }
             } catch (const std::exception& e) {
-                LOGDBG("get_peers during announce failed for {}: {}", node.endpoint.address().to_string(), e.what());
+                LOGWARN("get_peers during announce failed for {}: {}", node.endpoint.address().to_string(), e.what());
                 routing_table_.update_status(node.id, NodeStatus::Bad);
             }
             {
@@ -1008,14 +1115,12 @@ inline asio::awaitable<void> DHTNode::announce_peer(const InfoHash& info_hash, u
                 );
 
                 if (result.index() == 0) {
-                    LOGDBG("Announced to {}:{} for infohash {}",
-                        node.endpoint.address().to_string(), node.endpoint.port(),
-                        Crypto::bytes_to_hex(info_hash));
+                    ++announced_count;
                 } else {
                     routing_table_.update_status(node.id, NodeStatus::Bad);
                 }
             } catch (const std::exception& e) {
-                LOGDBG("announce_peer to {} failed: {}", node.endpoint.address().to_string(), e.what());
+                LOGWARN("announce_peer to {} failed: {}", node.endpoint.address().to_string(), e.what());
                 routing_table_.update_status(node.id, NodeStatus::Bad);
             }
             {
@@ -1024,6 +1129,8 @@ inline asio::awaitable<void> DHTNode::announce_peer(const InfoHash& info_hash, u
             }
         }
     }
+    LOGDBG("announce_peer: announced to {} of {} closest nodes (routing table now has {} entries)",
+            announced_count, closest.size(), routing_table_.size());
 }
 
 inline std::string DHTNode::to_compact_node_info(const std::vector<BucketEntry>& nodes) {
@@ -1247,7 +1354,7 @@ inline asio::awaitable<void> DHTNode::on_announce_peer_query(const Dict& args, c
         });
         peers.erase(it, peers.end());
         peers.push_back({peer_endpoint, std::chrono::steady_clock::now() + PEER_STORAGE_LIFETIME});
-        LOGDBG("Stored peer {}:{} for info_hash {}", peer_endpoint.address().to_string(), port, Crypto::bytes_to_hex(info_hash));
+        LOGINFO("Stored peer {}:{} for info_hash {}", peer_endpoint.address().to_string(), port, Crypto::bytes_to_hex(info_hash));
     }
 
     auto response = create_announce_peer_response(transaction_id, my_node_id_);
@@ -1335,7 +1442,7 @@ inline asio::awaitable<void> DHTNode::handle_response(const Dict& response_dict,
     if (query) {
         query->completion({}, Value(response_dict));
     } else {
-        LOGDBG("Received response for unknown transaction from {}", remote.address().to_string());
+        LOGINFO("Received response for unknown transaction from {}", remote.address().to_string());
     }
     co_return;
 }
@@ -1377,15 +1484,18 @@ inline asio::awaitable<void> DHTNode::udp_listen_loop() {
 
 inline asio::awaitable<void> DHTNode::bootstrap(const std::vector<std::string>& bootstrap_nodes_addrs) {
     CTRACK_ASYNC("DHTNode::bootstrap");
+    auto start_time = std::chrono::steady_clock::now();
     LOGINFO("Bootstrapping DHT with {} nodes", bootstrap_nodes_addrs.size());
+    LOGDBG("Routing table has {} entries before bootstrap.", routing_table_.size());
 
-    for (const auto& addr : bootstrap_nodes_addrs) {
-        if (shuting_down_) {
-            co_return;
-        }
+    // Ping all bootstrap nodes in PARALLEL. The old sequential loop took ~31s when
+    // 2 of 3 nodes timed out (10s each); parallel pings complete in ~max(timeout)=10s,
+    // so the one responsive node populates the routing table within ~300ms instead of
+    // being blocked behind two dead nodes.
+    auto ping_one = [this](std::string addr) -> asio::awaitable<void> {
+        if (shuting_down_) co_return;
         try {
             auto [host, port] = decode_address(addr);
-            // Resolve hostname to endpoint (handles both dotted-decimal IPs and DNS names)
             udp::resolver resolver(io_context_);
             auto results = co_await resolver.async_resolve(
                 host, std::to_string(port),
@@ -1394,24 +1504,57 @@ inline asio::awaitable<void> DHTNode::bootstrap(const std::vector<std::string>& 
             );
             if (results.empty()) {
                 LOGWARN("Failed to resolve bootstrap node: {}", addr);
-                continue;
-            }
-            if (shuting_down_) {
                 co_return;
             }
+            if (shuting_down_) co_return;
             udp::endpoint ep = results.begin()->endpoint();
+            auto ping_start = std::chrono::steady_clock::now();
             co_await send_ping(ep);
+            auto ping_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - ping_start);
+            LOGDBG("Ping to {} ({}) took {} ms ({} entries in routing table)",
+                    addr, ep.address().to_string(), ping_duration.count(), routing_table_.size());
         } catch (const std::exception& e) {
             LOGWARN("Failed to bootstrap with {}: {}", addr, e.what());
         }
+    };
+
+    using deferred_t = decltype(asio::co_spawn(std::declval<asio::io_context&>(), ping_one(std::declval<std::string>()), asio::deferred));
+    std::vector<deferred_t> ping_queries;
+    for (const auto& addr : bootstrap_nodes_addrs) {
+        ping_queries.push_back(asio::co_spawn(io_context_, ping_one(addr), asio::deferred));
+    }
+    if (!ping_queries.empty()) {
+        auto group = asio::experimental::make_parallel_group(std::move(ping_queries));
+        co_await group.async_wait(asio::experimental::wait_for_all(), asio::use_awaitable);
     }
 
     if (shuting_down_) {
         co_return;
     }
 
+    LOGDBG("Routing table has {} entries after parallel pings, starting find_nodes.", routing_table_.size());
     auto closest = co_await find_nodes(my_node_id_, K);
-    LOGINFO("Bootstrap complete. Routing table has {} closest entries.", closest.size());
+
+    // Populate distant buckets by looking up a few random IDs — fire-and-forget so
+    // bootstrap returns promptly (the detached find_nodes populate the routing table
+    // asynchronously). Blocking on them would delay session startup by minutes in
+    // large swarms and cause ASan UAF in tests where SessionHandle's 10s stop timeout
+    // fires before the slow/unresponsive queries complete.
+    //
+    // The routing_table_refresh_loop also handles bucket population over time.
+    for (int j = 0; j < 3 && !shuting_down_; ++j) {
+        NodeId random_id = generate_id("");
+        auto self = shared_from_this();
+        asio::co_spawn(io_context_, [self, random_id]() -> asio::awaitable<void> {
+            co_await self->find_nodes(random_id, K);
+        }(), asio::detached);
+    }
+
+    auto total_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start_time);
+    LOGINFO("Bootstrap complete ({} ms). Routing table has {} entries, find_nodes returned {} closest.",
+            total_duration.count(), routing_table_.size(), closest.size());
 }
 
 inline void DHTNode::routing_table_refresh_loop() {
@@ -1424,12 +1567,35 @@ inline void DHTNode::routing_table_refresh_loop() {
         if (ec || self->shuting_down_) {
             return;
         }
-        for (size_t i = 0; i < 160; ++i) {
-            if (self->routing_table_.needs_refresh(i)) {
+        size_t table_size = self->routing_table_.size();
+        if (table_size < K) {
+            LOGWARN("routing_table_refresh_loop: routing table is critically small ({} entries) after {} minutes. DHT peer discovery is likely non-functional.",
+                    table_size, BUCKET_REFRESH_INTERVAL.count());
+            // Force-refresh by spawning find_nodes for a few random IDs.
+            // find_nodes takes its target by value and `self2` keeps the node
+            // alive, so this fire-and-forget is safe even if this callback's
+            // frame dies first.
+            for (int j = 0; j < 3; ++j) {
                 NodeId random_id = generate_id("");
-                asio::co_spawn(self->io_context_, self->find_nodes(random_id, K), asio::detached);
+                auto self2 = self;
+                asio::co_spawn(self->io_context_, [self2, random_id]() -> asio::awaitable<void> {
+                    co_await self2->find_nodes(random_id, K);
+                }(), asio::detached);
             }
         }
+        int refresh_count = 0;
+        for (size_t i = 0; i < 160; ++i) {
+            if (self->routing_table_.needs_refresh(i)) {
+                ++refresh_count;
+                NodeId random_id = generate_id("");
+                auto self2 = self;
+                asio::co_spawn(self->io_context_, [self2, random_id]() -> asio::awaitable<void> {
+                    co_await self2->find_nodes(random_id, K);
+                }(), asio::detached);
+            }
+        }
+        LOGDBG("routing_table_refresh_loop: {} of 160 buckets need refresh (routing table has {} entries)",
+                refresh_count, self->routing_table_.size());
         self->routing_table_refresh_loop();
     });
 }
@@ -1482,12 +1648,25 @@ inline void DHTNode::cleanup_loop() {
         }
 
         {
-            std::lock_guard lock(self->queries_mutex_);
-            for (auto it = self->pending_queries_.begin(); it != self->pending_queries_.end(); ) {
-                if (it->second->expiry <= now) {
-                    it = self->pending_queries_.erase(it);
-                } else {
-                    ++it;
+            std::vector<std::shared_ptr<PendingQuery>> expired;
+            {
+                std::lock_guard lock(self->queries_mutex_);
+                for (auto it = self->pending_queries_.begin(); it != self->pending_queries_.end(); ) {
+                    if (it->second->expiry <= now) {
+                        expired.push_back(std::move(it->second));
+                        it = self->pending_queries_.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+            }
+            // Complete outside the lock (completions resume coroutines that may
+            // touch pending_queries_). The idempotent completion guard makes
+            // this safe even if the query was already completed by its expiry
+            // timer — the duplicate completion is dropped.
+            for (auto& query : expired) {
+                if (query->completion) {
+                    query->completion(asio::error::timed_out, Value{});
                 }
             }
         }

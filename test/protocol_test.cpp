@@ -765,7 +765,9 @@ TEST(PieceManagerTimeoutTest, BlockPastTimeoutTriggersCancelAndRerequest) {
     // Set request time to 31 seconds ago (past the 30s timeout)
     piece->request_times[0] = std::chrono::steady_clock::now() - 31s;
 
-    RunAsync(io, pm->check_block_timeouts());
+    // Use RunAsyncFor so the detached resumer loop spawned by ensure_resume_piece_download
+    // (when get_available_peers_ returns empty) doesn't keep io.run() alive forever.
+    RunAsyncFor(io, 200ms, pm->check_block_timeouts());
 
     EXPECT_TRUE(timeout_fired) << "Timeout callback should fire for a block past the timeout period";
     EXPECT_EQ(timed_out_piece, 0);

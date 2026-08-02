@@ -51,17 +51,25 @@ public:
     ClientConfig& config() { return config_; }
     const ClientConfig& config() const { return config_; }
 
-    // Access torrent sessions for UI rendering (returns a copy for thread safety)
+    // Access torrent sessions for UI rendering (returns pairs in insertion order)
     auto torrents() const {
         std::lock_guard lock(torrents_mutex_);
-        return torrents_;
+        std::vector<std::pair<InfoHash, std::shared_ptr<TorrentSession>>> result;
+        result.reserve(order_.size());
+        for (const auto& hash : order_) {
+            auto it = torrents_.find(hash);
+            if (it != torrents_.end()) {
+                result.emplace_back(hash, it->second);
+            }
+        }
+        return result;
     }
     size_t torrent_count() const {
         std::lock_guard lock(torrents_mutex_);
         return torrents_.size();
     }
 
-    // Return the i-th torrent (0-based iteration order of the map), or nullptr
+    // Return the i-th torrent (0-based insertion order), or nullptr
     std::shared_ptr<TorrentSession> torrent_by_index(size_t index) const;
 
     // Add a magnet link (BEP-9) while the io_context is running
@@ -116,6 +124,7 @@ private:
     asio::signal_set signals_;
     mutable std::mutex torrents_mutex_;
     std::map<InfoHash, std::shared_ptr<TorrentSession>> torrents_;
+    std::vector<InfoHash> order_; // insertion order matching torrents_ keys
     std::map<InfoHash, std::vector<EndPoint>> peer_cache_;
     ClientConfig config_;
     std::vector<std::string> global_trackers_;
@@ -123,4 +132,8 @@ private:
 
     void spawn_session(const std::shared_ptr<TorrentSession>& session);
     void apply_global_trackers(std::shared_ptr<TorrentSession> session);
+
+    // Shared DHT node — one instance for all sessions to avoid SO_REUSEPORT breakage.
+    void init_dht(uint16_t port);
+    std::shared_ptr<DHTNode> dht_node_;
 };

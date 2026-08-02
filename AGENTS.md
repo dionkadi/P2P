@@ -1,80 +1,59 @@
 # AGENTS.md
 
-P2P is a C++23 BitTorrent client implementation with a tracker server.
+P2P is a C++23 BitTorrent client (`build/client`) + tracker server (`build/tracker`). README is empty; trust `CMakeLists.txt` and `src/main_client.cpp`/`src/main_tracker.cpp` as sources of truth.
 
 ## Build
 
-```bash
-cmake -B build && cmake --build build
-```
+- `cmake -B build && cmake --build build`
+- CMake 4.0 required; Debug by default with `-Wall -Wextra -Werror` + AddressSanitizer; warnings are errors.
+- System deps: Boost (`url`, headers/asio), OpenSSL, spdlog, GTest. Vendored: `include/{argparse.hpp,ctrack.hpp,progress_bar.hpp}`.
+- Presets: `cmake --preset debug && cmake --build --preset debug-build` (binaries `build/debug/`, test at `build/debug/p2p_test`).
+- Library target `p2p_common`; `client`, `tracker`, `p2p_test` link it (test also links GTest).
+- No CI workflow exists — build and test locally.
 
-Build outputs in `build/`:
-- `client` - BitTorrent client (create/seed/download)
-- `tracker` - BitTorrent tracker server
-- `p2p_test` - Test runner
-- `libp2p_common.a` - Static library
+## Profiling
 
-**Build constraints:**
-- C++23 required
-- Strict warnings: `-Wall -Wextra -Werror` (any warning fails build)
-- Debug builds include AddressSanitizer
-- `compile_commands.json` generated in `build/`
+- App is instrumented via CTRACK (`include/ctrack.hpp`): `CTRACK` (sync RAII) on hot paths, `CTRACK_ASYNC` on coroutines.
+- Report prints to stdout at exit for both `client` and `tracker`.
+- Disable with `-DCTRACK_DISABLE`.
 
-## Test
+## Verify
 
-```bash
-./build/p2p_test                    # Run all tests
-./build/p2p_test --gtest_filter=BencodeTest.*  # Run specific suite
-```
+- All tests: `./build/p2p_test`
+- One suite: `./build/p2p_test --gtest_filter=BencodeTest.*`
+- One integration case: `./build/p2p_test --gtest_filter=IntegrationTest.BasicDownload`
+- Unit suites: `BencodeTest`, `BufferWriterTest`/`BufferReaderTest`, `CryptoTest`, `BackoffTest`, `MagnetUriTest`, `ClientConfigTest`, `TorrentFileTest`, `SessionStateTest`, `AsyncRateLimiterTest`, `ProtocolTest` (many sub-suites), `FileManagerTest`, `DHTNetworkTest`, `TrackerDirectTest`, `BanUnitTest`, `ClientAppShutdownTest`.
+- Integration quirks: `IntegrationTest` shares one `asio::io_context` fixture across all cases — state can leak between tests. Rerun individually before chasing flakiness. Known timeouts: `TrackerFailover` (180s), `LargeTorrentManyPieces` (600s), `ChokingAlgorithm` (sleeps 15s). Full suite >90s even when passing.
+- Integration tests spin up an in-process tracker on ports 6880/6880; `#include` `src/` headers directly.
+- Test helpers in `test/helper.hpp`: `RunAsync`, `RunAsyncFor`.
+- `test/output.txt` is a tracked LeakSanitizer crash-log artifact — ignore it.
 
-Tests use GTest. Integration tests spin up an in-process tracker.
+## CLI Gotchas
 
-## Dependencies
+- Client subcommands: only `create` and `run`.
+- `client run <torrent> [dest]` accepts a `.torrent` path. Magnets go through interactive `m <magnet> [dest]` or saved-state restore, not the positional arg.
+- Interactive TUI on by default; `h` shows: `a` (add .torrent), `m` (add magnet), `d` (download dir), `t` (add tracker), `f` (fetch trackers), `s`/`p`/`r` (stop/resume/remove by index), `q` (quit). `--non-interactive` disables it.
+- `--config` and `--save-config` are pre-scanned manually (~`main_client.cpp:159-166`) before argparse — argparse never registers them.
+- Without a positional torrent, client reloads `~/.config/p2p/client_state.bencode`.
+- Config lookup: `./p2p.conf` first, then `~/.config/p2p/p2p.conf`.
+- Tracker: `--port` sets HTTP+UDP to the same value; `--http-port`/`--udp-port` splits them.
 
-- Boost (asio, url, headers)
-- OpenSSL (SSL, Crypto)
-- spdlog
-- GTest
+## Layout
 
-## Client Usage
+- `src/main_client.cpp` — CLI, raw-terminal input loop, config/state restore, `ClientApp` startup.
+- `src/main_tracker.cpp` — HTTP+UDP tracker listeners, live stats (`LiveDisplay` from vendored `progress_bar.hpp`).
+- `ClientApp` owns torrent sessions; `TorrentSession` owns per-torrent subsystems (`PieceManager`, `PeerManager`, `FileManager`, DHT node, LSD discovery, tracker clients).
+- `src/` has 21 headers + 8 library `.cpp` + 2 mains; template/coroutine/inline-heavy. `include/` has 3 vendored headers.
+- `build/`, `data/`, `logs/`, `.cache/`, `.omo/` are gitignored. `downloads.resume` is untracked at root.
+- `docs/` has BEP references (BEP5, BEP9, BEP11) + architecture notes — useful for protocol work.
+- `PRINCIPLES.md` is generic software engineering philosophy — skip it for project-specific decisions.
+- Root `config.json` is OpenCode agent configuration.
 
-```bash
-./build/client create <file> <output.torrent> <tracker_url>
-./build/client seed <torrent> <content_dir> [--port 6881]
-./build/client download <torrent> <save_path> [--port 6881]
-```
+## Conventions
 
-Config flags: `--port`, `--upload-rate`, `--download-rate`, `--max-connections`, `--no-dht`, `--no-lsd`, `--no-pex`, `--config <path>`, `--save-config`.
-
-Config file: `p2p.conf` (bencode format), searched in `./`, `~/.config/p2p/`.
-
-## Tracker Usage
-
-```bash
-./build/tracker --http-port 3333 --udp-port 3333 --data-dir ./tracker_data
-```
-
-## Architecture
-
-Header-heavy design. Most logic lives in `.hpp` files under `src/`.
-
-Core components:
-- `TorrentSession` - Per-torrent session (uses coroutines)
-- `PeerManager` - Connection management, choking/unchoking
-- `PieceManager` - Piece selection, block requests
-- `FileManager` - Disk I/O, caching
-- `Tracker` - HTTP/UDP tracker server
-- `Kademlia` - DHT (BEP 5)
-- `LsdDiscovery` - Local peer discovery (BEP 14)
-
-Async pattern: `asio::awaitable<T>` coroutines throughout.
-
-## Style Notes
-
-- `asio` namespace alias used throughout
-- Logging via `LOGINFO`, `LOGWARN`, `LOGCRITICAL` macros (spdlog)
-- Types: `PeerId`, `InfoHash` = `std::array<std::byte, 20>`
-
-## Recent Work
-
-Completed production push plan documented in `.omo/plans/push-to-real-world-bittorrent.md`. All features implemented.
+- `Utils.hpp` is the central shared header (aliases, logging, crypto, backoff, constants, protocol structs). Don't add helpers there unless truly cross-cutting.
+- `namespace asio = boost::asio;` in `Utils.hpp` but copy-pasted into several other headers.
+- Logging is file-only: `Logger::init(...)` creates rotating logs under `logs/`; `LOG*` macros before `init()` silently go to a null sink.
+- Peer wire transport uses `AsyncSocket` (wrapper over `asio::ip::tcp::socket`); Beast is used for tracker HTTP/HTTPS (`HttpServer.hpp`, `TrackerClient.hpp`).
+- `DHTNode::stop()`: move `pending_queries_` out under `queries_mutex_`, then invoke completions after releasing the lock — avoids reentrant deadlock.
+- `test/integration_test.cpp` `SessionHandle` captures raw `this` in coroutine callbacks and waits up to 10s in its destructor for `stop()`.

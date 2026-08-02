@@ -48,6 +48,8 @@ void ClientApp::add_torrent(Mode mode, const std::filesystem::path& torrent_path
             LOGWARN("Torrent with info_hash already exists, replacing existing session");
             asio::co_spawn(io_context_, it->second->stop(), asio::detached);
             it->second = session;
+        } else {
+            order_.push_back(info_hash);
         }
     }
 
@@ -126,6 +128,8 @@ void ClientApp::add_torrent(Mode mode, const std::filesystem::path& torrent_path
             LOGWARN("Torrent with info_hash already exists, replacing existing session");
             asio::co_spawn(io_context_, it->second->stop(), asio::detached);
             it->second = session;
+        } else {
+            order_.push_back(info_hash);
         }
     }
 
@@ -160,7 +164,7 @@ void ClientApp::setup_signals() {
 
 void ClientApp::stop_all() {
     if (stopping_.exchange(true)) {
-        LOGDBG("Shutdown already in progress.");
+        // LOGDBG("Shutdown already in progress.");
         return;
     }
 
@@ -198,6 +202,11 @@ void ClientApp::stop_all() {
                 }
 
                 if (remaining->fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                    // Stop the shared DHT node after all sessions have stopped.
+                    if (dht_node_) {
+                        dht_node_->stop();
+                        dht_node_.reset();
+                    }
                     io_context_.stop();
                 }
             });
@@ -216,7 +225,25 @@ void ClientApp::stop_all() {
     force_stop_thread.detach();
 }
 
+void ClientApp::init_dht(uint16_t port) {
+    if (dht_node_ || !config_.enable_dht) return;
+    dht_node_ = std::make_shared<DHTNode>(io_context_, port);
+    dht_node_->start();
+    auto bootstrap_nodes = config_.dht_bootstrap_nodes; // copy for async bootstrap
+    asio::co_spawn(io_context_, [dht = dht_node_, bootstrap_nodes = std::move(bootstrap_nodes)]() -> asio::awaitable<void> {
+        co_await dht->bootstrap(bootstrap_nodes);
+    }, asio::detached);
+}
+
 void ClientApp::spawn_session(const std::shared_ptr<TorrentSession>& session) {
+    // Share the single DHT node across all sessions to avoid SO_REUSEPORT breakage.
+    init_dht(config_.peer_port);
+    if (dht_node_) {
+        session->set_shared_dht_node(dht_node_);
+    }
+    // Apply connection limits from config (otherwise PeerManager defaults are used
+    // and --max-connections / --max-half-open / --max-connections-per-ip are no-ops).
+    session->set_connection_limits(config_.max_connections, config_.max_connections_per_ip, config_.max_half_open);
     asio::co_spawn(io_context_,
         [session]() -> asio::awaitable<void> {
             try {
@@ -285,7 +312,7 @@ void ClientApp::add_peers_to_cache(const InfoHash& hash, const std::unordered_se
             cached.push_back(ep);
         }
     }
-    LOGDBG("Peer cache for torrent now has {} peers", cached.size());
+    // LOGDBG("Peer cache for torrent now has {} peers", cached.size());
 }
 
 void ClientApp::seed_session_from_cache(const InfoHash& hash, std::shared_ptr<TorrentSession> session) const {
@@ -321,6 +348,7 @@ void ClientApp::add_torrent_magnet(const std::string& magnet_uri,
             LOGWARN("Torrent with info_hash already exists");
             return;
         }
+        order_.push_back(info_hash);
     }
 
     {
@@ -360,6 +388,7 @@ void ClientApp::add_torrent_magnet(const std::string& magnet_uri,
             LOGWARN("Torrent with info_hash already exists");
             return;
         }
+        order_.push_back(info_hash);
     }
 
     {
@@ -377,9 +406,9 @@ void ClientApp::add_torrent_magnet(const std::string& magnet_uri,
 
 std::shared_ptr<TorrentSession> ClientApp::torrent_by_index(size_t index) const {
     std::lock_guard lock(torrents_mutex_);
-    if (index >= torrents_.size()) return nullptr;
-    auto it = torrents_.begin();
-    std::advance(it, index);
+    if (index >= order_.size()) return nullptr;
+    auto it = torrents_.find(order_[index]);
+    if (it == torrents_.end()) return nullptr;
     return it->second;
 }
 
@@ -411,14 +440,17 @@ void ClientApp::resume_torrent(size_t index) {
     uint64_t old_downloaded = 0, old_uploaded = 0;
     {
         std::lock_guard lock(torrents_mutex_);
-        if (index >= torrent_meta_.size()) {
+        if (index >= order_.size()) {
             LOGWARN("No torrent at index {}", index);
             return;
         }
-        auto it = torrent_meta_.begin();
-        std::advance(it, index);
-        hash = it->first;
-        entry_copy = it->second;
+        hash = order_[index];
+        auto meta_it = torrent_meta_.find(hash);
+        if (meta_it == torrent_meta_.end()) {
+            LOGWARN("No torrent metadata at index {}", index);
+            return;
+        }
+        entry_copy = meta_it->second;
         // If not actually stopped (e.g. already running), nothing to do
         auto session_it = torrents_.find(hash);
         if (session_it != torrents_.end()) {
@@ -443,6 +475,7 @@ void ClientApp::resume_torrent(size_t index) {
     {
         std::lock_guard lock(torrents_mutex_);
         torrents_.erase(hash);
+        std::erase(order_, hash);
     }
     try {
         if (entry_copy.is_magnet) {
@@ -496,16 +529,20 @@ void ClientApp::remove_torrent(size_t index) {
     InfoHash hash{};
     {
         std::lock_guard lock(torrents_mutex_);
-        if (index >= torrents_.size()) {
+        if (index >= order_.size()) {
             LOGWARN("No torrent at index {}", index);
             return;
         }
-        auto it = torrents_.begin();
-        std::advance(it, index);
-        hash = it->first;
+        hash = order_[index];
+        auto it = torrents_.find(hash);
+        if (it == torrents_.end()) {
+            LOGWARN("No torrent at index {}", index);
+            return;
+        }
         session = std::move(it->second);
         torrents_.erase(it);
         torrent_meta_.erase(hash);
+        std::erase(order_, hash);
     }
     LOGINFO("Removed torrent: {} (will stop async)", session->get_display_name());
     // Keep the session alive until stop() completes by chaining a
@@ -560,7 +597,10 @@ void ClientApp::save_state(const std::filesystem::path& path) const {
     root["download_dir"] = Value{config_.download_dir};
 
     List torrents_list;
-    for (const auto& [hash, entry] : torrent_meta_) {
+    for (const auto& hash : order_) {
+        auto meta_it = torrent_meta_.find(hash);
+        if (meta_it == torrent_meta_.end()) continue;
+        const auto& entry = meta_it->second;
         Dict entry_dict;
         entry_dict["source"] = Value{entry.source};
         entry_dict["dest"] = Value{entry.save_path};

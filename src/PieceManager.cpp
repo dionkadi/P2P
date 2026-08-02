@@ -386,7 +386,7 @@ asio::awaitable<void> PieceManager::resume_piece_download(size_t piece_index) {
 
         auto available_peers = co_await get_available_peers_(piece_index);
         if (available_peers.empty()) {
-            LOGDBG("Resumer for piece {}: No available peers yet, will retry...", piece_index);
+            // LOGDBG("Resumer for piece {}: No available peers yet, will retry...", piece_index);
             continue;
         }
 

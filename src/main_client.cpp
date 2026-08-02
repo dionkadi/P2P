@@ -590,20 +590,32 @@ int main(int argc, char* argv[]) {
             }
             torrents_body += " " + Text{ndisp}.bold().str() + "\n";
 
-            size_t bar_w = std::min<size_t>(term_w - 46, 36);
-            if (bar_w < 8) bar_w = 8;
-            size_t filled = static_cast<size_t>(bar_w * progress / 100.0);
-            if (filled > bar_w) filled = bar_w;
+            // The bar is budgeted in terminal COLUMNS, not cells: the fill
+            // glyph "😎" is 2 columns wide, so counting it as one cell makes
+            // the rendered bar grow with progress.  Budget columns and pack
+            // pairs of columns into emoji, with a 1-column half block for an
+            // odd remainder, so "]" always sits at the same position.
+            size_t bar_cols = std::min<size_t>(term_w - 46, 36);
+            if (bar_cols < 8) bar_cols = 8;
+            size_t filled_cols = static_cast<size_t>(bar_cols * progress / 100.0);
+            if (filled_cols > bar_cols) filled_cols = bar_cols;
+            size_t emoji_count = filled_cols / 2;   // 😎 = 2 columns each
+            size_t half_col = filled_cols % 2;      // 1 leftover column
+            size_t empty_cols = bar_cols - filled_cols;
 
             torrents_body += "[";
-            for (size_t i = 0; i < bar_w; ++i) {
-                if (i < filled) {
-                    auto c = Gradient{{RGB{220,50,50}, RGB{220,180,30}, RGB{50,200,50}}}
-                        .at(bar_w > 1 ? static_cast<double>(i) / (bar_w - 1) : 1.0);
-                    torrents_body += c.to_ansi_foreground() + "😎" + std::string(style::reset);
-                } else {
-                    torrents_body += Text{" "}.color(style::bright_black).str();
-                }
+            for (size_t i = 0; i < emoji_count; ++i) {
+                auto c = Gradient{{RGB{220,50,50}, RGB{220,180,30}, RGB{50,200,50}}}
+                    .at(bar_cols > 1 ? static_cast<double>(i * 2) / (bar_cols - 1) : 1.0);
+                torrents_body += c.to_ansi_foreground() + "😎" + std::string(style::reset);
+            }
+            if (half_col) {
+                auto c = Gradient{{RGB{220,50,50}, RGB{220,180,30}, RGB{50,200,50}}}
+                    .at(bar_cols > 1 ? static_cast<double>(filled_cols - 1) / (bar_cols - 1) : 1.0);
+                torrents_body += c.to_ansi_foreground() + "▌" + std::string(style::reset);
+            }
+            for (size_t i = 0; i < empty_cols; ++i) {
+                torrents_body += Text{" "}.color(style::bright_black).str();
             }
             torrents_body += "]";
 
@@ -622,8 +634,14 @@ int main(int argc, char* argv[]) {
             torrents_body += Text{std::format("↑ {}/s", fmt_bytes(static_cast<uint64_t>(sp.up_speed)))}.color(style::magenta).str() + "  ";
             torrents_body += std::format("DL: {}  UL: {}", fmt_bytes(downloaded), fmt_bytes(uploaded));
             if (!state->is_download_complete()) {
-                size_t needed = state->needed_pieces();
-                torrents_body += std::format("  Remaining: {} pieces", needed);
+                if (total == 0) {
+                    // Metadata-download mode (magnet link): pieces are not
+                    // known until a peer supplies the torrent metadata.
+                    torrents_body += std::format("  Awaiting metadata ({} peers connected)", peers);
+                } else {
+                    size_t needed = state->needed_pieces();
+                    torrents_body += std::format("  Remaining: {} pieces", needed);
+                }
             }
             torrents_body += "\n\n";
             ++tor_idx;

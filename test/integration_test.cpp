@@ -118,19 +118,23 @@ protected:
                       std::chrono::seconds timeout = 60s)
             : io_(io), strand_(asio::make_strand(io)), session_(session), 
                 timeout_timer_(strand_),
+                run_finished_promise_(), run_finished_future_(run_finished_promise_.get_future()),
                 stop_promise_(), stop_future_(stop_promise_.get_future()) 
         {
             // Set completion callback
             session_->set_on_complete(asio::bind_executor(strand_, [this] { 
                 set_done(); 
             }));
-            // Start session in background
+            // Start session in background. The completion handler captures raw
+            // `this`; the destructor waits on run_finished_future_ so this
+            // handler is guaranteed to have run before the object dies.
             asio::co_spawn(io, session_->run(), asio::bind_executor(strand_, [this](std::exception_ptr e) {
                 if (e) {
                     set_error(e);
                 } else if (!done_.load()) {
                     set_done();
                 }
+                run_finished_promise_.set_value();
             }));
             // Set timeout
             timeout_timer_.expires_after(timeout);
@@ -160,6 +164,12 @@ protected:
                     ADD_FAILURE() << "Session stop failed with exception: " << e.what();
                 }
             }
+            // The run() completion handler captures raw `this`; wait for it to
+            // actually execute before returning, or it will touch a dead stack
+            // frame (ASan: stack-use-after-return) once run() unwinds.
+            if (run_finished_future_.wait_for(5s) == std::future_status::timeout) {
+                ADD_FAILURE() << "Session run() completion handler did not fire within 5s.";
+            }
         }
 
         // Wait for completion or error
@@ -187,6 +197,8 @@ protected:
         asio::steady_timer timeout_timer_;
         std::promise<void> download_promise_;
         std::future<void> download_future_ = download_promise_.get_future();
+        std::promise<void> run_finished_promise_; // set by the run() completion handler
+        std::future<void> run_finished_future_; // waited on by the destructor
         std::promise<void> stop_promise_; // for session stop
         std::future<void> stop_future_; // for session stop
         std::atomic<bool> done_{false};
@@ -1034,9 +1046,10 @@ TEST(BanUnitTest, PeerBanning) {
     pm->report_timeout("13.14.15.16:6881");
     EXPECT_TRUE(pm->is_banned("13.14.15.16"));
 
-    // Test connection failure threshold
+    // Test connection failure threshold (raised to 10: transient NAT/handshake
+    // failures are common in public swarms and must not trigger a 1h ban).
     EXPECT_FALSE(pm->is_banned("17.18.19.20"));
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < 9; ++i) {
         pm->report_connection_failure("17.18.19.20:6881");
         EXPECT_FALSE(pm->is_banned("17.18.19.20"));
     }
