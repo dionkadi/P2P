@@ -530,7 +530,7 @@ asio::awaitable<void> PieceManager::resume_piece_download(size_t piece_index) {
         // second; the rejection window is 60s (kRejectedBlockTTL), so a 10s
         // idle poll costs nothing in recovery latency. (The first pass runs
         // immediately — the wait is only for idle retries.)
-        timer.expires_after(std::chrono::seconds(10));
+        timer.expires_after(std::chrono::seconds(2));
         try {
             co_await timer.async_wait(asio::use_awaitable);
         } catch (const boost::system::system_error& e) {

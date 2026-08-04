@@ -712,7 +712,7 @@ struct InProgressPiece {
     // full minute while the swarm re-fills around it, so the effective serving
     // set shrinks and throughput decays. 15s still suppresses the hot loop but
     // lets momentarily-busy peers back in quickly.
-    static constexpr std::chrono::seconds kRejectedBlockTTL{15s};
+    static constexpr std::chrono::seconds kRejectedBlockTTL{5s};
     std::vector<std::vector<std::pair<PeerId, TimePoint>>> rejected_by;
 
     InProgressPiece(uint64_t piece_size): data(piece_size) {

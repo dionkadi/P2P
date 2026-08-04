@@ -1095,6 +1095,17 @@ asio::awaitable<void> TorrentSession::on_piece_block(std::shared_ptr<PeerConnect
     // it so it can refill immediately rather than waiting for piece completion.
     piece_manager_->notify_one();
 
+    // Refill THIS piece's pipeline on every delivery. resume_piece_download is
+    // single-pass (it co_returns after placing requests) and is otherwise only
+    // re-triggered by failures (REJECT/choke/timeout/10s idle poll), so without
+    // this a piece drains its seeded blocks and then idles at 0.3 blocks/s/peer
+    // until a failure event rescues it. Each delivery runs a resume pass: for
+    // fully-placed pieces it's a cheap no-op (missing_indices empty); for
+    // pieces with gaps (rejected/choked-out blocks) it retries placement at
+    // delivery rate instead of waiting out a 4s timeout / 15s reject window.
+    // The resume_task_active guard prevents pile-up.
+    piece_manager_->ensure_resume_piece_download(piece_index);
+
     if (piece_complete) {
         auto expected_hash = std::vector<std::byte>(state_->torrent_info().pieces.begin() + piece_index * 20, state_->torrent_info().pieces.begin() + (piece_index * 20 + 20));
         // Lock just for reading progress->data during hash calculation (co_await-free)
