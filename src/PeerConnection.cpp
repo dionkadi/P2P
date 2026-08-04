@@ -205,7 +205,7 @@ asio::awaitable<void> PeerConnection::message_loop() {
 
             switch (type) {
                 case MessageType::Choke:
-                    // LOGDBG("Peer {} sent CHOKE. Setting peer_is_choking to true.", peer_id_);
+                    LOGDBG("Peer {} sent CHOKE. Setting peer_is_choking to true.", peer_id_);
                     peer_is_choking_.store(true, std::memory_order_relaxed);
                     co_await events_->on_choke_status_changed(self, true);
                     // Free the pipeline accounting, not just the unsent queue.
@@ -231,7 +231,7 @@ asio::awaitable<void> PeerConnection::message_loop() {
                     }
                     break;
                 case MessageType::Unchoke: {
-                    // LOGDBG("Peer {} sent UNCHOKE. Setting peer_is_choking to false.", peer_id_);
+                    LOGDBG("Peer {} sent UNCHOKE. Setting peer_is_choking to false.", peer_id_);
                     peer_is_choking_.store(false, std::memory_order_relaxed);
                     {
                         std::lock_guard lock(pipeline_mutex_);
@@ -241,14 +241,14 @@ asio::awaitable<void> PeerConnection::message_loop() {
                     break;
                 }
                 case MessageType::Interested:
-                    // LOGDBG("Peer {} sent INTERESTED. Setting peer_is_interested to true.", peer_id_);
+                    LOGDBG("Peer {} sent INTERESTED. Setting peer_is_interested to true.", peer_id_);
                     peer_is_interested_.store(true, std::memory_order_relaxed);
                     if (interest_change_hook_) {
                         interest_change_hook_();
                     }
                     break;
-                case MessageType::NotInterested:  
-                    // LOGDBG("Peer {} sent NOT INTERESTED. Setting peer_is_interested to false.", peer_id_);
+                case MessageType::NotInterested:
+                    LOGDBG("Peer {} sent NOT INTERESTED. Setting peer_is_interested to false.", peer_id_);
                     peer_is_interested_.store(false, std::memory_order_relaxed);
                     if (interest_change_hook_) {
                         interest_change_hook_();
