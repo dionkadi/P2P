@@ -4,9 +4,11 @@
 #include <atomic>
 #include <cassert>
 #include <chrono>
+#include <clocale>
 #include <cmath>
 #include <concepts>
 #include <cstddef>
+#include <wchar.h>
 #include <format>
 #include <functional>
 #include <iostream>
@@ -349,25 +351,15 @@ inline int get_character_display_width(uint32_t codepoint) noexcept {
         return (codepoint >= 0x20 && codepoint != 0x7F) ? 1 : 0;
     }
 
-    // 0-width (Control characters and Zero-Width spaces)
-    static constexpr auto zero_width = std::to_array<std::pair<uint32_t, uint32_t>>({
-        {0x0000, 0x001F}, {0x007F, 0x009F}, {0x0300, 0x036F}, // Combining Diacritical Marks
-        {0x200B, 0x200F}, {0x2028, 0x202E}, {0xFEFF, 0xFEFF}
-    });
-
-    // 2-width (East Asian Wide, Emojis, etc.)
-    static constexpr auto double_width = std::to_array<std::pair<uint32_t, uint32_t>>({
-        {0x1100, 0x11FF}, {0x2329, 0x232A}, {0x2E80, 0x303E},
-        {0x3040, 0xA4CF}, {0xAC00, 0xD7A3}, {0xF900, 0xFAFF},
-        {0xFE10, 0xFE19}, {0xFE30, 0xFE6F}, {0xFF00, 0xFF60},
-        {0xFFE0, 0xFFE6}, {0x1F300, 0x1F6FF}, {0x1F900, 0x1F9FF},
-        {0x20000, 0x2FFFD}, {0x30000, 0x3FFFD}
-    });
-
-    if (is_in_ranges(codepoint, zero_width)) return 0;
-    if (is_in_ranges(codepoint, double_width)) return 2;
-    
-    return 1; // Default to 1 for basic ASCII and unlisted printable chars
+    // Delegate to the system wcwidth(), which is what the terminal emulator
+    // itself uses to lay out columns under the user's locale. A hardcoded
+    // East-Asian/emoji table cannot match every terminal (e.g. U+2B07 ⬇ is
+    // width 1 under en_US.UTF-8 but width 2 under a CJK locale), so trusting
+    // wcwidth keeps the TUI borders aligned with the actual rendering. The
+    // process must call setlocale(LC_ALL, "") (done in main) for wcwidth to
+    // see the environment locale instead of the default "C".
+    int w = ::wcwidth(static_cast<wchar_t>(codepoint));
+    return w < 0 ? 0 : w;
 }
 
 // Helper to count the total display width of a string, handling ANSI escape codes and multi-cell UTF-8 characters
@@ -1163,13 +1155,15 @@ public:
             
             size_t filler_width = available_content_space - line_visible_len;
 
-            // Note: filler_width already covers padding_.right (available_content_space
-            // subtracted both paddings), so no separate right-padding append here —
-            // double-appending made every line one column too wide (term_w + 1),
-            // wrapping at the terminal and desyncing LiveDisplay's row accounting.
+            // filler_width spans only available_content_space, which is
+            // panel_width minus BOTH paddings and both borders. The right
+            // padding must be emitted explicitly, otherwise every content row
+            // is one column narrower than the border rows (term_w - 1 vs
+            // term_w) and its right border │ sits one column inside the box.
             result_ss << std::string(padding_.left, ' ')
                    << display_line
-                   << std::string(filler_width, ' ');
+                   << std::string(filler_width, ' ')
+                   << std::string(padding_.right, ' ');
             
             apply_border_color(result_ss);
             result_ss << to_string_view(border_style_[1]); // │

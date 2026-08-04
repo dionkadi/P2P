@@ -32,7 +32,13 @@ std::map<std::string, std::string> PieceManager::get_in_progress_for_resume() co
 asio::awaitable<void> PieceManager::downloader() {
     CTRACK_ASYNC("PieceManager::downloader");
     auto self = shared_from_this();
-    const int max_in_progress_pieces = 5;
+    // Aggregate in-flight window must span the connected swarm, not a fixed
+    // handful of pieces. 5 pieces (~1.28 MiB at 256 KiB pieces) serialized
+    // downloads on slow tail blocks: with only 5 pieces in flight a single
+    // snubbing peer stalls the whole pipe for BLOCK_REQUEST_TIMEOUT (12s),
+    // producing the observed sawtooth (~200 KB/s ceiling despite 50+ peers).
+    // 32 pieces keeps a healthy multi-MiB window; qBittorrent holds 30-60.
+    size_t max_in_progress_pieces = std::clamp<size_t>(state_->needed_pieces(), 5, 32);
 
     // Start the periodic block timeout checker
     asio::co_spawn(io_context_, self->block_timeout_loop(), asio::detached);
@@ -146,9 +152,18 @@ asio::awaitable<bool> PieceManager::try_piece_download(size_t piece_index) {
     emplace_in_progress_pieces(piece_index, std::make_shared<InProgressPiece>(piece_size));
     auto piece_progress = in_progress_piece(piece_index);
     uint32_t num_blocks = piece_progress->total_blocks;
-    
-    // Request all blocks for this piece
-    for (uint32_t block_idx = 0; block_idx < num_blocks; ++block_idx) {
+
+    // Seed a small bounded window at piece start instead of committing every
+    // block to the peers unchoked THIS instant. A fast-extension peer that is
+    // momentarily choking us REJECTs the whole committed batch at once (seen:
+    // all 16 blocks of a piece rejected in one timestamp), and the synchronous
+    // re-flood on each REJECT cascades it across peers. Requesting only a few
+    // blocks per peer lets the resume loop (one peer per missing block, runs
+    // on the strand, prunes rejected peers) fill the rest as pipeline slots
+    // free up — a momentary choke then costs a handful of blocks, not a piece.
+    size_t seed_per_peer = 2;
+    size_t seed_count = std::min<size_t>(num_blocks, available_peers.size() * seed_per_peer);
+    for (uint32_t block_idx = 0; block_idx < seed_count; ++block_idx) {
         uint32_t offset = block_idx * BLOCK_SIZE;
         uint32_t length = (block_idx == num_blocks - 1) 
             ? (piece_progress->data.size() - offset)
@@ -161,6 +176,11 @@ asio::awaitable<bool> PieceManager::try_piece_download(size_t piece_index) {
             }, 
             asio::detached
         );
+    }
+
+    // The resume loop now drives the rest of this piece's blocks incrementally.
+    if (seed_count < num_blocks) {
+        ensure_resume_piece_download(piece_index);
     }
     
     asio::co_spawn(io_context_, self->check_and_enter_endgame(), asio::detached);
@@ -433,7 +453,6 @@ asio::awaitable<void> PieceManager::resume_piece_download(size_t piece_index) {
                         if (std::find(outstanding.begin(), outstanding.end(), replacement->peer_id()) == outstanding.end()) {
                             outstanding.push_back(replacement->peer_id());
                         }
-                        piece_progress->request_times[block_idx] = std::chrono::steady_clock::now();
                     }
                 }
                 asio::co_spawn(io_context_,
@@ -622,7 +641,6 @@ asio::awaitable<void> PieceManager::check_block_timeouts() {
                         if (std::find(outstanding.begin(), outstanding.end(), replacement->peer_id()) == outstanding.end()) {
                             outstanding.push_back(replacement->peer_id());
                         }
-                        piece_progress->request_times[block_idx] = std::chrono::steady_clock::now();
                     }
                 }
                 asio::co_spawn(io_context_,

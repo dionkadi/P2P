@@ -113,6 +113,11 @@ public:
     size_t max_connections_per_ip() const noexcept { return max_connections_per_ip_; }
     size_t max_half_open_connections() const noexcept { return max_half_open_connections_; }
     size_t half_open_connections() const noexcept { return half_open_connections_.load(); }
+    void release_half_open() noexcept {
+        if (half_open_connections_.load() > 0) {
+            --half_open_connections_;
+        }
+    }
 
     void set_max_total_connections(size_t n) noexcept { max_total_connections_ = n; }
     void set_max_connections_per_ip(size_t n) noexcept { max_connections_per_ip_ = n; }
@@ -219,9 +224,14 @@ private:
     mutable std::mutex discovered_mutex_;
     mutable std::mutex dropped_mutex_;
 
-    // Connection limit fields
-    size_t max_total_connections_{200};
-    size_t max_connections_per_ip_{2};
+    // Connection limit fields. The download ceiling is the peer UNCHOKE set:
+    // seeders only grant upload slots via tit-for-tat + one rotating optimistic
+    // slot, so a 0-upload leecher is served by only a handful of peers no matter
+    // how many are connected. More connections = more optimistic-slot lottery
+    // tickets; 500 mirrors qBittorrent's default (200 starved the swarm).
+    size_t max_total_connections_{500};
+    // 2 per IP silently excluded legitimate seedboxes/CDNs on shared IPs.
+    size_t max_connections_per_ip_{4};
     // Concurrent in-flight connects. Cold-start swarms return hundreds of
     // peers, most of them dead; each dead connect holds a slot for the full
     // 15s timeout, so 40 slots cycle ~2.7 connects/s and a live peer buried

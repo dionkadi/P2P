@@ -16,8 +16,8 @@ struct ClientConfig {
     // so capping upload directly throttles the number of peers willing to send us data.
     uint64_t upload_rate_limit = 0;
     uint64_t download_rate_limit = 0;
-    uint32_t max_connections = 200;
-    uint32_t max_connections_per_ip = 2;
+    uint32_t max_connections = 500;
+    uint32_t max_connections_per_ip = 4;
     uint32_t max_half_open = 100;
     uint32_t block_request_timeout_seconds = 30;
     uint32_t peer_ban_corrupt_threshold = 3;

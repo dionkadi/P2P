@@ -14,6 +14,7 @@
 #include <boost/url.hpp>
 
 #include <atomic>
+#include <clocale>
 #include <csignal>
 #include <cstddef>
 #include <cstdlib>
@@ -276,6 +277,12 @@ static std::vector<std::string> fetch_tracker_list(const std::string& url_str) {
 int main(int argc, char* argv[]) {
     using namespace progressbar;
 
+    // wcwidth() must see the user's locale (not the default "C") so the TUI's
+    // character-width computation matches how the terminal lays out columns.
+    // Without this, wide glyphs like CJK would be miscounted and the panel
+    // borders would misalign under any non-C locale.
+    std::setlocale(LC_ALL, "");
+
     bool save_config = false;
     std::string cli_config_path;
     for (int i = 1; i < argc; ++i) {
@@ -298,11 +305,11 @@ int main(int argc, char* argv[]) {
     cmd_run.add_argument("torrent").help("Path to .torrent file").default_value(std::string{});
     cmd_run.add_argument("dest").help("Content / destination directory").default_value(std::string{});
     cmd_run.add_argument("--port").help("Peer listening port").scan<'d', int>().default_value(6881);
-    cmd_run.add_argument("--upload-rate").help("Upload rate limit (bytes/s)").scan<'u', uint64_t>().default_value(uint64_t{512 * 1024});
-    cmd_run.add_argument("--download-rate").help("Download rate limit (bytes/s)").scan<'u', uint64_t>().default_value(uint64_t{2 * 1024 * 1024});
-    cmd_run.add_argument("--max-connections").help("Max peer connections").scan<'u', uint32_t>().default_value(uint32_t{200});
-    cmd_run.add_argument("--max-connections-per-ip").help("Max connections per IP").scan<'u', uint32_t>().default_value(uint32_t{2});
-    cmd_run.add_argument("--max-half-open").help("Max half-open connections").scan<'u', uint32_t>().default_value(uint32_t{40});
+    cmd_run.add_argument("--upload-rate").help("Upload rate limit (bytes/s)").scan<'u', uint64_t>().default_value(uint64_t{0});
+    cmd_run.add_argument("--download-rate").help("Download rate limit (bytes/s), 0 = unlimited").scan<'u', uint64_t>().default_value(uint64_t{0});
+    cmd_run.add_argument("--max-connections").help("Max peer connections").scan<'u', uint32_t>().default_value(uint32_t{500});
+    cmd_run.add_argument("--max-connections-per-ip").help("Max connections per IP").scan<'u', uint32_t>().default_value(uint32_t{4});
+    cmd_run.add_argument("--max-half-open").help("Max half-open connections").scan<'u', uint32_t>().default_value(uint32_t{100});
     cmd_run.add_argument("--block-timeout").help("Block request timeout (seconds)").scan<'u', uint32_t>().default_value(uint32_t{30});
     cmd_run.add_argument("--download-dir").help("Default download directory").default_value(std::string{"./downloads"});
     cmd_run.add_argument("--no-dht").help("Disable DHT").flag();

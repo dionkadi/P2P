@@ -6,7 +6,7 @@ P2P is a C++23 BitTorrent client (`build/client`) + tracker server (`build/track
 
 - `cmake -B build && cmake --build build`
 - CMake 4.0 required; Debug by default with `-Wall -Wextra -Werror` + AddressSanitizer; warnings are errors.
-- System deps: Boost (`url`, headers/asio), OpenSSL, spdlog, GTest. Vendored: `include/{argparse.hpp,ctrack.hpp,progress_bar.hpp}`.
+- System deps: Boost (`url`, headers/asio), OpenSSL, spdlog, GTest, TBB, Threads. Vendored: `include/{argparse.hpp,ctrack.hpp,progress_bar.hpp}`.
 - Presets: `cmake --preset debug && cmake --build --preset debug-build` (binaries `build/debug/`, test at `build/debug/p2p_test`).
 - Library target `p2p_common`; `client`, `tracker`, `p2p_test` link it (test also links GTest).
 - No CI workflow exists — build and test locally.
@@ -14,8 +14,8 @@ P2P is a C++23 BitTorrent client (`build/client`) + tracker server (`build/track
 ## Profiling
 
 - App is instrumented via CTRACK (`include/ctrack.hpp`): `CTRACK` (sync RAII) on hot paths, `CTRACK_ASYNC` on coroutines.
-- Report prints to stdout at exit for both `client` and `tracker`.
-- Disable with `-DCTRACK_DISABLE`.
+- Client profiling is opt-in: only `client run --profile` enables it and prints the report at exit; without the flag it's a runtime no-op (`ctrack::set_profiling_enabled(false)` in `main_client.cpp`). Tracker always prints at exit.
+- Compile-time disable with `-DCTRACK_DISABLE`.
 
 ## Verify
 
@@ -33,7 +33,7 @@ P2P is a C++23 BitTorrent client (`build/client`) + tracker server (`build/track
 - Client subcommands: only `create` and `run`.
 - `client run <torrent> [dest]` accepts a `.torrent` path. Magnets go through interactive `m <magnet> [dest]` or saved-state restore, not the positional arg.
 - Interactive TUI on by default; `h` shows: `a` (add .torrent), `m` (add magnet), `d` (download dir), `t` (add tracker), `f` (fetch trackers), `s`/`p`/`r` (stop/resume/remove by index), `q` (quit). `--non-interactive` disables it.
-- `--config` and `--save-config` are pre-scanned manually (~`main_client.cpp:159-166`) before argparse — argparse never registers them.
+- `--config` and `--save-config` are pre-scanned manually (~`main_client.cpp:283-287`) before argparse — argparse never registers them.
 - Without a positional torrent, client reloads `~/.config/p2p/client_state.bencode`.
 - Config lookup: `./p2p.conf` first, then `~/.config/p2p/p2p.conf`.
 - Tracker: `--port` sets HTTP+UDP to the same value; `--http-port`/`--udp-port` splits them.

@@ -126,18 +126,32 @@ asio::awaitable<bool> PeerConnection::perform_handshake(const PeerId& my_id) {
             LOGDBG("Extended handshake sent to {}", peer_id_);
         }
 
-        // Send have-none, have-all, or bitfield based on our state
+        // Send have-none, have-all, or bitfield based on our state.
+        // BEP-6: HaveNone/HaveAll are only legal when the peer advertised
+        // fast-extension support; otherwise a strict peer will drop us. Peers
+        // without fast extension always get a real bitfield (BEP-3), which is
+        // omitted entirely when we hold no pieces (also legal per BEP-3).
         {
             size_t completed = state_->completed_pieces();
             size_t total = state_->num_pieces();
-            if (total == 0) {
-                // Metadata not yet available; send have-none
-                co_await send_simple_message(MessageType::HaveNone);
-            } else if (completed == 0) {
-                co_await send_simple_message(MessageType::HaveNone);
-            } else if (completed == total) {
-                co_await send_simple_message(MessageType::HaveAll);
-            } else {
+
+            bool should_send_bitfield = false;
+            bool send_have_none_or_all = fast_extension_supported_;
+
+            if (send_have_none_or_all) {
+                if (total == 0 || completed == 0) {
+                    // Metadata not yet available or no pieces; send have-none
+                    co_await send_simple_message(MessageType::HaveNone);
+                } else if (completed == total) {
+                    co_await send_simple_message(MessageType::HaveAll);
+                } else {
+                    should_send_bitfield = true;
+                }
+            } else if (total > 0) {
+                should_send_bitfield = true;
+            }
+
+            if (should_send_bitfield) {
                 std::vector<uint8_t> bitfield((total + 7) / 8, 0);
                 std::string have_bitfield_str = state_->get_have_bitfield_str();
                 std::ranges::copy(have_bitfield_str, bitfield.begin());
@@ -194,11 +208,27 @@ asio::awaitable<void> PeerConnection::message_loop() {
                     // LOGDBG("Peer {} sent CHOKE. Setting peer_is_choking to true.", peer_id_);
                     peer_is_choking_.store(true, std::memory_order_relaxed);
                     co_await events_->on_choke_status_changed(self, true);
-                    // Drop unsent queued requests: they will be re-requested
-                    // from other peers via the piece resume path. Keeping them
-                    // here would re-flood this (now refusing) peer on the next
-                    // Unchoke.
-                    drop_pending_requests();
+                    // Free the pipeline accounting, not just the unsent queue.
+                    // Requests that were on the wire when the peer choked will
+                    // never be fulfilled, and non-BEP-6 peers never send REJECT
+                    // to free their slots — so outstanding_request_count_ and
+                    // total_bytes_requested_ would stay pinned at the cap and
+                    // every future send_request/flush_pending_requests would
+                    // stall (the pipeline gate never clears). Blocks assigned
+                    // to this peer would sit queued-and-unsent forever: with
+                    // request_times only armed on an actual write, the timeout
+                    // checker skips them, pieces stall, and the whole window
+                    // deadlocks into 0 B/s. The piece resume path (invoked via
+                    // on_choke_status_changed above) re-requests those blocks
+                    // elsewhere. Late-arriving blocks are harmless: the
+                    // completion path clamps against total_bytes_requested_.
+                    {
+                        std::lock_guard lock(pipeline_mutex_);
+                        pending_requests_.clear();
+                        outstanding_request_count_ = 0;
+                        total_bytes_requested_ = 0;
+                        total_bytes_received_ = 0;
+                    }
                     break;
                 case MessageType::Unchoke: {
                     // LOGDBG("Peer {} sent UNCHOKE. Setting peer_is_choking to false.", peer_id_);

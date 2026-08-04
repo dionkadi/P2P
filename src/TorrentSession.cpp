@@ -503,16 +503,19 @@ asio::awaitable<void> TorrentSession::handle_new_connection(AsyncSocket socket, 
         conn = co_await PeerConnection::create(io_context_, std::move(socket), peer_addr, my_peer_id_, state_, shared_from_this());
     } catch (const boost::system::system_error& e) {
         LOGERR("Network error during PeerConnection::create for {}: {}", peer_addr, e.what());
+        peer_manager_->release_half_open();
         peer_manager_->report_connection_failure(peer_addr);
         co_return;
     } catch (const std::exception& e) {
         LOGERR("General exception during PeerConnection::create for {}: {}", peer_addr, e.what());
+        peer_manager_->release_half_open();
         peer_manager_->report_connection_failure(peer_addr);
         co_return;
     }
     if (!conn) {
         // This catches cases where PeerConnection::create explicitly returns nullptr (e.g., self-connection, info hash mismatch)
         LOGERR("PeerConnection::create returned nullptr for {}. Handshake likely failed or was dropped.", peer_addr);
+        peer_manager_->release_half_open();
         peer_manager_->report_connection_failure(peer_addr);
         co_return;
     }
@@ -541,6 +544,7 @@ asio::awaitable<void> TorrentSession::handle_new_connection(AsyncSocket socket, 
     if (peer_manager_->contains_peer(conn->peer_id())) {
         if (my_peer_id_ < conn->peer_id()) {
             LOGWARN("Duplicate connection to {}. Dropping this one.", conn->peer_id());
+            peer_manager_->release_half_open();
             co_return;
         } else {
             LOGWARN("Duplicate connection to {}. Closing the other one.", conn->peer_id());
@@ -1082,6 +1086,10 @@ asio::awaitable<void> TorrentSession::on_piece_block(std::shared_ptr<PeerConnect
     state_->add_total_bytes_downloaded(block_data.size());
     conn->add_bytes_downloaded(block_data.size());
 
+    // A block landed and possibly freed a slot in the downloader window; wake
+    // it so it can refill immediately rather than waiting for piece completion.
+    piece_manager_->notify_one();
+
     if (piece_complete) {
         auto expected_hash = std::vector<std::byte>(state_->torrent_info().pieces.begin() + piece_index * 20, state_->torrent_info().pieces.begin() + (piece_index * 20 + 20));
         // Lock just for reading progress->data during hash calculation (co_await-free)
@@ -1207,14 +1215,13 @@ asio::awaitable<void> TorrentSession::on_piece_rejected(std::shared_ptr<PeerConn
     co_await asio::dispatch(piece_manager_->strand(), asio::use_awaitable);
     piece_manager_->record_block_rejection(piece_index, block_index, conn->peer_id());
 
-    // Random replacement peer that hasn't rejected this block and isn't
-    // already serving it.
-    auto replacement = co_await piece_manager_->pick_block_peer(piece_index, block_index, &conn->peer_id(), true);
-    if (replacement) {
-        co_await replacement->send_request(piece_index, begin, length);
-    } else {
-        piece_manager_->ensure_resume_piece_download(piece_index);
-    }
+    // Defer the replacement to the resume loop instead of re-sending here:
+    // on a choke-wave, one peer REJECTs many blocks at once and the old
+    // inline pick+send fired a detached re-request per block into the same
+    // still-congested set — re-flooding peers that had just choked. The
+    // resume loop selects one peer per missing block, prunes rejected peers,
+    // runs on the strand, and paces through the pipeline gate.
+    piece_manager_->ensure_resume_piece_download(piece_index);
 
     piece_manager_->notify_one();
 }
