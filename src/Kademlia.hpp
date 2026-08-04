@@ -875,7 +875,14 @@ inline asio::awaitable<std::vector<EndPoint>> DHTNode::get_peers(InfoHash info_h
         std::vector<EndPoint> current_peers;
         std::vector<BucketEntry> current_nodes;
 
-        auto get_peers_coro = [this, info_hash, &query_result_mutex, &current_peers, &current_nodes] (const BucketEntry& node) -> asio::awaitable<void> {
+        // Take `node` by VALUE: the caller passes a local copy
+        // (`auto node = nodes_to_query.front()`), and with asio::deferred the
+        // coroutine starts only when the parallel group is awaited — after the
+        // loop has destroyed that local. A `const BucketEntry&` parameter
+        // would dangle and read a garbage endpoint (observed: every get_peers
+        // query sent to "::" and timing out → 0 peers from DHT forever, while
+        // find_nodes — whose reference outlives the wait — worked fine).
+        auto get_peers_coro = [this, info_hash, &query_result_mutex, &current_peers, &current_nodes] (BucketEntry node) -> asio::awaitable<void> {
             if (shuting_down_) {
                 co_return;
             }
