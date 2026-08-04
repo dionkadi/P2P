@@ -108,18 +108,54 @@ static std::vector<std::string> http_get_trackers(Stream& stream, const std::str
     return trackers;
 }
 
-// Returns the HTTP proxy (host, port) to use for `host`.
+// Returns the HTTP proxy (host, port) to use for `host`, honoring
+// no_proxy/NO_PROXY (exact host or dot-suffix match) and the scheme-specific
+// http(s)_proxy / HTTP(S)_PROXY, falling back to all_proxy/ALL_PROXY.
+// Only plain http:// proxies are supported — SOCKS entries are ignored.
 //
-// Always returns nullopt: we connect directly, matching qBittorrent's
-// "Proxy: None" default. System proxy env vars (http_proxy / all_proxy) are
-// set by tools like Clash Verge and would otherwise hijack the tracker-list
-// fetch, while DHT (UDP) cannot be carried by an HTTP proxy at all — leaving
-// tracker traffic proxied and DHT unproxied breaks swarm discovery. Users who
-// genuinely need a relay can restore env-var proxying here.
+// This is used ONLY for the tracker-list fetch (`f` command, ngosang.github.io):
+// that host is RST'd on some networks (incl. this one) and requires the local
+// proxy. Tracker ANNOUNCES, peer connections, and DHT stay direct — they are
+// deliberately not proxied (see announce_proxy_for in TrackerClient.hpp).
 static std::optional<std::pair<std::string, std::string>> get_http_proxy(
     const std::string& scheme, const std::string& host) {
-    (void)scheme; (void)host;
-    return std::nullopt;
+    const char* no_proxy_env = std::getenv("NO_PROXY");
+    if (!no_proxy_env) no_proxy_env = std::getenv("no_proxy");
+    if (no_proxy_env) {
+        std::istringstream ss(no_proxy_env);
+        std::string entry;
+        while (std::getline(ss, entry, ',')) {
+            entry = trim(entry);
+            if (entry.empty()) continue;
+            std::string suffix = entry;
+            if (!suffix.empty() && suffix.front() == '*') suffix.erase(0, 1);
+            if (!suffix.empty() && suffix.front() == '.') suffix.erase(0, 1);
+            if (host == suffix ||
+                (host.size() > suffix.size() && host.ends_with("." + suffix))) {
+                return std::nullopt;
+            }
+        }
+    }
+
+    const char* proxy = std::getenv((scheme + "_proxy").c_str());
+    if (!proxy) proxy = std::getenv((scheme + "_PROXY").c_str());
+    if (!proxy) proxy = std::getenv("all_proxy");
+    if (!proxy) proxy = std::getenv("ALL_PROXY");
+    if (!proxy) return std::nullopt;
+
+    std::string proxy_str(proxy);
+    if (proxy_str.rfind("socks", 0) == 0 || proxy_str.rfind("SOCKS", 0) == 0) {
+        return std::nullopt;  // SOCKS proxying not implemented
+    }
+    try {
+        boost::urls::url u(proxy_str);
+        if (u.scheme() != "http") {
+            return std::nullopt;
+        }
+        return std::make_pair(u.host(), u.has_port() ? std::string(u.port()) : "80");
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
 }
 
 static std::vector<std::string> fetch_tracker_list(const std::string& url_str) {
