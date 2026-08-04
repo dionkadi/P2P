@@ -183,56 +183,18 @@ std::string url_encode(const Cont& value) {
     return escaped.str();
 }
 
-// Returns the HTTP proxy (host, port) to use for `host`, honoring
-// no_proxy/NO_PROXY (exact host or dot-suffix match) and the scheme-specific
-// http(s)_proxy / HTTP(S)_PROXY, falling back to all_proxy/ALL_PROXY.
-// Only plain http:// proxies are supported — SOCKS entries are ignored.
-// Mirrors main_client.cpp::get_http_proxy: tracker endpoints are sometimes
-// only reachable through the local proxy (redirect origin IPs RST'd/dropped
-// on some networks while the proxy succeeds), so announces must route
-// through it the same way curl does.
+// Returns the HTTP proxy (host, port) to use for `host`.
+//
+// Always returns nullopt: we connect directly, matching qBittorrent's
+// "Proxy: None" default. System proxy env vars (http_proxy / all_proxy) are
+// set by tools like Clash Verge and would hijack tracker announces while
+// DHT (UDP) cannot be carried by an HTTP proxy — proxying only the tracker
+// half leaves DHT unproxied and breaks swarm discovery. Users who genuinely
+// need a relay can restore env-var proxying here.
 static std::optional<std::pair<std::string, std::string>> announce_proxy_for(
     const std::string& scheme, const std::string& host) {
-    const char* no_proxy_env = std::getenv("NO_PROXY");
-    if (!no_proxy_env) no_proxy_env = std::getenv("no_proxy");
-    if (no_proxy_env) {
-        std::istringstream ss(no_proxy_env);
-        std::string entry;
-        while (std::getline(ss, entry, ',')) {
-            // trim
-            size_t b = entry.find_first_not_of(" \t\r\n");
-            size_t e = entry.find_last_not_of(" \t\r\n");
-            entry = (b == std::string::npos) ? "" : entry.substr(b, e - b + 1);
-            if (entry.empty()) continue;
-            std::string suffix = entry;
-            if (!suffix.empty() && suffix.front() == '*') suffix.erase(0, 1);
-            if (!suffix.empty() && suffix.front() == '.') suffix.erase(0, 1);
-            if (host == suffix ||
-                (host.size() > suffix.size() && host.ends_with("." + suffix))) {
-                return std::nullopt;
-            }
-        }
-    }
-
-    const char* proxy = std::getenv((scheme + "_proxy").c_str());
-    if (!proxy) proxy = std::getenv((scheme + "_PROXY").c_str());
-    if (!proxy) proxy = std::getenv("all_proxy");
-    if (!proxy) proxy = std::getenv("ALL_PROXY");
-    if (!proxy) return std::nullopt;
-
-    std::string proxy_str(proxy);
-    if (proxy_str.rfind("socks", 0) == 0 || proxy_str.rfind("SOCKS", 0) == 0) {
-        return std::nullopt;  // SOCKS proxying not implemented
-    }
-    try {
-        boost::urls::url u(proxy_str);
-        if (u.scheme() != "http") {
-            return std::nullopt;
-        }
-        return std::make_pair(u.host(), u.has_port() ? std::string(u.port()) : "80");
-    } catch (const std::exception&) {
-        return std::nullopt;
-    }
+    (void)scheme; (void)host;
+    return std::nullopt;
 }
 
 // HTTP proxy CONNECT tunnel: plain TCP to the proxy is already established;
