@@ -232,11 +232,13 @@ private:
     size_t max_total_connections_{500};
     // 2 per IP silently excluded legitimate seedboxes/CDNs on shared IPs.
     size_t max_connections_per_ip_{4};
-    // Concurrent in-flight connects. Cold-start swarms return hundreds of
-    // peers, most of them dead; each dead connect holds a slot for the full
-    // 15s timeout, so 40 slots cycle ~2.7 connects/s and a live peer buried
-    // behind the dead ones takes minutes to reach (qBittorrent uses ~100).
-    size_t max_half_open_connections_{100};
+    // Concurrent in-flight connects. libtorrent 2.x removed the hard half-open
+    // cap (replaced by ~30 connects/sec throttling); a fixed cap of 100
+    // serialized acquisition: with trackers/DHT/PEX returning hundreds of peers
+    // (mostly dead) the pool pinned at 100/100 for 15s each, so the client
+    // could never reach the ~500-live-peer cross-section that gives an unchoke
+    // lottery ticket per seed. Match qBittorrent's no-cap behavior.
+    size_t max_half_open_connections_{500};
     std::atomic<size_t> half_open_connections_{0};
 
     std::shared_ptr<PeerConnection> find_worst_peer_locked();

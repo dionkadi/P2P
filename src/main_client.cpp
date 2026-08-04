@@ -275,7 +275,7 @@ int main(int argc, char* argv[]) {
     cmd_run.add_argument("--download-rate").help("Download rate limit (bytes/s), 0 = unlimited").scan<'u', uint64_t>().default_value(uint64_t{0});
     cmd_run.add_argument("--max-connections").help("Max peer connections").scan<'u', uint32_t>().default_value(uint32_t{500});
     cmd_run.add_argument("--max-connections-per-ip").help("Max connections per IP").scan<'u', uint32_t>().default_value(uint32_t{4});
-    cmd_run.add_argument("--max-half-open").help("Max half-open connections").scan<'u', uint32_t>().default_value(uint32_t{100});
+    cmd_run.add_argument("--max-half-open").help("Max half-open connections").scan<'u', uint32_t>().default_value(uint32_t{500});
     cmd_run.add_argument("--block-timeout").help("Block request timeout (seconds)").scan<'u', uint32_t>().default_value(uint32_t{30});
     cmd_run.add_argument("--download-dir").help("Default download directory").default_value(std::string{"./downloads"});
     cmd_run.add_argument("--no-dht").help("Disable DHT").flag();

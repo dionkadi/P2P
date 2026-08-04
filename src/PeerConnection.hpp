@@ -216,7 +216,12 @@ public:
         return pending_requests_.size();
     }
 
-    static constexpr uint64_t MAX_PIPELINE_BUFFER = 4 * 1024 * 1024;
+    // qBittorrent pipelines up to max_out_request_queue=500 requests per peer
+    // (16 KiB blocks → ~8 MiB in flight per connection), filling every
+    // unchoked peer's pipe simultaneously. 64 requests (~1 MiB) under-utilized
+    // the few peers that did unchoke us, capping per-peer throughput. 500
+    // matches libtorrent's request_queue_size default.
+    static constexpr uint64_t MAX_PIPELINE_BUFFER = 8 * 1024 * 1024;
 
     bool fast_extension_supported() const noexcept { return fast_extension_supported_; }
     void fast_extension_supported(bool val) noexcept { fast_extension_supported_ = val; }
@@ -252,10 +257,10 @@ protected:
 
     // Request pipelining. The old window (5 requests / 256 KiB in flight) kept
     // throughput far below what peers can deliver over LAN/domestic links;
-    // qBittorrent pipelines dozens of blocks per connection. 64 requests of
-    // 16 KiB = ~1 MiB per peer in flight, capped by MAX_PIPELINE_BUFFER.
+    // qBittorrent pipelines dozens of blocks per connection. 500 requests of
+    // 16 KiB = ~8 MiB per peer in flight, capped by MAX_PIPELINE_BUFFER.
     std::deque<RequestPayload> pending_requests_;
-    size_t max_outstanding_requests_ = 64;
+    size_t max_outstanding_requests_ = 500;
     size_t outstanding_request_count_ = 0;
     uint64_t total_bytes_requested_ = 0;
     uint64_t total_bytes_received_ = 0;

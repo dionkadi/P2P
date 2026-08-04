@@ -28,6 +28,12 @@ static constexpr uint32_t IN_PROGRESS_RARITY_GROUP_ID = std::numeric_limits<uint
 // peer latency and burst scheduling.
 static constexpr auto BLOCK_REQUEST_TIMEOUT = std::chrono::seconds(12);
 
+// libtorrent initial_picker_threshold: pick this many pieces RANDOMLY at the
+// start of a download instead of rarest-first, so a fresh leecher quickly
+// gains pieces it can upload — earning regular (non-optimistic) tit-for-tat
+// unchoke slots from seeders instead of only the rotating optimistic slot.
+static constexpr size_t kInitialPickerThreshold = 4;
+
 class PieceManager : public std::enable_shared_from_this<PieceManager> {
 public:
     using GetAvailableCallback = std::function<asio::awaitable<std::vector<std::shared_ptr<PeerConnection>>>(size_t)>;

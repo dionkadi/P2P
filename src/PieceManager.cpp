@@ -78,6 +78,35 @@ asio::awaitable<void> PieceManager::request_one_piece() {
         co_return;
     }
 
+    // libtorrent initial_picker_threshold=4: the first few pieces are picked
+    // RANDOMLY rather than rarest-first, so a fresh leecher quickly gains
+    // tradeable pieces. Rarest-first at 0% picks pieces almost nobody needs,
+    // leaving us nothing to upload in return -> tit-for-tat seeders keep us
+    // choked -> no unchoke slots -> slow ramp. Random early pieces become
+    // instantly tradeable, earning regular (non-optimistic) unchoke slots.
+    size_t started = state_->completed_pieces() + in_progress_pieces()->size();
+    if (started < kInitialPickerThreshold) {
+        std::vector<size_t> random_candidates;
+        std::ranges::copy(
+            std::views::iota(0UL, state_->num_pieces())
+                | std::views::filter([this](size_t i) {
+                    return state_->piece_status(i) == PieceStatus::Needed;
+                }),
+            std::back_inserter(random_candidates)
+        );
+        std::shuffle(
+            random_candidates.begin(), random_candidates.end(),
+            std::mt19937{std::random_device{}()}
+        );
+        for (size_t piece_index : random_candidates) {
+            if (co_await try_piece_download(piece_index)) {
+                co_return;
+            }
+        }
+        // No unchoked peer had any needed piece — fall through to the
+        // rarest-first scan below (it may find a rarer piece a peer has).
+    }
+
     for (const auto& [rarity, piece_set] : snapshot_pieces_by_rarity()) {
         if (rarity == 0) continue;  // We only care about pieces that are actually available (rarity > 0)
 
