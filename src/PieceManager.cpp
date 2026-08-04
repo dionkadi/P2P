@@ -32,13 +32,15 @@ std::map<std::string, std::string> PieceManager::get_in_progress_for_resume() co
 asio::awaitable<void> PieceManager::downloader() {
     CTRACK_ASYNC("PieceManager::downloader");
     auto self = shared_from_this();
-    // Aggregate in-flight window must span the connected swarm, not a fixed
-    // handful of pieces. 5 pieces (~1.28 MiB at 256 KiB pieces) serialized
-    // downloads on slow tail blocks: with only 5 pieces in flight a single
-    // snubbing peer stalls the whole pipe for BLOCK_REQUEST_TIMEOUT (12s),
-    // producing the observed sawtooth (~200 KB/s ceiling despite 50+ peers).
-    // 32 pieces keeps a healthy multi-MiB window; qBittorrent holds 30-60.
-    size_t max_in_progress_pieces = std::clamp<size_t>(state_->needed_pieces(), 5, 32);
+    // Scale the in-flight window to the currently-unchoked peer set. A fixed
+    // 5..32 window commits the whole window when only ~1 peer has unchoked us
+    // (the swarm unchokes us staggered over the next ~12s, too late to absorb
+    // an already-locked window). Observed: 32 pieces x 16 blocks = 512 blocks
+    // flooded onto the single first-unchoked peer -> 446-block timeout burst
+    // exactly 12s later. Measure the window against live unchoked peers so it
+    // stays small at cold-start and grows as peers stagger in (each UNCHOKE
+    // fires notify_one, waking the downloader to refill).
+    size_t max_in_progress_pieces = 1;
 
     // Start the periodic block timeout checker
     asio::co_spawn(io_context_, self->block_timeout_loop(), asio::detached);
@@ -49,6 +51,13 @@ asio::awaitable<void> PieceManager::downloader() {
         co_await asio::dispatch(strand_, asio::use_awaitable);
 
         if (shutting_down_) break;
+
+        // Refit the in-flight window to the live unchoked set each wake. Each
+        // UNCHOKE fires notify_one, so the window grows as the swarm staggers
+        // in instead of having been locked too small (or flooded onto 1 peer).
+        size_t unchoked = get_unchoked_count_ ? get_unchoked_count_() : 1;
+        if (unchoked < 1) unchoked = 1;
+        max_in_progress_pieces = std::clamp<size_t>(unchoked * 2, 1, 32);
 
         size_t current_in_progress = in_progress_pieces()->size();
         if (current_in_progress < max_in_progress_pieces) {
@@ -199,6 +208,22 @@ asio::awaitable<bool> PieceManager::try_piece_download(size_t piece_index) {
             : BLOCK_SIZE;
         
         auto& peer_conn = available_peers[block_idx % available_peers.size()];
+
+        // Eager outstanding registration: the notify hook (record_request_sent)
+        // only fires AFTER the async write completes, so without registering up
+        // front the resume loop (spawned right below for the remaining blocks)
+        // sees every seeded block as "missing" and re-requests ALL 16 - an
+        // immediate double-commit on the same peer. Mirror the resumer's
+        // registration so seeded blocks are treated as in-flight immediately.
+        {
+            std::lock_guard lock(piece_progress->piece_mutex_);
+            if (block_idx < piece_progress->outstanding_requests.size()) {
+                auto& outstanding = piece_progress->outstanding_requests[block_idx];
+                if (std::find(outstanding.begin(), outstanding.end(), peer_conn->peer_id()) == outstanding.end()) {
+                    outstanding.push_back(peer_conn->peer_id());
+                }
+            }
+        }
         asio::co_spawn(io_context_, 
             [peer_conn, piece_index, offset, length]() -> asio::awaitable<void> {
                 co_await peer_conn->send_request(piece_index, offset, length);
@@ -632,21 +657,14 @@ asio::awaitable<void> PieceManager::check_block_timeouts() {
             LOGWARN("Block {}/{} timed out after {}s. Cancelling and re-requesting.",
                     piece_idx, block_idx, BLOCK_REQUEST_TIMEOUT.count());
 
-            // Record the peers that failed us so the re-request goes elsewhere.
-            // (pick_block_peer would otherwise re-target the same peer, since
-            // the timeout callback clears the outstanding-request bookkeeping.)
-            {
-                std::vector<PeerId> timed_out_peers;
-                {
-                    std::lock_guard lock(piece_progress->piece_mutex_);
-                    if (block_idx < piece_progress->outstanding_requests.size()) {
-                        timed_out_peers = piece_progress->outstanding_requests[block_idx];
-                    }
-                }
-                for (const auto& pid : timed_out_peers) {
-                    record_block_rejection(piece_idx, block_idx, pid);
-                }
-            }
+            // Do NOT record_block_rejection here: a timeout is CONGESTION, not
+            // hostility. The peer may simply be momentarily busy (the swarm
+            // staggers its unchokes); blacklisting it for 15s would freeze a
+            // healthy peer through the exact window it would recover in, shrinking
+            // the serving set during a spike->decay. Explicit REJECT (a peer
+            // decision to not serve) still blacklists via on_piece_rejected. The
+            // re-request below already avoids re-hammering the same peer by
+            // picking a replacement.
 
             if (block_timeout_callback_) {
                 co_await block_timeout_callback_(static_cast<uint32_t>(piece_idx), block_idx);

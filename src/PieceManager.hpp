@@ -22,11 +22,15 @@
 #include "PeerConnection.hpp"
 
 static constexpr uint32_t IN_PROGRESS_RARITY_GROUP_ID = std::numeric_limits<uint32_t>::max();
-// 30s was far too lenient: a block lost to a dead/snubbing peer cost half a
-// minute of pipeline stall, and with only 5 outstanding requests the whole
-// connection starved. 12s keeps the pipeline moving while tolerating normal
-// peer latency and burst scheduling.
-static constexpr auto BLOCK_REQUEST_TIMEOUT = std::chrono::seconds(12);
+// How long a written block request may go unanswered before it is re-requested
+// from another peer. libtorrent re-requests stalled blocks after
+// request_queue_time=3s. 12s was 4x too slow: with peers unchoking us in
+// bursts, a wave of requests that a peer stops serving all timed out together
+// 12s later (observed: 446 blocks stalling at once, right after the unchoke
+// burst), blacklisting busy-but-healthy peers and decaying the pipeline. 4s
+// recycles stalled requests fast enough to keep the window full while
+// tolerating normal peer latency and burst scheduling.
+static constexpr auto BLOCK_REQUEST_TIMEOUT = std::chrono::seconds(4);
 
 // libtorrent initial_picker_threshold: pick this many pieces RANDOMLY at the
 // start of a download instead of rarest-first, so a fresh leecher quickly
@@ -150,6 +154,13 @@ public:
         std::lock_guard lock(mutex_);
         get_available_peers_ = std::move(cb); 
     }
+    // Source for the count of peers that have unchoked us; the downloader
+    // scales the in-flight piece window to this so it never commits a fixed
+    // 32-piece window to a single newly-unchoked peer.
+    void set_unchoked_count_callback(std::function<size_t()> cb) {
+        std::lock_guard lock(mutex_);
+        get_unchoked_count_ = std::move(cb);
+    }
     void set_block_timeout_callback(BlockTimeoutCallback cb) { 
         std::lock_guard lock(mutex_);
         block_timeout_callback_ = std::move(cb); 
@@ -218,5 +229,6 @@ private:
     mutable std::mutex mutex_;
     GetAvailableCallback get_available_peers_;
     BlockTimeoutCallback block_timeout_callback_;
+    std::function<size_t()> get_unchoked_count_;
     std::atomic<bool> shutting_down_{false};
 };

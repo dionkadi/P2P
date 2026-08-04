@@ -167,6 +167,22 @@ public:
         return result;
     }
 
+    // Count of peers that have UNCHOKED US (download capacity). The in-flight
+    // piece window is scaled to this: committing a fixed 32-piece window when
+    // only 1 peer has unchoked us floods that single peer (observed 446-block
+    // timeout burst), because the rest of the swarm unchokes us staggered over
+    // the next ~12s — far too late to absorb an already-locked window.
+    size_t unchoked_by_peer_count() const {
+        std::lock_guard lock(mutex_);
+        size_t n = 0;
+        for (const auto& [pid, conn] : active_connections_) {
+            if (!conn->peer_is_choking()) {
+                ++n;
+            }
+        }
+        return n;
+    }
+
     void cancel() noexcept {
         shutting_down_.store(true, std::memory_order_release);
         LOGDBG("PeerManager: Cancelling pex_timer_...");

@@ -339,6 +339,11 @@ asio::awaitable<void> TorrentSession::run() {
                                          if (!self) co_return std::vector<std::shared_ptr<PeerConnection>>{};
                                          co_return co_await self->peer_manager_->available_peers(piece_index);
                                      });
+        piece_manager_->set_unchoked_count_callback([weak_cb]() -> size_t {
+            auto self = weak_cb.lock();
+            if (!self) return 0;
+            return self->peer_manager_->unchoked_by_peer_count();
+        });
         piece_manager_->set_block_timeout_callback([weak_cb](uint32_t piece_index, uint32_t block_index)
                                                          -> asio::awaitable<void> {
                                                      auto self = weak_cb.lock();
