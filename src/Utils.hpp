@@ -703,12 +703,19 @@ struct InProgressPiece {
 
     std::vector<std::vector<PeerId>> outstanding_requests;
     std::vector<TimePoint> request_times;  // When each block was first requested (for timeout detection)
+    // Peers that REJECTED a request for this block (PeerId -> rejection time).
+    // Entries expire after kRejectedBlockTTL so a peer that was temporarily
+    // choked can be tried again later. Prevents the reject -> re-request same
+    // peer -> reject loop that previously burned hundreds of requests.
+    static constexpr std::chrono::seconds kRejectedBlockTTL{60s};
+    std::vector<std::vector<std::pair<PeerId, TimePoint>>> rejected_by;
 
     InProgressPiece(uint64_t piece_size): data(piece_size) {
         total_blocks = (piece_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
         blocks_received.resize(total_blocks, false);
         outstanding_requests.resize(total_blocks);
         request_times.resize(total_blocks);  // Default TimePoint{} (epoch = "not requested")
+        rejected_by.resize(total_blocks);
     }
 };
 

@@ -5,8 +5,10 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <format>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 #include <random>
@@ -31,6 +33,19 @@ public:
     virtual const std::string get_url() const = 0;
 
     /// Cancel any in-flight announce() operation.
+    ///
+    /// Must never close a socket from the caller's thread: a cross-thread
+    /// close of a socket with a pending async op is undefined behavior
+    /// (double deregister of the epoll descriptor state -> SEGV in
+    /// epoll_reactor::deregister_descriptor, hit with ~80 concurrent HTTP
+    /// announces). The HTTP/HTTPS implementations instead dispatch the
+    /// socket close onto the stream's own strand, so the cancel is
+    /// serialized with the op that owns the socket and the pending op
+    /// completes with operation_canceled in-place. The UDP implementation
+    /// closes its socket, which asio handles safely by completing all
+    /// pending ops with operation_aborted (no internal second closer exists
+    /// for UDP ops).
+    ///
     /// After cancel(), the next announce() call creates a fresh connection.
     /// Thread-safe: implementations must not require external synchronization.
     virtual void cancel() = 0;
@@ -50,6 +65,9 @@ public:
     asio::awaitable<TrackerAnnounceResult> announce(const AnnounceRequestParams& params) override;
     const std::string get_url() const override { return "udp://" + url_str_; }
     void cancel() override {
+        // Safe: asio completes all ops pending on a closed socket with
+        // operation_aborted, and UDP ops never close the socket themselves
+        // (no multi-endpoint iteration), so no concurrent deregister exists.
         boost::system::error_code ec;
         socket_.close(ec);
     }
@@ -80,9 +98,22 @@ public:
     asio::awaitable<TrackerAnnounceResult> announce(const AnnounceRequestParams& params) override;
     const std::string get_url() const override { return std::format("http://{}:{}", host_, port_); }
     void cancel() override {
-        if (active_stream_) {
-            boost::beast::error_code ec;
-            active_stream_->socket().close(ec);
+        // Dispatch the socket close onto the stream's own strand: the
+        // stream is only ever mutated there, so this is serialized with the
+        // in-flight op, which completes with operation_canceled in-place.
+        // Never close the socket from the caller's thread — a foreign-thread
+        // close racing Beast's connect op (or its own deadline close) is a
+        // use-after-free in epoll_reactor::deregister_descriptor.
+        std::shared_ptr<beast::tcp_stream> stream;
+        {
+            std::lock_guard lock(stream_mutex_);
+            stream = active_stream_;
+        }
+        if (stream) {
+            asio::dispatch(stream->get_executor(), [stream] {
+                boost::beast::error_code ec;
+                stream->socket().close(ec);
+            });
         }
     }
 
@@ -91,10 +122,15 @@ private:
     std::string host_;
     std::string target_;
     int port_;
-    // Non-owning pointer set during announce(), cleared when announce() completes.
-    // Points to a local tcp_stream on the coroutine frame (or the lowest layer
-    // of an ssl_stream). Valid only while announce() is in-flight.
-    boost::beast::tcp_stream* active_stream_ = nullptr;
+    // Stream of the in-flight announce(), kept alive by a shared_ptr so a
+    // cancel() dispatch can outlive the announce coroutine's frame. The
+    // stream runs on its own strand (see announce()): Beast's internal
+    // deadline timer closes the socket, and without a strand that close
+    // races the connect op's own socket close in process() across io
+    // threads (SEGV in epoll_reactor::deregister_descriptor once the
+    // multi-tracker fan-out put ~80 concurrent announces in flight).
+    std::mutex stream_mutex_;
+    std::shared_ptr<beast::tcp_stream> active_stream_;
 };
 
 class HttpsTrackerClient: public ITrackerClient, public std::enable_shared_from_this<HttpsTrackerClient> {
@@ -105,9 +141,18 @@ public:
     asio::awaitable<TrackerAnnounceResult> announce(const AnnounceRequestParams& params) override;
     const std::string get_url() const override { return std::format("https://{}:{}", host_, port_); }
     void cancel() override {
-        if (active_stream_) {
-            boost::beast::error_code ec;
-            active_stream_->socket().close(ec);
+        // Same strand-dispatched socket close as HttpTrackerClient.
+        std::shared_ptr<beast::ssl_stream<beast::tcp_stream>> stream;
+        {
+            std::lock_guard lock(stream_mutex_);
+            stream = active_stream_;
+        }
+        if (stream) {
+            auto& lowest = beast::get_lowest_layer(*stream);
+            asio::dispatch(lowest.get_executor(), [stream] {
+                boost::beast::error_code ec;
+                beast::get_lowest_layer(*stream).socket().close(ec);
+            });
         }
     }
 
@@ -116,9 +161,10 @@ private:
     std::string host_;
     std::string target_;
     int port_;
-    // Non-owning pointer to the lowest layer (tcp_stream) of the SSL stream.
-    // Set during announce(), cleared when announce() completes.
-    boost::beast::tcp_stream* active_stream_ = nullptr;
+    // In-flight announce()'s ssl_stream; see HttpTrackerClient for why it is
+    // a mutex-guarded shared_ptr running on its own strand.
+    std::mutex stream_mutex_;
+    std::shared_ptr<beast::ssl_stream<beast::tcp_stream>> active_stream_;
 };
 
 template <typename Cont>
@@ -137,14 +183,95 @@ std::string url_encode(const Cont& value) {
     return escaped.str();
 }
 
+// Returns the HTTP proxy (host, port) to use for `host`, honoring
+// no_proxy/NO_PROXY (exact host or dot-suffix match) and the scheme-specific
+// http(s)_proxy / HTTP(S)_PROXY, falling back to all_proxy/ALL_PROXY.
+// Only plain http:// proxies are supported — SOCKS entries are ignored.
+// Mirrors main_client.cpp::get_http_proxy: tracker endpoints are sometimes
+// only reachable through the local proxy (redirect origin IPs RST'd/dropped
+// on some networks while the proxy succeeds), so announces must route
+// through it the same way curl does.
+static std::optional<std::pair<std::string, std::string>> announce_proxy_for(
+    const std::string& scheme, const std::string& host) {
+    const char* no_proxy_env = std::getenv("NO_PROXY");
+    if (!no_proxy_env) no_proxy_env = std::getenv("no_proxy");
+    if (no_proxy_env) {
+        std::istringstream ss(no_proxy_env);
+        std::string entry;
+        while (std::getline(ss, entry, ',')) {
+            // trim
+            size_t b = entry.find_first_not_of(" \t\r\n");
+            size_t e = entry.find_last_not_of(" \t\r\n");
+            entry = (b == std::string::npos) ? "" : entry.substr(b, e - b + 1);
+            if (entry.empty()) continue;
+            std::string suffix = entry;
+            if (!suffix.empty() && suffix.front() == '*') suffix.erase(0, 1);
+            if (!suffix.empty() && suffix.front() == '.') suffix.erase(0, 1);
+            if (host == suffix ||
+                (host.size() > suffix.size() && host.ends_with("." + suffix))) {
+                return std::nullopt;
+            }
+        }
+    }
+
+    const char* proxy = std::getenv((scheme + "_proxy").c_str());
+    if (!proxy) proxy = std::getenv((scheme + "_PROXY").c_str());
+    if (!proxy) proxy = std::getenv("all_proxy");
+    if (!proxy) proxy = std::getenv("ALL_PROXY");
+    if (!proxy) return std::nullopt;
+
+    std::string proxy_str(proxy);
+    if (proxy_str.rfind("socks", 0) == 0 || proxy_str.rfind("SOCKS", 0) == 0) {
+        return std::nullopt;  // SOCKS proxying not implemented
+    }
+    try {
+        boost::urls::url u(proxy_str);
+        if (u.scheme() != "http") {
+            return std::nullopt;
+        }
+        return std::make_pair(u.host(), u.has_port() ? std::string(u.port()) : "80");
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
+}
+
+// HTTP proxy CONNECT tunnel: plain TCP to the proxy is already established;
+// send CONNECT host:port and verify the proxy accepted the tunnel. After
+// this the stream is end-to-end to the target (TLS handshake proceeds over
+// it). read_header, not read: a 2xx CONNECT response has no body and no
+// Content-Length/Transfer-Encoding, so http::read cannot frame it and would
+// block until the connection closes (observed: hang on every proxy fetch).
+static asio::awaitable<void> proxy_connect_tunnel(
+    beast::tcp_stream& stream, const std::string& host, const std::string& port) {
+    http::request<http::empty_body> connect_req{http::verb::connect, host + ":" + port, 11};
+    connect_req.set(http::field::host, host + ":" + port);
+    stream.expires_after(std::chrono::seconds(30));
+    co_await http::async_write(stream, connect_req, asio::use_awaitable);
+
+    beast::flat_buffer connect_buffer;
+    http::response_parser<http::empty_body> connect_parser;
+    stream.expires_after(std::chrono::seconds(30));
+    co_await http::async_read_header(stream, connect_buffer, connect_parser, asio::use_awaitable);
+    auto connect_res = connect_parser.release();
+    if (connect_res.result() != http::status::ok) {
+        throw std::runtime_error("Proxy CONNECT to " + host + ":" + port +
+                                 " failed: HTTP " + std::to_string(static_cast<int>(connect_res.result())));
+    }
+}
+
 // Template helper: performs HTTP/HTTPS announce request/response cycle.
 // Works with both beast::tcp_stream and beast::ssl_stream<beast::tcp_stream>.
+// `proxy` (http proxy host, port) is non-empty when the connection was made
+// through a proxy: plain HTTP then uses absolute-form request targets
+// (RFC 7230) and HTTPS tunnels via CONNECT with path-form targets.
 template <typename Stream>
 asio::awaitable<TrackerAnnounceResult> http_announce_impl(
     Stream& stream,
+    asio::io_context& io,
     const std::string& host,
     const std::string& target,
-    const AnnounceRequestParams& params)
+    const AnnounceRequestParams& params,
+    const std::optional<std::pair<std::string, std::string>>& proxy = std::nullopt)
 {
     std::stringstream query_ss;
     query_ss << "info_hash=" << url_encode(params.info_hash_bytes)
@@ -159,11 +286,18 @@ asio::awaitable<TrackerAnnounceResult> http_announce_impl(
         query_ss << "&event=" << params.event;
     }
     std::string full_target = target + "?" + query_ss.str();
+    std::string current_host = host;
+
+    constexpr bool kIsTls = requires { stream.async_handshake(asio::ssl::stream_base::client, asio::use_awaitable); };
+    // Plain HTTP through a proxy requires absolute-form targets; inside a
+    // CONNECT tunnel (HTTPS) and on direct connections, path-form is used.
+    const bool absolute_form = proxy && !kIsTls;
 
     constexpr int max_redirects = 5;
     for (int redirect = 0; redirect <= max_redirects; ++redirect) {
-        http::request<http::string_body> req{http::verb::get, full_target, 11};
-        req.set(http::field::host, host);
+        http::request<http::string_body> req{http::verb::get,
+            absolute_form ? "http://" + current_host + full_target : full_target, 11};
+        req.set(http::field::host, current_host);
         req.set(http::field::user_agent, "Cpp-P2P-Client/1.0");
 
         co_await http::async_write(stream, req, asio::use_awaitable);
@@ -208,8 +342,58 @@ asio::awaitable<TrackerAnnounceResult> http_announce_impl(
             }
             std::string loc(location);
             LOGDBG("Tracker redirect ({}): {} -> {}", res.result_int(), full_target, loc);
-            // For same-host path redirects, update target and retry
-            full_target = loc;
+
+            // Resolve the Location into an authority + path-form target. Sending
+            // the absolute-form target with the stale Host header gets rejected
+            // (403) by many tracker endpoints, so always use path-form with a
+            // matching Host, and reconnect when the authority differs.
+            std::string redirect_host = current_host;
+            auto loc_r = boost::urls::parse_uri(loc);
+            if (loc_r && loc_r->has_authority()) {
+                redirect_host = std::string(loc_r->host());
+                if (loc_r->has_port()) {
+                    redirect_host += ":" + std::string(loc_r->port());
+                }
+                full_target = std::string(loc_r->encoded_path());
+                if (loc_r->has_query()) {
+                    full_target += "?" + std::string(loc_r->encoded_query());
+                }
+                if (full_target.empty()) {
+                    full_target = "/";
+                }
+            } else {
+                // Relative Location (path or /path?query): same authority.
+                full_target = loc;
+            }
+
+            if (redirect_host != current_host) {
+                // Cross-authority redirect: reconnect before following it.
+                // Through a proxy, the target is the proxy itself — the proxy
+                // resolves/connects to the new authority (curl behavior).
+                LOGINFO("Tracker redirect to different host {}, reconnecting.", redirect_host);
+                std::string port_str = loc_r && loc_r->has_port() ? std::string(loc_r->port()) : (kIsTls ? "443" : "80");
+                std::string conn_host = proxy ? proxy->first : std::string(loc_r->host());
+                std::string conn_port = proxy ? proxy->second : port_str;
+                tcp::resolver resolver(io);
+                auto const results = co_await resolver.async_resolve(
+                    conn_host, conn_port, asio::use_awaitable);
+
+                auto& lowest = beast::get_lowest_layer(stream);
+                beast::error_code ignore;
+                lowest.socket().close(ignore);
+                lowest.expires_after(std::chrono::seconds(30));
+                co_await lowest.async_connect(results, asio::use_awaitable);
+
+                // Re-establish TLS if the stream is an SSL stream: open a new
+                // CONNECT tunnel through the proxy, then handshake.
+                if constexpr (kIsTls) {
+                    if (proxy) {
+                        co_await proxy_connect_tunnel(lowest, std::string(loc_r->host()), port_str);
+                    }
+                    co_await stream.async_handshake(asio::ssl::stream_base::client);
+                }
+            }
+            current_host = redirect_host;
             continue;
         }
 
@@ -230,11 +414,11 @@ inline std::shared_ptr<ITrackerClient> create_tracker_client(asio::io_context& i
 
     std::string scheme = uv.scheme();
     std::string host = uv.host();
-    std::string target = uv.path();
+    std::string target = std::string(uv.encoded_path());
     if (target.empty()) target = "/";
     if (!uv.query().empty()) {
         target += "?";
-        target += uv.query();
+        target += std::string(uv.encoded_query());
     }
 
     uint16_t port = 0;
@@ -406,26 +590,48 @@ inline asio::awaitable<TrackerAnnounceResult> UdpTrackerClient::announce(const A
 inline asio::awaitable<TrackerAnnounceResult> HttpTrackerClient::announce(const AnnounceRequestParams& params) {
     CTRACK_ASYNC("HttpTrackerClient::announce");
     auto self = shared_from_this();
-    beast::tcp_stream stream(io_context_);
-    active_stream_ = &stream;
+    // The stream runs on its own strand. Without it, Beast's internal 30s
+    // deadline timer (expires_after) closes the socket from whichever io
+    // thread the timer fires on, racing the connect op's own socket close in
+    // process() on another io thread -> double deregister of the epoll
+    // descriptor state -> SEGV in epoll_reactor::deregister_descriptor. This
+    // surfaced once the multi-tracker fan-out put ~80 concurrent announces
+    // in flight. On the strand, the timer handler and every op completion
+    // are serialized, so the deadline close can never overlap op processing.
+    auto stream = std::make_shared<beast::tcp_stream>(asio::make_strand(io_context_));
+    {
+        std::lock_guard lock(stream_mutex_);
+        active_stream_ = stream;
+    }
     try {
+        auto proxy = announce_proxy_for("http", host_);
         tcp::resolver resolver(io_context_);
 
-        auto const results = co_await resolver.async_resolve(host_, std::to_string(port_), asio::use_awaitable);
-        stream.expires_after(std::chrono::seconds(30));
-        co_await stream.async_connect(results, asio::use_awaitable);
+        // Through a proxy: connect to the proxy itself; requests then use
+        // absolute-form targets (see http_announce_impl).
+        auto const results = co_await resolver.async_resolve(
+            proxy ? proxy->first : host_,
+            proxy ? proxy->second : std::to_string(port_), asio::use_awaitable);
+        stream->expires_after(std::chrono::seconds(30));
+        co_await stream->async_connect(results, asio::use_awaitable);
 
-        auto result = co_await http_announce_impl(stream, host_, target_, params);
+        auto result = co_await http_announce_impl(*stream, io_context_, host_, target_, params, proxy);
 
         beast::error_code ec;
-        ec = stream.socket().shutdown(tcp::socket::shutdown_both, ec);
+        ec = stream->socket().shutdown(tcp::socket::shutdown_both, ec);
         if (ec && ec != beast::errc::not_connected)
             throw beast::system_error{ec};
 
-        active_stream_ = nullptr;
+        {
+            std::lock_guard lock(stream_mutex_);
+            active_stream_.reset();
+        }
         co_return result;
     } catch (const std::exception& e) {
-        active_stream_ = nullptr;
+        {
+            std::lock_guard lock(stream_mutex_);
+            active_stream_.reset();
+        }
         LOGERR("HTTP announce to {} failed: {}", get_url(), e.what());
         throw;
     }
@@ -436,28 +642,47 @@ inline asio::awaitable<TrackerAnnounceResult> HttpsTrackerClient::announce(const
     auto self = shared_from_this();
     boost::asio::ssl::context ssl_ctx(boost::asio::ssl::context::tlsv12_client);
     ssl_ctx.set_default_verify_paths();
-    beast::ssl_stream<beast::tcp_stream> stream(io_context_, ssl_ctx);
-    active_stream_ = &beast::get_lowest_layer(stream);
+    // Same strand rationale as HttpTrackerClient::announce.
+    auto stream = std::make_shared<beast::ssl_stream<beast::tcp_stream>>(asio::make_strand(io_context_), ssl_ctx);
+    {
+        std::lock_guard lock(stream_mutex_);
+        active_stream_ = stream;
+    }
     try {
-        if (!SSL_set_tlsext_host_name(stream.native_handle(), host_.c_str())) {
+        auto proxy = announce_proxy_for("https", host_);
+        if (!SSL_set_tlsext_host_name(stream->native_handle(), host_.c_str())) {
             beast::error_code ec{static_cast<int>(::ERR_get_error()), asio::error::get_ssl_category()};
             throw beast::system_error{ec};
         }
 
         tcp::resolver resolver(io_context_);
-        auto const results = co_await resolver.async_resolve(host_, std::to_string(port_), asio::use_awaitable);
-        beast::get_lowest_layer(stream).expires_after(std::chrono::seconds(30));
-        co_await beast::get_lowest_layer(stream).async_connect(results, asio::use_awaitable);
-        co_await stream.async_handshake(asio::ssl::stream_base::client);
+        // Through a proxy: plain TCP to the proxy, then a CONNECT tunnel to
+        // the tracker; TLS handshakes inside the tunnel.
+        auto const results = co_await resolver.async_resolve(
+            proxy ? proxy->first : host_,
+            proxy ? proxy->second : std::to_string(port_), asio::use_awaitable);
+        auto& lowest = beast::get_lowest_layer(*stream);
+        lowest.expires_after(std::chrono::seconds(30));
+        co_await lowest.async_connect(results, asio::use_awaitable);
+        if (proxy) {
+            co_await proxy_connect_tunnel(lowest, host_, std::to_string(port_));
+        }
+        co_await stream->async_handshake(asio::ssl::stream_base::client);
 
-        auto result = co_await http_announce_impl(stream, host_, target_, params);
+        auto result = co_await http_announce_impl(*stream, io_context_, host_, target_, params, proxy);
 
         beast::error_code ec;
-        stream.shutdown(ec);
-        active_stream_ = nullptr;
+        stream->shutdown(ec);
+        {
+            std::lock_guard lock(stream_mutex_);
+            active_stream_.reset();
+        }
         co_return result;
     } catch (const std::exception& e) {
-        active_stream_ = nullptr;
+        {
+            std::lock_guard lock(stream_mutex_);
+            active_stream_.reset();
+        }
         LOGERR("HTTPS announce to {} failed: {}", get_url(), e.what());
         throw;
     }

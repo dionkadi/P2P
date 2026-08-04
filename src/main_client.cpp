@@ -22,6 +22,7 @@
 #include <filesystem>
 #include <iostream>
 #include <mutex>
+#include <optional>
 #include <ranges>
 #include <sstream>
 #include <string>
@@ -106,6 +107,54 @@ static std::vector<std::string> http_get_trackers(Stream& stream, const std::str
     return trackers;
 }
 
+// Returns the HTTP proxy (host, port) to use for `host`, honoring
+// no_proxy/NO_PROXY (exact host or dot-suffix match) and the scheme-specific
+// http(s)_proxy / HTTP(S)_PROXY, falling back to all_proxy/ALL_PROXY.
+// Only plain http:// proxies are supported — SOCKS entries are ignored.
+// Without this, direct TLS connections to github.io (the tracker list
+// source) are RST'd on some networks while the local proxy (used by curl
+// through the same env vars) succeeds — the fetch must tunnel through it.
+static std::optional<std::pair<std::string, std::string>> get_http_proxy(
+    const std::string& scheme, const std::string& host) {
+    const char* no_proxy_env = std::getenv("NO_PROXY");
+    if (!no_proxy_env) no_proxy_env = std::getenv("no_proxy");
+    if (no_proxy_env) {
+        std::istringstream ss(no_proxy_env);
+        std::string entry;
+        while (std::getline(ss, entry, ',')) {
+            entry = trim(entry);
+            if (entry.empty()) continue;
+            std::string suffix = entry;
+            if (!suffix.empty() && suffix.front() == '*') suffix.erase(0, 1);
+            if (!suffix.empty() && suffix.front() == '.') suffix.erase(0, 1);
+            if (host == suffix ||
+                (host.size() > suffix.size() && host.ends_with("." + suffix))) {
+                return std::nullopt;
+            }
+        }
+    }
+
+    const char* proxy = std::getenv((scheme + "_proxy").c_str());
+    if (!proxy) proxy = std::getenv((scheme + "_PROXY").c_str());
+    if (!proxy) proxy = std::getenv("all_proxy");
+    if (!proxy) proxy = std::getenv("ALL_PROXY");
+    if (!proxy) return std::nullopt;
+
+    std::string proxy_str(proxy);
+    if (proxy_str.rfind("socks", 0) == 0 || proxy_str.rfind("SOCKS", 0) == 0) {
+        return std::nullopt;  // SOCKS proxying not implemented
+    }
+    try {
+        boost::urls::url u(proxy_str);
+        if (u.scheme() != "http") {
+            return std::nullopt;
+        }
+        return std::make_pair(u.host(), u.has_port() ? std::string(u.port()) : "80");
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
+}
+
 static std::vector<std::string> fetch_tracker_list(const std::string& url_str) {
     LOGINFO("Fetching trackers...");
     try {
@@ -119,13 +168,61 @@ static std::vector<std::string> fetch_tracker_list(const std::string& url_str) {
 
         boost::asio::io_context ioc;
         tcp::resolver resolver(ioc);
-        auto const results = resolver.resolve(host, port);
 
         constexpr auto op_timeout = 5s;
+        auto proxy = get_http_proxy(u.scheme() == "https" ? "https" : "http", host);
 
         if (u.scheme() == "https") {
             boost::asio::ssl::context ssl_ctx(boost::asio::ssl::context::tlsv12_client);
             ssl_ctx.set_default_verify_paths();
+
+            if (proxy) {
+                // HTTP proxy CONNECT tunnel: plain TCP to the proxy, CONNECT
+                // request, then TLS inside the tunnel (SNI still targets the
+                // real host).
+                tcp::resolver proxy_resolver(ioc);
+                auto const proxy_results = proxy_resolver.resolve(proxy->first, proxy->second);
+                beast::tcp_stream stream(ioc);
+                stream.expires_after(op_timeout);
+                stream.connect(proxy_results);
+
+                http::request<http::empty_body> connect_req{http::verb::connect, host + ":" + port, 11};
+                connect_req.set(http::field::host, host + ":" + port);
+                stream.expires_after(op_timeout);
+                http::write(stream, connect_req);
+                beast::flat_buffer connect_buffer;
+                // read_header (via a parser), not read: a 2xx CONNECT response
+                // has no body and no Content-Length/Transfer-Encoding, so
+                // http::read cannot frame it and blocks until the connection
+                // closes (observed: hang on every proxy fetch). The header is
+                // the whole message; the proxy sends nothing else until our
+                // ClientHello, so no stray bytes are lost.
+                http::response_parser<http::empty_body> connect_parser;
+                stream.expires_after(op_timeout);
+                http::read_header(stream, connect_buffer, connect_parser);
+                auto connect_res = connect_parser.release();
+                if (connect_res.result() != http::status::ok) {
+                    LOGWARN("Proxy CONNECT to {}:{} failed: {}", host, port, static_cast<int>(connect_res.result()));
+                    return {};
+                }
+
+                stream.expires_after(op_timeout);
+                beast::ssl_stream<beast::tcp_stream> stream_tls(std::move(stream), ssl_ctx);
+                if (!SSL_set_tlsext_host_name(stream_tls.native_handle(), host.c_str())) {
+                    beast::error_code ec{static_cast<int>(::ERR_get_error()), asio::error::get_ssl_category()};
+                    LOGWARN("HTTPS SNI failure for {}: {}", host, ec.message());
+                    return {};
+                }
+                stream_tls.handshake(asio::ssl::stream_base::client);
+                beast::get_lowest_layer(stream_tls).expires_after(op_timeout);
+                auto trackers = http_get_trackers(stream_tls, host, target);
+                beast::error_code ec;
+                stream_tls.shutdown(ec);
+                LOGINFO("Fetching done (via proxy {}:{})...", proxy->first, proxy->second);
+                return trackers;
+            }
+
+            auto const results = resolver.resolve(host, port);
             beast::ssl_stream<beast::tcp_stream> stream(ioc, ssl_ctx);
 
             if (!SSL_set_tlsext_host_name(stream.native_handle(), host.c_str())) {
@@ -145,6 +242,22 @@ static std::vector<std::string> fetch_tracker_list(const std::string& url_str) {
             return trackers;
         } else {
             beast::tcp_stream stream(ioc);
+            if (proxy) {
+                // Plain HTTP through the proxy: request with absolute-form
+                // target (http://host/path) per RFC 7230.
+                tcp::resolver proxy_resolver(ioc);
+                auto const proxy_results = proxy_resolver.resolve(proxy->first, proxy->second);
+                stream.expires_after(op_timeout);
+                stream.connect(proxy_results);
+                stream.expires_after(op_timeout);
+                auto trackers = http_get_trackers(stream, host, "http://" + host + target);
+                beast::error_code ec;
+                stream.socket().shutdown(tcp::socket::shutdown_both, ec);
+                LOGINFO("Fetching done (via proxy {}:{})...", proxy->first, proxy->second);
+                return trackers;
+            }
+
+            auto const results = resolver.resolve(host, port);
             stream.expires_after(op_timeout);
             stream.connect(results);
             stream.expires_after(op_timeout);
@@ -197,6 +310,7 @@ int main(int argc, char* argv[]) {
     cmd_run.add_argument("--no-pex").help("Disable peer exchange").flag();
     cmd_run.add_argument("--selective").help("Prompt for file selection before download").flag();
     cmd_run.add_argument("--non-interactive").help("Disable interactive TUI commands").flag();
+    cmd_run.add_argument("--profile").help("Enable CTRACK function profiling and print results on exit").flag();
 
     prog.add_subparser(cmd_create);
     prog.add_subparser(cmd_run);
@@ -207,6 +321,11 @@ int main(int argc, char* argv[]) {
         std::cerr << e.what() << "\n" << prog;
         return 1;
     }
+
+    // Profiling is opt-in: without --profile, CTRACK/CTRACK_ASYNC are runtime
+    // no-ops and no profiling report is printed at exit.
+    if (!(prog.is_subcommand_used("run") && cmd_run.is_used("--profile")))
+        ctrack::set_profiling_enabled(false);
 
     Logger::init("client");
 
@@ -698,7 +817,8 @@ int main(int argc, char* argv[]) {
 
     app.save_state(state_path);
 
-    ctrack::result_print();
+    if (ctrack::profiling_is_enabled())
+        ctrack::result_print();
 
     return result;
 }

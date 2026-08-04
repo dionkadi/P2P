@@ -1163,10 +1163,13 @@ public:
             
             size_t filler_width = available_content_space - line_visible_len;
 
+            // Note: filler_width already covers padding_.right (available_content_space
+            // subtracted both paddings), so no separate right-padding append here —
+            // double-appending made every line one column too wide (term_w + 1),
+            // wrapping at the terminal and desyncing LiveDisplay's row accounting.
             result_ss << std::string(padding_.left, ' ')
                    << display_line
-                   << std::string(filler_width, ' ')
-                   << std::string(padding_.right, ' ');
+                   << std::string(filler_width, ' ');
             
             apply_border_color(result_ss);
             result_ss << to_string_view(border_style_[1]); // │
@@ -1409,8 +1412,14 @@ private:
                     }
                     current_cursor_y = target_y;
                     
-                    // Clear line & draw payload
-                    std::format_to(std::back_inserter(output_buffer_), "\033[2K{}", new_line);
+                    // Clear line & draw payload. The trailing \r is load-bearing:
+                    // if the line ends exactly at the terminal's last column, the
+                    // cursor sits in the terminal's pending-wrap state; the next
+                    // cursor-navigation CSI is then executed after the wrap fires,
+                    // landing every subsequent write one row too low and leaving
+                    // stale (doubled) rows on screen. The \r moves the cursor off
+                    // the right margin and cancels the pending wrap.
+                    std::format_to(std::back_inserter(output_buffer_), "\033[2K{}\r", new_line);
                 }
             }
         }

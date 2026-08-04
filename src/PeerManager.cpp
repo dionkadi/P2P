@@ -88,6 +88,16 @@ bool PeerManager::add_connection(const PeerId& id, std::shared_ptr<PeerConnectio
         }
     }
 
+    // Dedup: a new connection carrying an already-known peer id replaces the
+    // old one. Close the old connection explicitly — otherwise its message
+    // loop and socket survive as a "zombie" that no longer appears in the map
+    // (choke loop can't see it, requests over it get rejected as choked), and
+    // its eventual disconnect would erase the new connection by peer id.
+    if (auto it = active_connections_.find(id); it != active_connections_.end()) {
+        LOGWARN("add_connection: replacing existing connection to {} (duplicate peer id)", id);
+        it->second->close();
+    }
+
     active_connections_[id] = std::move(conn);
     return true;
 }
@@ -367,7 +377,7 @@ asio::awaitable<void> PeerManager::choke_loop() {
     auto self = shared_from_this();
     std::mt19937 rng(std::random_device{}());
     
-    static constexpr size_t unchoke_slots = 4;
+    static constexpr size_t unchoke_slots = kUnchokeSlots;
     std::shared_ptr<PeerConnection> optimistically_unchoked_peer = nullptr;
 
     auto send_async = [this](auto conn, MessageType type) {
@@ -386,12 +396,22 @@ asio::awaitable<void> PeerManager::choke_loop() {
         if (shutting_down_.load(std::memory_order_acquire)) {
             break;
         }
-        choke_timer_.expires_after(choke_interval_);
+        // Run the first pass immediately (peers now start choked, so a fresh
+        // connection must get an upload slot without waiting a full interval).
+        // A poke (new connection / disconnect) re-arms a short 1s interval so
+        // an "Interested" message arriving right after the poke is picked up.
+        bool poked = choke_poke_.exchange(false);
+        choke_timer_.expires_after(choke_loop_counter_ == 0 ? std::chrono::milliseconds(0)
+                                    : poked ? std::chrono::milliseconds(250)
+                                            : choke_interval_);
         if (shutting_down_.load(std::memory_order_acquire)) {
             choke_timer_.expires_at(decltype(choke_timer_)::clock_type::time_point::min());
         }
         boost::system::error_code ec;
         co_await choke_timer_.async_wait(asio::redirect_error(asio::use_awaitable, ec));
+        if (ec == asio::error::operation_aborted) {
+            ec.clear(); // poke_choke_loop() cancelled the wait — run the pass now
+        }
         if (ec || shutting_down_.load(std::memory_order_acquire)) {
             break;
         }
@@ -431,20 +451,35 @@ asio::awaitable<void> PeerManager::choke_loop() {
         }
 
         if (is_seed) {
-            std::sort(interested.begin(), interested.end(),
-                [](const auto& a, const auto& b) {
-                    return a->bytes_downloaded() > b->bytes_downloaded();
-                });
-        } else {
+            // Seeder: serve the peers that take data from us fastest.
+            // (bytes_uploaded = what they downloaded from us this round.)
             std::sort(interested.begin(), interested.end(),
                 [](const auto& a, const auto& b) {
                     return a->bytes_uploaded() > b->bytes_uploaded();
+                });
+        } else {
+            // Leecher: tit-for-tat — keep downloading from the peers that
+            // upload to us fastest (bytes_downloaded = what they sent us this
+            // round). The old sort-by-bytes_uploaded rewarded peers we were
+            // already serving, which for a leecher is the opposite of the
+            // peers whose data we actually want.
+            std::sort(interested.begin(), interested.end(),
+                [](const auto& a, const auto& b) {
+                    return a->bytes_downloaded() > b->bytes_downloaded();
                 });
         }
 
         std::vector<std::shared_ptr<PeerConnection>> to_unchoke;
         size_t regular_slots = unchoke_slots - 1;
         for (size_t i = 0; i < interested.size() && to_unchoke.size() < regular_slots; ++i) {
+            // Anti-snub persistence: a peer choked for not sending data must
+            // not be re-unchoked by the regular selection on the next pass —
+            // it only earns an upload slot again once it actually sends data.
+            auto last_data = interested[i]->last_data_received();
+            if (last_data != std::chrono::steady_clock::time_point{} &&
+                now - last_data > std::chrono::seconds(60)) {
+                continue;
+            }
             to_unchoke.push_back(interested[i]);
         }
 
@@ -462,7 +497,14 @@ asio::awaitable<void> PeerManager::choke_loop() {
 
             std::vector<std::shared_ptr<PeerConnection>> candidates;
             std::ranges::copy_if(interested, std::back_inserter(candidates),
-                [](const auto& p) { return p->am_choking(); });
+                [&now](const auto& p) {
+                    auto last_data = p->last_data_received();
+                    if (last_data != std::chrono::steady_clock::time_point{} &&
+                        now - last_data > std::chrono::seconds(60)) {
+                        return false; // never optimistically unchoke a snubber
+                    }
+                    return p->am_choking();
+                });
 
             if (!candidates.empty()) {
                 std::uniform_int_distribution<size_t> dist(0, candidates.size() - 1);
@@ -500,6 +542,11 @@ asio::awaitable<void> PeerManager::choke_loop() {
             conn->bytes_downloaded(0);
         });
     }
+}
+
+void PeerManager::poke_choke_loop() noexcept {
+    choke_poke_.store(true, std::memory_order_release);
+    choke_timer_.cancel();
 }
 
 asio::awaitable<void> PeerManager::send_have_message_to_all(size_t piece_index) {

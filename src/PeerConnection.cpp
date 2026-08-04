@@ -194,6 +194,11 @@ asio::awaitable<void> PeerConnection::message_loop() {
                     // LOGDBG("Peer {} sent CHOKE. Setting peer_is_choking to true.", peer_id_);
                     peer_is_choking_.store(true, std::memory_order_relaxed);
                     co_await events_->on_choke_status_changed(self, true);
+                    // Drop unsent queued requests: they will be re-requested
+                    // from other peers via the piece resume path. Keeping them
+                    // here would re-flood this (now refusing) peer on the next
+                    // Unchoke.
+                    drop_pending_requests();
                     break;
                 case MessageType::Unchoke: {
                     // LOGDBG("Peer {} sent UNCHOKE. Setting peer_is_choking to false.", peer_id_);
@@ -208,10 +213,16 @@ asio::awaitable<void> PeerConnection::message_loop() {
                 case MessageType::Interested:
                     // LOGDBG("Peer {} sent INTERESTED. Setting peer_is_interested to true.", peer_id_);
                     peer_is_interested_.store(true, std::memory_order_relaxed);
+                    if (interest_change_hook_) {
+                        interest_change_hook_();
+                    }
                     break;
                 case MessageType::NotInterested:  
                     // LOGDBG("Peer {} sent NOT INTERESTED. Setting peer_is_interested to false.", peer_id_);
                     peer_is_interested_.store(false, std::memory_order_relaxed);
+                    if (interest_change_hook_) {
+                        interest_change_hook_();
+                    }
                     break;
                 case MessageType::HaveAll: {
                     co_await events_->on_peer_has_all(self);
@@ -350,11 +361,20 @@ asio::awaitable<void> PeerConnection::keep_alive_loop() {
 }
 
 asio::awaitable<void> PeerConnection::send_simple_message(MessageType type) {
+    // Keep the connection alive while the write is in flight: with the
+    // serialized write queue, this coroutine (or the queue drain it owns)
+    // may be suspended across socket close, and a raw `this` would dangle.
+    auto self = shared_from_this();
+    (void)self;
     std::vector<std::byte> msg_body(1, static_cast<std::byte>(type));
     co_await socket_.send_message(msg_body);
 }
 
 asio::awaitable<bool> PeerConnection::send_request(size_t index, uint32_t begin, uint32_t length) {
+    // Keep the connection alive while the write is in flight (see
+    // send_simple_message).
+    auto self = shared_from_this();
+    (void)self;
     {
         std::lock_guard lock(pipeline_mutex_);
 
@@ -467,6 +487,8 @@ void PeerConnection::on_request_rejected(uint32_t length) {
 
 asio::awaitable<void> PeerConnection::send_piece(size_t index, uint32_t begin, std::span<const std::byte> block_data) {
     CTRACK_ASYNC("PeerConnection::send_piece");
+    auto self = shared_from_this(); // keep alive across the write (see send_simple_message)
+    (void)self;
     co_await upload_limiter_->await_tokens(block_data.size());
     std::vector<std::byte> msg_body(1, static_cast<std::byte>(MessageType::Piece));
     BufferWriter writer(msg_body);
@@ -477,12 +499,16 @@ asio::awaitable<void> PeerConnection::send_piece(size_t index, uint32_t begin, s
 }
 
 asio::awaitable<void> PeerConnection::send_bitfield(const std::vector<uint8_t>& bitfield_data) {
+    auto self = shared_from_this(); // keep alive across the write (see send_simple_message)
+    (void)self;
     std::vector<std::byte> msg_body(1, static_cast<std::byte>(MessageType::Bitfield));
     msg_body.insert(msg_body.end(), reinterpret_cast<const std::byte*>(bitfield_data.data()), reinterpret_cast<const std::byte*>(bitfield_data.data() + bitfield_data.size()));
     co_await socket_.send_message(msg_body);
 }
 
 asio::awaitable<void> PeerConnection::send_cancel(size_t index, uint32_t begin, uint32_t length) {
+    auto self = shared_from_this(); // keep alive across the write (see send_simple_message)
+    (void)self;
     bool send_wire_cancel = false;
     {
         std::lock_guard lock(pipeline_mutex_);
@@ -517,6 +543,8 @@ asio::awaitable<void> PeerConnection::send_cancel(size_t index, uint32_t begin, 
 }
 
 asio::awaitable<void> PeerConnection::send_reject(size_t index, uint32_t begin, uint32_t length) {
+    auto self = shared_from_this(); // keep alive across the write (see send_simple_message)
+    (void)self;
     std::vector<std::byte> msg_body(1, static_cast<std::byte>(MessageType::Reject));
     auto payload = RequestPayload::serialize(index, begin, length);
     msg_body.insert(msg_body.end(), payload.begin(), payload.end());
@@ -524,6 +552,8 @@ asio::awaitable<void> PeerConnection::send_reject(size_t index, uint32_t begin, 
 }
 
 asio::awaitable<void> PeerConnection::send_have(size_t index) {
+    auto self = shared_from_this(); // keep alive across the write (see send_simple_message)
+    (void)self;
     std::vector<std::byte> have_msg(1, static_cast<std::byte>(MessageType::Have));
     BufferWriter writer(have_msg);
     writer.write(asio::detail::socket_ops::host_to_network_long(static_cast<uint32_t>(index)));
@@ -531,6 +561,8 @@ asio::awaitable<void> PeerConnection::send_have(size_t index) {
 }
 
 asio::awaitable<void> PeerConnection::send_extended_message(uint8_t type_id, std::span<const std::byte> payload) {
+    auto self = shared_from_this(); // keep alive across the write (see send_simple_message)
+    (void)self;
     std::vector<std::byte> msg_body;
     msg_body.push_back(static_cast<std::byte>(MessageType::ExtendedMessage));
     msg_body.push_back(static_cast<std::byte>(type_id));
@@ -539,6 +571,8 @@ asio::awaitable<void> PeerConnection::send_extended_message(uint8_t type_id, std
 }
 
 asio::awaitable<void> PeerConnection::send_metadata_request(uint8_t ext_id, int piece) {
+    auto self = shared_from_this(); // keep alive across the write (see send_simple_message)
+    (void)self;
     Dict msg_dict;
     msg_dict["msg_type"] = Value(static_cast<Integer>(0));
     msg_dict["piece"] = Value(static_cast<Integer>(piece));

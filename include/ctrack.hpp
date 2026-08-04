@@ -1088,25 +1088,42 @@ namespace ctrack
 			return *thread_id;
 		}
 
+		// Runtime toggle: when disabled, instrumented functions (CTRACK /
+		// CTRACK_ASYNC) become no-ops and profiling reports are suppressed.
+		// Defaults to enabled; the client binary disables it unless the
+		// --profile CLI flag is passed.
+		inline std::atomic<bool> profiling_enabled{true};
+
+		inline void set_profiling_enabled(bool enabled) noexcept
+		{
+			profiling_enabled.store(enabled, std::memory_order_relaxed);
+		}
+
+		inline bool profiling_is_enabled() noexcept
+		{
+			return profiling_enabled.load(std::memory_order_relaxed);
+		}
+
 		class EventHandler
 		{
 		public:
-			EventHandler(int line = __builtin_LINE(), const char *filename = __builtin_FILE(), const char *function = __builtin_FUNCTION(), std::chrono::high_resolution_clock::time_point start_time = std::chrono::high_resolution_clock::now()) : line(line)
-
+			EventHandler(int line = __builtin_LINE(), const char *filename = __builtin_FILE(), const char *function = __builtin_FUNCTION(), std::chrono::high_resolution_clock::time_point start_time = {}) : start_time(start_time), line(line), filename(filename), function(function)
 			{
+				if (!profiling_is_enabled())
+					return;
 
 				previous_store_clear_cnt = store::store_clear_cnt;
-				this->filename = filename;
-				this->function = function;
 				while (store::write_events_locked)
 				{
 				}
 
+				start_time = std::chrono::high_resolution_clock::now();
 				register_event();
-				this->start_time = start_time;
 			}
 			~EventHandler()
 			{
+				if (!profiling_is_enabled())
+					return;
 				auto end_time = std::chrono::high_resolution_clock::now();
 				while (store::write_events_locked)
 				{
@@ -1261,11 +1278,15 @@ public:
                       const char *function = __builtin_FUNCTION()) 
         : line(line), filename(filename), function(function)
     {
+        if (!profiling_is_enabled())
+            return;
         start_time = std::chrono::high_resolution_clock::now();
     }
 
     ~AsyncEventHandler()
     {
+        if (!profiling_is_enabled())
+            return;
         auto end_time = std::chrono::high_resolution_clock::now();
 
         // Wait if the global store is locked

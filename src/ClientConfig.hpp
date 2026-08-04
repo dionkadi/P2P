@@ -18,7 +18,7 @@ struct ClientConfig {
     uint64_t download_rate_limit = 0;
     uint32_t max_connections = 200;
     uint32_t max_connections_per_ip = 2;
-    uint32_t max_half_open = 40;
+    uint32_t max_half_open = 100;
     uint32_t block_request_timeout_seconds = 30;
     uint32_t peer_ban_corrupt_threshold = 3;
     uint32_t peer_ban_duration_minutes = 60;

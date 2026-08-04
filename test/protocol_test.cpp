@@ -332,27 +332,28 @@ TEST(PeerConnectionRequestQueueTest, QueuedRequestsDoNotFlushWhileChoked) {
     });
     conn->peer_is_choking(false);
 
+    size_t limit = conn->max_outstanding_requests();
     RunAsync(io, [&]() -> asio::awaitable<void> {
-        for (uint32_t block = 0; block < 6; ++block) {
+        for (uint32_t block = 0; block < limit + 1; ++block) {
             co_await conn->send_request(7, block * BLOCK_SIZE, BLOCK_SIZE);
         }
     });
 
-    EXPECT_EQ(sent_count.load(std::memory_order_relaxed), 5);
+    EXPECT_EQ(sent_count.load(std::memory_order_relaxed), static_cast<int>(limit));
     EXPECT_EQ(conn->pending_request_count(), 1U);
 
     conn->peer_is_choking(true);
     conn->on_request_completed(BLOCK_SIZE);
     io.restart();
     io.run_for(20ms);
-    EXPECT_EQ(sent_count.load(std::memory_order_relaxed), 5);
+    EXPECT_EQ(sent_count.load(std::memory_order_relaxed), static_cast<int>(limit));
     EXPECT_EQ(conn->pending_request_count(), 1U);
 
     conn->peer_is_choking(false);
     conn->on_request_completed(BLOCK_SIZE);
     io.restart();
     io.run_for(20ms);
-    EXPECT_EQ(sent_count.load(std::memory_order_relaxed), 6);
+    EXPECT_EQ(sent_count.load(std::memory_order_relaxed), static_cast<int>(limit + 1));
     EXPECT_EQ(conn->pending_request_count(), 0U);
 
     sockets.server.close();
@@ -573,7 +574,7 @@ TEST(PeerManagerLimitsTest, DefaultLimits) {
 
     EXPECT_EQ(pm->max_total_connections(), 200);
     EXPECT_EQ(pm->max_connections_per_ip(), 2);
-    EXPECT_EQ(pm->max_half_open_connections(), 40);
+    EXPECT_EQ(pm->max_half_open_connections(), 100);
     EXPECT_EQ(pm->half_open_connections(), 0);
 }
 
@@ -1298,7 +1299,8 @@ TEST(RequestPipeliningTest, RequestsAreQueuedAtOutstandingLimit) {
     PeerId pid = test_peer_id("pipe1");
     auto conn = std::make_shared<TestPeerConn>(io, "1.2.3.4:6881", pid);
 
-    conn->set_pipeline_state(5, 5 * BLOCK_SIZE, 0);
+    size_t limit = conn->max_outstanding_requests();
+    conn->set_pipeline_state(limit, limit * BLOCK_SIZE, 0);
 
     bool sent = false;
     asio::co_spawn(io, [&]() -> asio::awaitable<void> {
@@ -1308,7 +1310,7 @@ TEST(RequestPipeliningTest, RequestsAreQueuedAtOutstandingLimit) {
 
     EXPECT_FALSE(sent);
     EXPECT_EQ(conn->pending_request_count(), 1);
-    EXPECT_EQ(conn->outstanding_request_count(), 5);
+    EXPECT_EQ(conn->outstanding_request_count(), limit);
     ASSERT_FALSE(conn->pending_requests().empty());
     EXPECT_EQ(conn->pending_requests().front().index, 0);
     EXPECT_EQ(conn->pending_requests().front().begin, 0);
@@ -1339,7 +1341,8 @@ TEST(RequestPipeliningTest, QueuedRequestFlushedOnPieceReceived) {
     PeerId pid = test_peer_id("pipe3");
     auto conn = std::make_shared<TestPeerConn>(io, "1.2.3.4:6881", pid);
 
-    conn->set_pipeline_state(5, 5 * BLOCK_SIZE, 0);
+    size_t limit = conn->max_outstanding_requests();
+    conn->set_pipeline_state(limit, limit * BLOCK_SIZE, 0);
     conn->peer_is_choking(false);
     asio::co_spawn(io, [&]() -> asio::awaitable<void> {
         co_await conn->send_request(0, 0, BLOCK_SIZE);
@@ -1351,8 +1354,8 @@ TEST(RequestPipeliningTest, QueuedRequestFlushedOnPieceReceived) {
 
     EXPECT_EQ(conn->pending_request_count(), 0);
     EXPECT_EQ(conn->total_bytes_received(), BLOCK_SIZE);
-    EXPECT_EQ(conn->total_bytes_requested(), 6 * BLOCK_SIZE);
-    EXPECT_EQ(conn->outstanding_request_count(), 5);
+    EXPECT_EQ(conn->total_bytes_requested(), (limit + 1) * BLOCK_SIZE);
+    EXPECT_EQ(conn->outstanding_request_count(), limit);
 }
 
 TEST(RequestPipeliningTest, QueuedRequestFlushedOnRejectReceived) {
@@ -1360,8 +1363,9 @@ TEST(RequestPipeliningTest, QueuedRequestFlushedOnRejectReceived) {
     PeerId pid = test_peer_id("pipe4");
     auto conn = std::make_shared<TestPeerConn>(io, "1.2.3.4:6881", pid);
 
-    uint64_t req_bytes = 5 * BLOCK_SIZE;
-    conn->set_pipeline_state(5, req_bytes, 0);
+    size_t limit = conn->max_outstanding_requests();
+    uint64_t req_bytes = limit * BLOCK_SIZE;
+    conn->set_pipeline_state(limit, req_bytes, 0);
     conn->peer_is_choking(false);
     asio::co_spawn(io, [&]() -> asio::awaitable<void> {
         co_await conn->send_request(1, 0, BLOCK_SIZE);
@@ -1373,7 +1377,7 @@ TEST(RequestPipeliningTest, QueuedRequestFlushedOnRejectReceived) {
 
     EXPECT_EQ(conn->pending_request_count(), 0);
     EXPECT_EQ(conn->total_bytes_requested(), req_bytes);
-    EXPECT_EQ(conn->outstanding_request_count(), 5);
+    EXPECT_EQ(conn->outstanding_request_count(), limit);
 }
 
 TEST(RequestPipeliningTest, CancelRemovesFromPendingQueue) {
@@ -1396,7 +1400,8 @@ TEST(RequestPipeliningTest, MultipleRequestsQueuedAndFlushedInOrder) {
     PeerId pid = test_peer_id("pipe6");
     auto conn = std::make_shared<TestPeerConn>(io, "1.2.3.4:6881", pid);
 
-    conn->set_pipeline_state(5, 5 * BLOCK_SIZE, 0);
+    size_t limit = conn->max_outstanding_requests();
+    conn->set_pipeline_state(limit, limit * BLOCK_SIZE, 0);
     conn->peer_is_choking(false);
     bool sent3 = true, sent4 = true, sent5 = true;
     asio::co_spawn(io, [&]() -> asio::awaitable<void> {
@@ -1412,13 +1417,13 @@ TEST(RequestPipeliningTest, MultipleRequestsQueuedAndFlushedInOrder) {
 
     conn->on_request_completed(BLOCK_SIZE);
     EXPECT_EQ(conn->pending_request_count(), 2);
-    EXPECT_EQ(conn->outstanding_request_count(), 5);
-    EXPECT_EQ(conn->total_bytes_requested(), 6 * BLOCK_SIZE);
+    EXPECT_EQ(conn->outstanding_request_count(), limit);
+    EXPECT_EQ(conn->total_bytes_requested(), (limit + 1) * BLOCK_SIZE);
 
     conn->on_request_rejected(BLOCK_SIZE);
     EXPECT_EQ(conn->pending_request_count(), 1);
     EXPECT_EQ(conn->pending_requests()[0].index, 5);
-    EXPECT_EQ(conn->total_bytes_requested(), 6 * BLOCK_SIZE);
+    EXPECT_EQ(conn->total_bytes_requested(), (limit + 1) * BLOCK_SIZE);
 
     conn->on_request_completed(BLOCK_SIZE);
     EXPECT_EQ(conn->pending_request_count(), 0);

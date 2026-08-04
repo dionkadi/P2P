@@ -26,7 +26,7 @@ TEST(ClientConfigTest, DefaultValues) {
     EXPECT_EQ(cfg.download_rate_limit, 0u);
     EXPECT_EQ(cfg.max_connections, 200u);
     EXPECT_EQ(cfg.max_connections_per_ip, 2u);
-    EXPECT_EQ(cfg.max_half_open, 40u);
+    EXPECT_EQ(cfg.max_half_open, 100u);
     EXPECT_EQ(cfg.block_request_timeout_seconds, 30u);
     EXPECT_EQ(cfg.peer_ban_corrupt_threshold, 3u);
     EXPECT_EQ(cfg.peer_ban_duration_minutes, 60u);

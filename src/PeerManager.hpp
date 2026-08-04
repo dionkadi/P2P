@@ -46,8 +46,17 @@ public:
     PeerManager& operator=(PeerManager&&) noexcept = delete;
 
     bool add_connection(const PeerId& id, std::shared_ptr<PeerConnection> conn);
-    void remove_connection(const PeerId& id) {
+    void remove_connection(const PeerId& id, const PeerConnection* conn = nullptr) {
         std::lock_guard lock(mutex_);
+        // If a specific connection is given, only erase the map entry when it
+        // still refers to THAT connection. A stale connection whose id was
+        // replaced by dedup must not remove the live replacement.
+        if (conn) {
+            auto it = active_connections_.find(id);
+            if (it == active_connections_.end() || it->second.get() != conn) {
+                return;
+            }
+        }
         active_connections_.erase(id);
     }
     void remove_all_connections() {
@@ -99,6 +108,7 @@ public:
     }
     
     // Connection limit accessors
+    static constexpr size_t kUnchokeSlots = 4;
     size_t max_total_connections() const noexcept { return max_total_connections_; }
     size_t max_connections_per_ip() const noexcept { return max_connections_per_ip_; }
     size_t max_half_open_connections() const noexcept { return max_half_open_connections_; }
@@ -109,6 +119,7 @@ public:
     void set_max_half_open_connections(size_t n) noexcept { max_half_open_connections_ = n; }
 
     asio::awaitable<void> choke_loop();
+    void poke_choke_loop() noexcept;
     asio::awaitable<void> send_have_message_to_all(size_t piece_index);
 
     asio::awaitable<void> pex_loop();
@@ -201,6 +212,7 @@ private:
     std::unordered_set<EndPoint> discovered_peers_;
     std::deque<EndPoint> dropped_peers_;
     size_t choke_loop_counter_{0};
+    std::atomic_bool choke_poke_{false};
     std::chrono::milliseconds choke_interval_;
     mutable std::mutex mutex_;
     mutable std::mutex active_mutex_;
@@ -210,7 +222,11 @@ private:
     // Connection limit fields
     size_t max_total_connections_{200};
     size_t max_connections_per_ip_{2};
-    size_t max_half_open_connections_{40};
+    // Concurrent in-flight connects. Cold-start swarms return hundreds of
+    // peers, most of them dead; each dead connect holds a slot for the full
+    // 15s timeout, so 40 slots cycle ~2.7 connects/s and a live peer buried
+    // behind the dead ones takes minutes to reach (qBittorrent uses ~100).
+    size_t max_half_open_connections_{100};
     std::atomic<size_t> half_open_connections_{0};
 
     std::shared_ptr<PeerConnection> find_worst_peer_locked();

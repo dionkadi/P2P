@@ -19,6 +19,7 @@
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 static constexpr size_t METADATA_PIECE_SIZE = 16384; // 16 KiB metadata pieces (BEP-10)
@@ -93,6 +94,11 @@ public:
 
     void add_tracker_url(const std::string& url);
     void add_tracker_url_direct(const std::string& url);
+    // Returns true and remembers `url` if it was not seen before; false if it
+    // is a duplicate. Prevents the same tracker being configured twice
+    // (observed: tracker.publicbt.com:80 registered twice from state restore),
+    // which doubled announce traffic and wasted connection slots.
+    bool is_duplicate_tracker_url(const std::string& url);
     // Count trackers that have had at least one successful announce
     size_t connected_tracker_count() const noexcept {
         std::lock_guard lock(tracker_backoff_mutex_);
@@ -163,6 +169,8 @@ private:
     std::vector<std::vector<std::shared_ptr<ITrackerClient>>> tracker_clients_by_tier_;
     std::unordered_map<std::string, BackoffState> tracker_backoff_states_;
     mutable std::mutex tracker_backoff_mutex_;
+    std::unordered_set<std::string> tracker_urls_;
+    std::mutex tracker_urls_mutex_;
 
     std::shared_ptr<SessionState> state_;
     std::shared_ptr<PieceManager> piece_manager_;
@@ -174,6 +182,7 @@ private:
     std::shared_ptr<LsdDiscovery> lsd_discovery_;
     asio::steady_timer dht_announce_timer_;
     int empty_dht_lookups_{0}; // consecutive get_peers returning 0 peers
+    std::atomic<bool> dht_bootstrap_in_progress_{false}; // one bootstrap round at a time
     std::vector<std::string> dht_bootstrap_nodes_;
     bool enable_dht_{true};
     bool enable_lsd_{true};

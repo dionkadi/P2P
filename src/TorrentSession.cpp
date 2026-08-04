@@ -4,6 +4,35 @@
 
 #include <algorithm>
 #include <boost/asio/experimental/awaitable_operators.hpp>
+#include <ifaddrs.h>
+#include <limits>
+
+// Returns true if `ip` is an address of one of this host's network
+// interfaces (lo, eth, docker bridge, ...). Used to skip tracker-echoed
+// self-announcements: our own address + listening port is us, and
+// connecting to ourselves wastes half-open slots on the handshake ->
+// self-drop path.
+static bool is_local_interface_address(const std::string& ip) {
+    ifaddrs* ifaddr = nullptr;
+    if (::getifaddrs(&ifaddr) != 0) {
+        return false;
+    }
+    bool found = false;
+    for (ifaddrs* ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
+        if (ifa->ifa_addr == nullptr || ifa->ifa_addr->sa_family != AF_INET) {
+            continue;
+        }
+        auto* sin = reinterpret_cast<sockaddr_in*>(ifa->ifa_addr);
+        char buf[INET_ADDRSTRLEN] = {};
+        if (::inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf)) != nullptr &&
+            ip == buf) {
+            found = true;
+            break;
+        }
+    }
+    ::freeifaddrs(ifaddr);
+    return found;
+}
 
 TorrentSession::TorrentSession(
     asio::io_context& io_context, 
@@ -37,19 +66,25 @@ TorrentSession::TorrentSession(
     tracker_announce_interval_(std::chrono::seconds(1800))
 {
     for (const auto& tier : state_->tracker_tiers()) {
-        auto client_tier_view = tier
-                                | std::views::transform([&](const std::string& url) -> std::shared_ptr<ITrackerClient> {
-                                    try {
-                                        return create_tracker_client(io_context, url);
-                                    } catch (const std::exception& e) {
-                                        LOGWARN("Failed to create tracker client for URL '{}': {}", url, e.what());
-                                        return nullptr; // Return nullptr on failure
-                                    }
-                                })
-                                | std::views::filter([](const std::shared_ptr<ITrackerClient>& client) {
-                                    return client != nullptr; // Filter out failed clients
-                                });
-        std::vector<std::shared_ptr<ITrackerClient>> client_tier(client_tier_view.begin(), client_tier_view.end());
+        // Plain loop, not a view pipeline: std::views::transform+filter can
+        // evaluate the transform more than once per element (find_if in
+        // begin(), then the vector ctor re-derefs), which doubles the
+        // is_duplicate_tracker_url side effect and pushed nullptr clients.
+        std::vector<std::shared_ptr<ITrackerClient>> client_tier;
+        for (const auto& url : tier) {
+            if (is_duplicate_tracker_url(url)) {
+                LOGDBG("Duplicate tracker URL '{}' skipped.", url);
+                continue;
+            }
+            try {
+                auto client = create_tracker_client(io_context, url);
+                if (client) {
+                    client_tier.push_back(std::move(client));
+                }
+            } catch (const std::exception& e) {
+                LOGWARN("Failed to create tracker client for URL '{}': {}", url, e.what());
+            }
+        }
         if (!client_tier.empty()) {
             tracker_clients_by_tier_.push_back(std::move(client_tier));
         }
@@ -94,19 +129,23 @@ TorrentSession::TorrentSession(
     tracker_announce_interval_(std::chrono::seconds(1800))
 {
     for (const auto& tier : state_->tracker_tiers()) {
-        auto client_tier_view = tier
-                                | std::views::transform([&](const std::string& url) -> std::shared_ptr<ITrackerClient> {
-                                    try {
-                                        return create_tracker_client(io_context, url);
-                                    } catch (const std::exception& e) {
-                                        LOGWARN("Failed to create tracker client for URL '{}': {}", url, e.what());
-                                        return nullptr;
-                                    }
-                                })
-                                | std::views::filter([](const std::shared_ptr<ITrackerClient>& client) {
-                                    return client != nullptr;
-                                });
-        std::vector<std::shared_ptr<ITrackerClient>> client_tier(client_tier_view.begin(), client_tier_view.end());
+        // Plain loop: view pipelines can evaluate the transform twice per
+        // element, doubling tracker client creation.
+        std::vector<std::shared_ptr<ITrackerClient>> client_tier;
+        for (const auto& url : tier) {
+            if (is_duplicate_tracker_url(url)) {
+                LOGDBG("Duplicate tracker URL '{}' skipped.", url);
+                continue;
+            }
+            try {
+                auto client = create_tracker_client(io_context, url);
+                if (client) {
+                    client_tier.push_back(std::move(client));
+                }
+            } catch (const std::exception& e) {
+                LOGWARN("Failed to create tracker client for URL '{}': {}", url, e.what());
+            }
+        }
         if (!client_tier.empty()) {
             tracker_clients_by_tier_.push_back(std::move(client_tier));
         }
@@ -273,9 +312,18 @@ asio::awaitable<void> TorrentSession::run() {
             LOGINFO("DHT node started on UDP port {}", peer_port_);
             auto dht = dht_node_;
             auto bootstrap_nodes = dht_bootstrap_nodes_;
+            dht_bootstrap_in_progress_.store(true, std::memory_order_release);
             asio::co_spawn(io_context_, [dht, bootstrap_nodes = std::move(bootstrap_nodes)]() -> asio::awaitable<void> {
                 co_await dht->bootstrap(bootstrap_nodes);
-            }, asio::detached);
+            }, [weak_self = weak_from_this()](std::exception_ptr e) {
+                if (e) {
+                    try { std::rethrow_exception(e); }
+                    catch (const std::exception& ex) { LOGWARN("DHT bootstrap failed: {}", ex.what()); }
+                }
+                if (auto self = weak_self.lock()) {
+                    self->dht_bootstrap_in_progress_.store(false, std::memory_order_release);
+                }
+            });
         }
         asio::co_spawn(strand_, dht_announce_loop(), asio::detached);
     }
@@ -303,6 +351,20 @@ asio::awaitable<void> TorrentSession::run() {
     }
     if (metadata_download_active_) {
         asio::co_spawn(strand_, metadata_retry_loop(), asio::detached);
+    }
+
+    // DEBUG: inject a peer from environment (P2P_DEBUG_PEER="ip:port") for testing.
+    if (const char* dbg_peer = std::getenv("P2P_DEBUG_PEER")) {
+        try {
+            std::string s(dbg_peer);
+            auto colon = s.rfind(':');
+            auto ip = s.substr(0, colon);
+            uint16_t port = static_cast<uint16_t>(std::stoi(s.substr(colon + 1)));
+            peer_manager_->add_discovered_peer(EndPoint(asio::ip::make_address(ip), port));
+            LOGINFO("DEBUG: injected peer {}:{}", ip, port);
+        } catch (const std::exception& e) {
+            LOGWARN("DEBUG: bad P2P_DEBUG_PEER value: {} ({})", dbg_peer, e.what());
+        }
     }
 
     if (enable_dht_ || enable_lsd_) {
@@ -368,12 +430,20 @@ asio::awaitable<void> TorrentSession::stop() {
     // shared_from_this() alive for up to 30s (the HTTP timeout).
     // The tracker_announce_loop will then exit promptly when it checks
     // shutting_down_.
+    // Snapshot the client list under the strand first: add_tracker_url()
+    // mutates tracker_clients_by_tier_ via strand dispatch from other
+    // threads, so iterating it directly here races vector reallocation.
+    std::vector<std::shared_ptr<ITrackerClient>> clients_to_cancel;
+    co_await asio::dispatch(strand_, asio::use_awaitable);
     for (auto& tier : tracker_clients_by_tier_) {
         for (auto& client : tier) {
             if (client) {
-                client->cancel();
+                clients_to_cancel.push_back(client);
             }
         }
+    }
+    for (auto& client : clients_to_cancel) {
+        client->cancel();
     }
 
     if (mode_ != Mode::Seed) {
@@ -453,10 +523,20 @@ asio::awaitable<void> TorrentSession::handle_new_connection(AsyncSocket socket, 
         }
     });
 
-    asio::co_spawn(io_context_, [conn] () -> asio::awaitable<void> {
-        co_await conn->send_simple_message(MessageType::Unchoke);
-        conn->am_choking(false);
-    }, asio::detached);
+    // Re-evaluate upload slots as soon as the peer tells us it is (not)
+    // interested, instead of waiting for the next choke-loop tick. The choke
+    // loop remains the single authority on who gets unchoked.
+    conn->set_interest_change_hook([weak_self = weak_from_this()]() {
+        if (auto self = weak_self.lock()) {
+            self->peer_manager_->poke_choke_loop();
+        }
+    });
+
+    // New peers start CHOKED. Unchoking every connection on arrival produced
+    // a choke/unchoke oscillation: the peer got one round of unchoke here,
+    // then the choke loop (4 slots, tit-for-tat) choked it 10s later, and
+    // when it got re-unchoked the loop choked it again — repeatedly. The
+    // choke loop is the single authority on upload slots.
 
     if (peer_manager_->contains_peer(conn->peer_id())) {
         if (my_peer_id_ < conn->peer_id()) {
@@ -466,13 +546,24 @@ asio::awaitable<void> TorrentSession::handle_new_connection(AsyncSocket socket, 
             LOGWARN("Duplicate connection to {}. Closing the other one.", conn->peer_id());
             if (auto other_conn = peer_manager_->get_connection(conn->peer_id())) {
                 other_conn->close();
-                peer_manager_->remove_connection(conn->peer_id());
+    peer_manager_->remove_connection(conn->peer_id(), conn.get());
             }
         }
     }
     if (!peer_manager_->add_connection(conn->peer_id(), conn)) {
         LOGWARN("handle_new_connection: connection rejected by PeerManager for {} (limits)", conn->peer_addr());
         co_return;
+    }
+
+    // Fast start: when upload slots are abundant (fewer connections than
+    // slots), unchoke immediately instead of waiting for the poked choke-loop
+    // pass (~250ms later). The choke loop remains the authority — it would
+    // unchoke this peer anyway in this situation, and re-evaluates on its
+    // next pass, so there is no choke/unchoke oscillation while slots are
+    // free.
+    if (peer_manager_->connection_count() <= PeerManager::kUnchokeSlots && conn->am_choking()) {
+        conn->am_choking(false);
+        co_await conn->send_simple_message(MessageType::Unchoke);
     }
 
     try {
@@ -485,6 +576,11 @@ asio::awaitable<void> TorrentSession::handle_new_connection(AsyncSocket socket, 
     }
 
     LOGDBG("PeerConnection created and handshake finished for {}", conn->peer_addr());
+
+    // Give the new peer an upload slot quickly: it starts choked, so without
+    // this poke it would wait up to a full choke interval for its first
+    // Unchoke.
+    peer_manager_->poke_choke_loop();
 }
 
 asio::awaitable<void> TorrentSession::tracker_announce_loop() {
@@ -572,80 +668,155 @@ asio::awaitable<void> TorrentSession::announce_tracker_for(std::string event) {
         .left = left,
     };
 
-    bool announce_successful = false;
+    // Snapshot all tracker clients under the strand (add_tracker_url mutates
+    // tracker_clients_by_tier_ from other threads via dispatch).
+    std::vector<std::shared_ptr<ITrackerClient>> trackers;
     co_await asio::dispatch(self->strand_, asio::use_awaitable);
     for (auto& tier : self->tracker_clients_by_tier_) {
         for (const auto& tracker_client : tier) {
-            if (!tracker_client) {
-                continue;
+            if (tracker_client) {
+                trackers.push_back(tracker_client);
             }
-            const auto& url = tracker_client->get_url();
+        }
+    }
 
-            // Check backoff for this tracker URL
+    if (trackers.empty()) {
+        LOGERR("Failed to announce '{}': no trackers configured.", event);
+        co_return;
+    }
+
+    // Announce to ALL trackers in parallel instead of stopping at the first
+    // success. With ~90 configured trackers the old sequential loop only ever
+    // used the 4 fastest, and a single dead UDP tracker (15s+30s+60s+120s
+    // backoff retries) could monopolize the whole cycle. This is what
+    // qBittorrent does: fan out, merge, dedupe.
+    struct AnnounceOutcome {
+        bool success = false;
+        int interval_seconds = 0;
+        std::vector<std::string> peers;
+    };
+    auto outcomes = std::make_shared<std::vector<AnnounceOutcome>>(trackers.size());
+
+    // Shared dedup state so concurrent announce responses don't spawn
+    // duplicate connections for peers returned by several trackers.
+    auto peers_dedup = std::make_shared<std::unordered_set<std::string>>();
+    auto peers_dedup_mutex = std::make_shared<std::mutex>();
+
+    auto announce_one = [self, weak_this, params, event, outcomes, trackers, peers_dedup, peers_dedup_mutex](size_t i) -> asio::awaitable<void> {
+        const auto& url = trackers[i]->get_url();
+        auto& outcome = (*outcomes)[i];
+
+        // Check backoff for this tracker URL
+        {
+            std::lock_guard lock(self->tracker_backoff_mutex_);
+            auto it = self->tracker_backoff_states_.find(url);
+            if (it != self->tracker_backoff_states_.end()) {
+                it->second.check_and_reset_if_idle();
+                if (it->second.is_in_backoff()) {
+                    LOGDBG("announce_tracker_for: skipping tracker {} (in backoff, attempt {})",
+                           url, it->second.attempt_count_);
+                    co_return;
+                }
+            }
+        }
+
+        try {
+            LOGINFO("Announcing to tracker {} (event: '{}')...", url, event);
+            auto result = co_await trackers[i]->announce(params);
             {
                 std::lock_guard lock(self->tracker_backoff_mutex_);
-                auto it = self->tracker_backoff_states_.find(url);
-                if (it != self->tracker_backoff_states_.end()) {
-                    it->second.check_and_reset_if_idle();
-                    if (it->second.is_in_backoff()) {
-                        LOGDBG("announce_tracker_for: skipping tracker {} (in backoff, attempt {})",
-                               url, it->second.attempt_count_);
+                self->tracker_backoff_states_[url].on_success();
+            }
+            outcome.success = true;
+            outcome.interval_seconds = result.interval_seconds;
+            outcome.peers = std::move(result.peers);
+
+            // Connect to THIS tracker's peers immediately, without waiting
+            // for the rest of the fan-out. A dead UDP tracker retries with
+            // 15s/30s/60s/120s backoff, and gating peer connects behind
+            // wait_for_all() starved the swarm for minutes — the first peer
+            // connection happened ~4min after startup while qBittorrent
+            // connected within seconds of the first tracker response.
+            if (event != "stopped") {
+                auto peer_manager = self->peer_manager_;
+                for (const auto& peer_addr : outcome.peers) {
+                    std::string ip = PeerManager::extract_ip_from_addr(peer_addr);
+                    // Trackers echo our own announce back as a peer (our
+                    // address + listening port). Connecting to ourselves
+                    // wastes half-open slots and cycles the handshake ->
+                    // self-drop path. qBittorrent filters these.
+                    if (is_local_interface_address(ip) &&
+                        peer_addr.substr(ip.size() + 1) == std::to_string(self->peer_port_)) {
+                        LOGDBG("Skipping self-echoed peer {}", peer_addr);
                         continue;
                     }
-                }
-            }
-
-            try {
-                LOGINFO("Announcing to tracker {} (event: '{}')...", url, event);
-                auto result = co_await tracker_client->announce(params);
-                announce_successful = true;
-
-                {
-                    std::lock_guard lock(self->tracker_backoff_mutex_);
-                    self->tracker_backoff_states_[url].on_success();
-                }
-
-                self->tracker_announce_interval_ = std::chrono::seconds(result.interval_seconds);
-                if (event != "stopped") {
-                    auto peer_manager = self->peer_manager_;
-                    for (const auto& peer_addr : result.peers) {
-                        std::string ip = PeerManager::extract_ip_from_addr(peer_addr);
-                        bool already_connected = self->peer_manager_->contains_peer_addr(peer_addr)
-                                                 || self->peer_manager_->contains_peer_ip(ip);
-                        if (!already_connected) {
-                            asio::co_spawn(self->io_context_, 
-                                [peer_addr, weak_this, peer_manager] () -> asio::awaitable<void> {
-                                    auto socket = co_await peer_manager->connect_to_peer(peer_addr);
-                                    if (socket) {
-                                        if (auto self = weak_this.lock()) {
-                                            co_await self->handle_new_connection(std::move(*socket), peer_addr);
-                                        }
-                                    }
-                                }, 
-                                asio::detached
-                            );
+                    {
+                        std::lock_guard lock(*peers_dedup_mutex);
+                        if (!peers_dedup->insert(peer_addr).second) {
+                            continue;  // another tracker already queued this peer
                         }
                     }
-                }
-
-                break;
-            } catch (const std::exception& e) {
-                LOGERR("Failed to announce to tracker: {}.", e.what());
-                {
-                    std::lock_guard lock(self->tracker_backoff_mutex_);
-                    self->tracker_backoff_states_[url].on_failure(self->tracker_announce_interval_);
+                    bool already_connected = peer_manager->contains_peer_addr(peer_addr)
+                                             || peer_manager->contains_peer_ip(ip);
+                    if (already_connected) {
+                        continue;
+                    }
+                    asio::co_spawn(self->io_context_,
+                        [peer_addr, weak_this, peer_manager] () -> asio::awaitable<void> {
+                            auto socket = co_await peer_manager->connect_to_peer(peer_addr);
+                            if (socket) {
+                                if (auto self = weak_this.lock()) {
+                                    co_await self->handle_new_connection(std::move(*socket), peer_addr);
+                                }
+                            }
+                        },
+                        asio::detached
+                    );
                 }
             }
+        } catch (const std::exception& e) {
+            LOGERR("Failed to announce to tracker: {}.", e.what());
+            {
+                std::lock_guard lock(self->tracker_backoff_mutex_);
+                self->tracker_backoff_states_[url].on_failure(self->tracker_announce_interval_);
+            }
         }
+    };
 
-        if (announce_successful) {
-            break;
+    using deferred_t = decltype(asio::co_spawn(
+        std::declval<asio::io_context&>(), announce_one(0), asio::deferred));
+    std::vector<deferred_t> queries;
+    queries.reserve(trackers.size());
+    for (size_t i = 0; i < trackers.size(); ++i) {
+        queries.push_back(asio::co_spawn(self->io_context_, announce_one(i), asio::deferred));
+    }
+    auto group = asio::experimental::make_parallel_group(std::move(queries));
+    co_await group.async_wait(asio::experimental::wait_for_all(), asio::use_awaitable);
+
+    // Merge successful announces: refresh the re-announce interval. Peer
+    // connection spawning happens per-response above.
+    int min_interval = std::numeric_limits<int>::max();
+    bool announce_successful = false;
+    for (const auto& outcome : *outcomes) {
+        if (!outcome.success) continue;
+        announce_successful = true;
+        if (outcome.interval_seconds > 0) {
+            min_interval = std::min(min_interval, outcome.interval_seconds);
         }
     }
 
-    if (!announce_successful) {
+    if (announce_successful) {
+        if (min_interval != std::numeric_limits<int>::max()) {
+            self->tracker_announce_interval_ = std::chrono::seconds(min_interval);
+        }
+    } else {
         LOGERR("Failed to announce '{}' to any tracker.", event);
     }
+}
+
+bool TorrentSession::is_duplicate_tracker_url(const std::string& url) {
+    std::lock_guard lock(tracker_urls_mutex_);
+    return !tracker_urls_.insert(url).second;
 }
 
 void TorrentSession::add_tracker_url(const std::string& url) {
@@ -668,6 +839,10 @@ void TorrentSession::add_tracker_url(const std::string& url) {
         if (!self || self->shutting_down_) {
             return;
         }
+        if (self->is_duplicate_tracker_url(url)) {
+            LOGDBG("Duplicate tracker URL '{}' skipped.", url);
+            return;
+        }
         if (self->tracker_clients_by_tier_.empty()) {
             self->tracker_clients_by_tier_.push_back({});
         }
@@ -679,6 +854,11 @@ void TorrentSession::add_tracker_url(const std::string& url) {
 
 void TorrentSession::add_tracker_url_direct(const std::string& url) {
     if (shutting_down_) {
+        return;
+    }
+
+    if (is_duplicate_tracker_url(url)) {
+        LOGDBG("Duplicate tracker URL '{}' skipped.", url);
         return;
     }
 
@@ -767,13 +947,41 @@ asio::awaitable<void> TorrentSession::dht_announce_loop() {
             }
         }
 
-        if (dht_peers.empty() && empty_dht_lookups_ < 10) {
-            // The very first lookup usually runs before the DHT routing table
-            // is bootstrapped (it starts empty), so it finds nothing.  Retry
+        if (dht_peers.empty()) {
+            // The first lookup usually runs before the DHT routing table is
+            // bootstrapped (it starts empty), so it finds nothing.  Retry
             // quickly a few times instead of sleeping 30 minutes on a useless
             // query — metadata-download (magnet) sessions depend on DHT for
             // peer discovery when trackers know nothing about the infohash.
             ++empty_dht_lookups_;
+            if (dht_node_->routing_table_size() < 16 &&
+                !dht_bootstrap_in_progress_.load(std::memory_order_acquire)) {
+                // Routing table too small to answer anything: the initial
+                // bootstrap (one ping round at startup) either timed out or
+                // only reached 2 of 3 bootstrap nodes, leaving the table with
+                // a handful of stale entries that get_peers keeps querying
+                // into silence. Re-bootstrap to repopulate it; this is what
+                // makes a dead-start DHT recover instead of going dormant.
+                // Never run while another bootstrap is still in flight: a
+                // duplicate round would double the ping traffic on the shared
+                // io_context and slow every other session on it.
+                LOGWARN("DHT routing table small ({} nodes) and no peers found; re-bootstrapping.",
+                        dht_node_->routing_table_size());
+                auto dht = dht_node_;
+                auto bootstrap_nodes = dht_bootstrap_nodes_;
+                dht_bootstrap_in_progress_.store(true, std::memory_order_release);
+                asio::co_spawn(io_context_, [dht, bootstrap_nodes = std::move(bootstrap_nodes)]() -> asio::awaitable<void> {
+                    co_await dht->bootstrap(bootstrap_nodes);
+                }, [weak_self = weak_from_this()](std::exception_ptr e) {
+                    if (e) {
+                        try { std::rethrow_exception(e); }
+                        catch (const std::exception& ex) { LOGWARN("DHT re-bootstrap failed: {}", ex.what()); }
+                    }
+                    if (auto self = weak_self.lock()) {
+                        self->dht_bootstrap_in_progress_.store(false, std::memory_order_release);
+                    }
+                });
+            }
             dht_announce_timer_.expires_after(std::chrono::seconds(30));
         } else {
             empty_dht_lookups_ = 0;
@@ -858,6 +1066,11 @@ asio::awaitable<void> TorrentSession::on_piece_block(std::shared_ptr<PeerConnect
         std::ranges::copy(block_data, progress->data.begin() + begin);
         progress->blocks_received[block_index] = true;
         ++progress->received_count;
+
+        // Block is done: clear rejection history so it never blocks a re-request.
+        if (block_index < progress->rejected_by.size()) {
+            progress->rejected_by[block_index].clear();
+        }
 
         piece_complete = (progress->received_count == progress->total_blocks);
     }
@@ -962,8 +1175,8 @@ asio::awaitable<void> TorrentSession::on_block_request(std::shared_ptr<PeerConne
 }
 
 asio::awaitable<void> TorrentSession::on_piece_rejected(std::shared_ptr<PeerConnection> conn, size_t piece_index, uint32_t begin, uint32_t length) {
-    LOGDBG("Peer {} rejected our request for piece {} begin {} length {}. Re-requesting from another peer.",
-            conn->peer_id(), piece_index, begin, length);
+    LOGDBG("Peer {} ({}) rejected our request for piece {} begin {} length {}. Re-requesting from another peer.",
+            conn->peer_id(), conn->peer_addr(), piece_index, begin, length);
 
     auto progress = piece_manager_->in_progress_piece(piece_index);
     if (!progress) {
@@ -984,17 +1197,22 @@ asio::awaitable<void> TorrentSession::on_piece_rejected(std::shared_ptr<PeerConn
         }
     }
 
-    bool replacement_found = false;
-    auto available_peers = co_await peer_manager_->available_peers(piece_index);
-    for (const auto& peer : available_peers) {
-        if (peer->peer_id() != conn->peer_id() && !peer->peer_is_choking()) {
-            co_await peer->send_request(piece_index, begin, length);
-            replacement_found = true;
-            break;
-        }
-    }
+    // Blacklist this peer for this block (TTL-bounded): without this, a peer
+    // that rejects once gets re-targeted on every retry — the reject ->
+    // re-request -> reject loop that produced thousands of REJECTs.
+    //
+    // All PieceManager state (in_progress_pieces_, rng_) must be touched on
+    // its own strand — pick_block_peer/record_block_rejection run there,
+    // concurrently with check_block_timeouts on the same strand.
+    co_await asio::dispatch(piece_manager_->strand(), asio::use_awaitable);
+    piece_manager_->record_block_rejection(piece_index, block_index, conn->peer_id());
 
-    if (!replacement_found) {
+    // Random replacement peer that hasn't rejected this block and isn't
+    // already serving it.
+    auto replacement = co_await piece_manager_->pick_block_peer(piece_index, block_index, &conn->peer_id(), true);
+    if (replacement) {
+        co_await replacement->send_request(piece_index, begin, length);
+    } else {
         piece_manager_->ensure_resume_piece_download(piece_index);
     }
 
@@ -1146,8 +1364,40 @@ asio::awaitable<void> TorrentSession::on_choke_status_changed(std::shared_ptr<Pe
         }
 
         piece_manager_->notify_one();
+        co_return;
     }
-    co_return ;
+
+    // Peer choked us: it will not serve our outstanding requests. Free their
+    // slots immediately (instead of waiting out BLOCK_REQUEST_TIMEOUT) and
+    // let the piece resume path re-request from peers that still serve us.
+    // Without this, blocks sat on a refusing peer for 30s+ while the rest of
+    // the pipeline stalled behind them.
+    auto pieces_snapshot = piece_manager_->in_progress_pieces();
+    if (!pieces_snapshot) co_return;
+
+    // If this peer held unsent queued requests, those blocks become orphaned
+    // (empty outstanding-request lists) once the queue is dropped, so every
+    // in-progress piece may need a resume pass.
+    bool peer_had_queued_requests = conn->has_pending_requests();
+
+    for (const auto& [piece_idx, progress] : *pieces_snapshot) {
+        bool needs_resume = peer_had_queued_requests;
+        {
+            std::lock_guard lock(progress->piece_mutex_);
+            for (size_t block_index = 0; block_index < progress->outstanding_requests.size(); ++block_index) {
+                auto& requests = progress->outstanding_requests[block_index];
+                std::erase(requests, conn->peer_id());
+                if (requests.empty() && !progress->blocks_received[block_index]) {
+                    progress->request_times[block_index] = TimePoint{};
+                    needs_resume = true;
+                }
+            }
+        }
+        if (needs_resume) {
+            piece_manager_->ensure_resume_piece_download(piece_idx);
+        }
+    }
+    co_return;
 }
 
 asio::awaitable<void> TorrentSession::on_disconnect(std::shared_ptr<PeerConnection> conn) {
@@ -1182,6 +1432,11 @@ asio::awaitable<void> TorrentSession::on_disconnect(std::shared_ptr<PeerConnecti
                     needs_resume = true;
                 }
             }
+            // Drop this peer from rejection history too (stale entries would
+            // otherwise keep excluding a peer that merely disconnected).
+            for (auto& rejected : progress->rejected_by) {
+                std::erase_if(rejected, [&](const auto& entry) { return entry.first == conn->peer_id(); });
+            }
         }
         if (needs_resume) {
             piece_manager_->ensure_resume_piece_download(piece_index);
@@ -1192,7 +1447,13 @@ asio::awaitable<void> TorrentSession::on_disconnect(std::shared_ptr<PeerConnecti
     // If a replacement peer also disconnects during send_request, catch the
     // exception and resume the piece through the normal path instead of letting
     // the exception destroy this coroutine (and the caller's message_loop).
-    for (const auto& req : conn->pending_requests()) {
+    // Iterate a snapshot: the live queue is mutated concurrently under
+    // pipeline_mutex_ by other coroutines (resumer send_request push_back,
+    // Choke drop_pending_requests clear, flush pop_front, send_cancel erase),
+    // so iterating the live deque across the co_awaits below is a
+    // use-after-free (dangling req reference → SEGV in on_disconnect.resume).
+    const auto pending = conn->pending_requests_snapshot();
+    for (const auto& req : pending) {
         auto progress = piece_manager_->in_progress_piece(req.index);
         if (!progress) {
             continue;
@@ -1232,6 +1493,7 @@ asio::awaitable<void> TorrentSession::on_disconnect(std::shared_ptr<PeerConnecti
     }
 
     peer_manager_->remove_connection(conn->peer_id());
+    peer_manager_->poke_choke_loop();
     piece_manager_->notify_one();
 }
 

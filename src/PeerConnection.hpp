@@ -26,6 +26,9 @@ class PeerManager;
 class PeerConnection: public std::enable_shared_from_this<PeerConnection> {
 public:
     using RequestSentHook = std::function<void(uint32_t index, uint32_t begin, uint32_t length, const PeerId& peer_id)>;
+    using InterestChangeHook = std::function<void()>;
+
+    void set_interest_change_hook(InterestChangeHook hook) noexcept { interest_change_hook_ = std::move(hook); }
 
     static asio::awaitable<std::shared_ptr<PeerConnection>> create(
         asio::io_context& io_context,
@@ -162,7 +165,30 @@ public:
     void flush_pending_requests();
     void on_request_completed(uint32_t length);
     void on_request_rejected(uint32_t length);
+    // True if requests are queued (unsent) waiting for a free pipeline slot.
+    bool has_pending_requests() const noexcept {
+        std::lock_guard lock(pipeline_mutex_);
+        return !pending_requests_.empty();
+    }
+    // Drops unsent queued requests. Called when the peer chokes us: those
+    // blocks are re-requested through the piece resume path instead, so the
+    // queue can't re-flood a peer that already refused us.
+    void drop_pending_requests() noexcept {
+        std::lock_guard lock(pipeline_mutex_);
+        pending_requests_.clear();
+    }
     const std::deque<RequestPayload>& pending_requests() const noexcept { return pending_requests_; }
+    // Thread-safe snapshot of the unsent request queue. on_disconnect must
+    // iterate across co_await suspension points; the live deque is mutated by
+    // other coroutines under pipeline_mutex_ (send_request push_back,
+    // flush_pending_requests pop_front, send_cancel erase, drop clear), so
+    // iterating the live reference races concurrent mutation (dangling
+    // iterator → SEGV). Elements are 12 bytes and the queue is bounded by the
+    // pipeline limits, so the copy is negligible.
+    std::deque<RequestPayload> pending_requests_snapshot() const {
+        std::lock_guard lock(pipeline_mutex_);
+        return pending_requests_;
+    }
 
     void set_upload_rate(uint64_t bps) noexcept;
     void set_download_rate(uint64_t bps) noexcept;
@@ -190,7 +216,7 @@ public:
         return pending_requests_.size();
     }
 
-    static constexpr uint64_t MAX_PIPELINE_BUFFER = 256 * 1024;
+    static constexpr uint64_t MAX_PIPELINE_BUFFER = 4 * 1024 * 1024;
 
     bool fast_extension_supported() const noexcept { return fast_extension_supported_; }
     void fast_extension_supported(bool val) noexcept { fast_extension_supported_ = val; }
@@ -224,9 +250,12 @@ protected:
 
     std::chrono::steady_clock::time_point last_data_received_{};
 
-    // Request pipelining
+    // Request pipelining. The old window (5 requests / 256 KiB in flight) kept
+    // throughput far below what peers can deliver over LAN/domestic links;
+    // qBittorrent pipelines dozens of blocks per connection. 64 requests of
+    // 16 KiB = ~1 MiB per peer in flight, capped by MAX_PIPELINE_BUFFER.
     std::deque<RequestPayload> pending_requests_;
-    size_t max_outstanding_requests_ = 5;
+    size_t max_outstanding_requests_ = 64;
     size_t outstanding_request_count_ = 0;
     uint64_t total_bytes_requested_ = 0;
     uint64_t total_bytes_received_ = 0;
@@ -257,6 +286,7 @@ private:
     std::vector<uint8_t> bitfield_;
     std::map<uint8_t, ExtendedMessageType> remote_extension_;
     RequestSentHook request_sent_hook_;
+    InterestChangeHook interest_change_hook_;
 
     std::atomic_bool am_choking_{true};
     std::atomic_bool peer_is_choking_{true};

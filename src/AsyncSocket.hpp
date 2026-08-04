@@ -8,7 +8,12 @@
 #include <boost/asio/use_awaitable.hpp>
 #include <boost/system/detail/error_code.hpp>
 #include <cstdint>
+#include <cstring>
+#include <deque>
+#include <memory>
+#include <mutex>
 #include <string>
+#include <vector>
 namespace asio = boost::asio;
 
 #include "Utils.hpp"
@@ -19,7 +24,7 @@ static constexpr uint32_t MAX_MESSAGE_SIZE = 10 * 1024 * 1024;
 class AsyncSocket {
 public:
     explicit AsyncSocket(asio::ip::tcp::socket socket) noexcept
-        : socket_(std::move(socket)) {}
+        : write_state_(std::make_shared<WriteQueueState>()), socket_(std::move(socket)) {}
 
     AsyncSocket(const AsyncSocket&) = delete;
     AsyncSocket& operator=(const AsyncSocket&) = delete;
@@ -33,8 +38,16 @@ public:
         LOGINFO("Successfully connected to {}:{}", host, port);
     }
 
+    // All writes (send_raw, send_message) funnel through a single per-socket
+    // write queue. The io_context runs on multiple threads, and several
+    // coroutines (message handlers, request flushes, keep-alive, choke loop,
+    // piece uploads) can initiate socket writes concurrently. Unserialized
+    // async_write calls interleave their frames on the wire, which peers
+    // (qBittorrent etc.) read as a corrupt length prefix and drop the
+    // connection within seconds. Serializing every frame guarantees atomic
+    // wire frames regardless of caller thread.
     asio::awaitable<void> send_raw(std::span<const std::byte> data) {
-        co_await asio::async_write(socket_, asio::buffer(data), asio::use_awaitable);
+        co_await enqueue_write(std::vector<std::byte>(data.begin(), data.end()));
     }
 
     asio::awaitable<std::vector<std::byte>> receive_raw(size_t size) {
@@ -44,20 +57,18 @@ public:
     }
 
     asio::awaitable<void> send_message(std::span<const std::byte> message) {
-        // keep-alive message
+        // keep-alive message (zero length prefix only)
         if (message.empty()) {
-            uint32_t zero_len = 0; // Already in host order, will be converted by buffer.
-            co_await asio::async_write(socket_, asio::buffer(&zero_len, sizeof(zero_len)), asio::use_awaitable);
+            co_await enqueue_write(std::vector<std::byte>(sizeof(uint32_t), std::byte{0}));
             co_return;
         }
 
         uint32_t length = asio::detail::socket_ops::host_to_network_long(static_cast<uint32_t>(message.size()));
 
-        std::array<asio::const_buffer, 2> buffer_sequence = {
-            asio::buffer(&length, sizeof(uint32_t)),
-            asio::buffer(message)
-        };
-        co_await asio::async_write(socket_, buffer_sequence, asio::use_awaitable);
+        std::vector<std::byte> frame(sizeof(uint32_t) + message.size());
+        std::memcpy(frame.data(), &length, sizeof(uint32_t));
+        std::copy(message.begin(), message.end(), frame.begin() + sizeof(uint32_t));
+        co_await enqueue_write(std::move(frame));
     }
 
     asio::awaitable<std::vector<std::byte>> receive_message() {
@@ -116,6 +127,96 @@ public:
     }
 
 private:
+    // A frame is fully built (length prefix + payload) before enqueueing, so
+    // the draining coroutine only ever issues one async_write at a time and
+    // wire frames can never interleave.
+    struct PendingWrite {
+        std::vector<std::byte> frame;
+        std::shared_ptr<boost::system::error_code> result;
+        std::shared_ptr<asio::steady_timer> waiter;
+    };
+
+    struct WriteQueueState {
+        std::mutex mutex;
+        std::deque<PendingWrite> queue;
+        bool writing = false;
+    };
+
+    asio::awaitable<void> enqueue_write(std::vector<std::byte> frame) {
+        auto result = std::make_shared<boost::system::error_code>();
+        auto waiter = std::make_shared<asio::steady_timer>(socket_.get_executor());
+        bool become_drain = false;
+        {
+            std::lock_guard lock(write_state_->mutex);
+            write_state_->queue.push_back(PendingWrite{std::move(frame), result, waiter});
+            if (!write_state_->writing) {
+                write_state_->writing = true;
+                become_drain = true;
+            }
+        }
+
+        if (become_drain) {
+            // This coroutine is the drain: it writes its own frame first, then
+            // keeps draining until the queue is empty (see drain_write_queue).
+            co_await drain_write_queue();
+            co_return;
+        }
+
+        // An active drain will write our frame and cancel our waiter.
+        boost::system::error_code ec;
+        co_await waiter->async_wait(asio::redirect_error(asio::use_awaitable, ec));
+        if (*result) {
+            throw boost::system::system_error(*result, "AsyncSocket write failed");
+        }
+    }
+
+    asio::awaitable<void> drain_write_queue() {
+        while (true) {
+            PendingWrite entry;
+            {
+                std::lock_guard lock(write_state_->mutex);
+                if (write_state_->queue.empty()) {
+                    write_state_->writing = false;
+                    co_return;
+                }
+                entry = std::move(write_state_->queue.front());
+                write_state_->queue.pop_front();
+            }
+
+            try {
+                co_await asio::async_write(socket_, asio::buffer(entry.frame), asio::use_awaitable);
+            } catch (const boost::system::system_error& e) {
+                fail_all_writes(e.code());
+                throw;
+            } catch (...) {
+                fail_all_writes(asio::error::operation_aborted);
+                throw;
+            }
+
+            // Signal the waiter. It must check *result for errors, but on the
+            // success path the error_code stays clear.
+            entry.waiter->cancel();
+        }
+    }
+
+    // Socket failed mid-drain: unblock every queued writer with the error and
+    // reset the queue so future sends start a fresh drain (and fail fast on
+    // the closed socket).
+    void fail_all_writes(const boost::system::error_code& ec) {
+        std::deque<PendingWrite> remaining;
+        {
+            std::lock_guard lock(write_state_->mutex);
+            remaining.swap(write_state_->queue);
+            write_state_->writing = false;
+        }
+        for (auto& pw : remaining) {
+            *pw.result = ec;
+            pw.waiter->cancel();
+        }
+    }
+
+    std::shared_ptr<WriteQueueState> write_state_;
+
     asio::ip::tcp::socket socket_;
 };
 

@@ -13,6 +13,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <unordered_set>
 #include <utility>
 
@@ -21,7 +22,11 @@
 #include "PeerConnection.hpp"
 
 static constexpr uint32_t IN_PROGRESS_RARITY_GROUP_ID = std::numeric_limits<uint32_t>::max();
-static constexpr auto BLOCK_REQUEST_TIMEOUT = std::chrono::seconds(30);
+// 30s was far too lenient: a block lost to a dead/snubbing peer cost half a
+// minute of pipeline stall, and with only 5 outstanding requests the whole
+// connection starved. 12s keeps the pipeline moving while tolerating normal
+// peer latency and burst scheduling.
+static constexpr auto BLOCK_REQUEST_TIMEOUT = std::chrono::seconds(12);
 
 class PieceManager : public std::enable_shared_from_this<PieceManager> {
 public:
@@ -71,9 +76,24 @@ public:
         std::lock_guard lock(mutex_);
         return pieces_by_rarity_; 
     };
-    void add_piece_availability(size_t piece_index, int32_t val) { 
-        assert(piece_index < state_->num_pieces());
+    // Locked deep copy of the rarity map for iteration. The underlying sets
+    // are mutated in place under mutex_ (update_piece_rarity), so iterating
+    // the shared snapshot without the lock races concurrent updates (same
+    // crash class as the in_progress_pieces_ iteration race).
+    std::map<size_t, std::vector<int>> snapshot_pieces_by_rarity() const {
         std::lock_guard lock(mutex_);
+        std::map<size_t, std::vector<int>> out;
+        for (const auto& [rarity, set] : *pieces_by_rarity_) {
+            out.emplace(rarity, std::vector<int>(set->begin(), set->end()));
+        }
+        return out;
+    }
+    void add_piece_availability(size_t piece_index, int32_t val) { 
+        std::lock_guard lock(mutex_);
+        // The vector may have been cleared by signal_shutdown() while a late
+        // HAVE/disconnect handler is still running — skip rather than assert
+        // on an out-of-bounds operator[] (the piece index itself is valid).
+        if (piece_index >= piece_availability_->size()) return;
         (*piece_availability_)[piece_index] += val; 
     }
 
@@ -90,19 +110,32 @@ public:
     asio::awaitable<void> check_and_enter_endgame();
     asio::awaitable<void> return_piece_to_queue(size_t piece_index);
 
+    // All three shared structures (in_progress_pieces_, pieces_by_rarity_,
+    // piece_availability_) are published as shared_ptr<const T> snapshots
+    // (e.g. TorrentSession::on_disconnect iterates *in_progress_pieces()).
+    // Mutations must therefore be copy-on-write: replace the shared_ptr with
+    // a new copy instead of mutating the shared object in place. In-place
+    // mutation raced concurrent snapshot iteration (std::map rebalancing
+    // during insert/erase) and crashed on_disconnect with a dangling
+    // iterator (SEGV at resume). The maps are tiny (<= max_in_progress_pieces
+    // entries), so the copies are cheap.
     template<typename... Args>
     void emplace_in_progress_pieces(Args... args) { 
         std::lock_guard lock(mutex_);
-        in_progress_pieces_->emplace(std::forward<Args>(args)...); 
+        auto new_map = std::make_shared<std::map<size_t, std::shared_ptr<InProgressPiece>>>(*in_progress_pieces_);
+        new_map->emplace(std::forward<Args>(args)...);
+        in_progress_pieces_ = std::move(new_map);
     }
     void remove_in_progress_piece(size_t piece_index) {
         assert(piece_index < state_->num_pieces());
         std::lock_guard lock(mutex_);
-        in_progress_pieces_->erase(piece_index);
+        auto new_map = std::make_shared<std::map<size_t, std::shared_ptr<InProgressPiece>>>(*in_progress_pieces_);
+        new_map->erase(piece_index);
+        in_progress_pieces_ = std::move(new_map);
     }
     void remove_all_in_progress_pieces() {
         std::lock_guard lock(mutex_);
-        in_progress_pieces_->clear();
+        in_progress_pieces_ = std::make_shared<std::map<size_t, std::shared_ptr<InProgressPiece>>>();
     }
 
     std::map<std::string, std::string> get_in_progress_for_resume() const;
@@ -120,6 +153,21 @@ public:
     // On timeout: calls the timeout callback (cancel) and re-requests from another peer.
     asio::awaitable<void> check_block_timeouts();
 
+    // Picks a peer to request `block_idx` of `piece_index` from.
+    // Excludes peers that recently REJECTED this block, peers already
+    // carrying an outstanding request for it (when exclude_outstanding), and
+    // the optional exclude_peer. Returns nullptr when no suitable peer exists.
+    // Random selection (instead of deterministic round-robin) prevents the
+    // same peer being re-targeted on every retry.
+    asio::awaitable<std::shared_ptr<PeerConnection>> pick_block_peer(
+        size_t piece_index, uint32_t block_idx, const PeerId* exclude_peer = nullptr,
+        bool exclude_outstanding = true);
+
+    // Records that `peer_id` rejected (or failed) block `block_idx` of
+    // `piece_index`. The peer is then excluded from re-requests for that block
+    // until the entry expires (InProgressPiece::kRejectedBlockTTL).
+    void record_block_rejection(size_t piece_index, uint32_t block_idx, const PeerId& peer_id);
+
     // Signal that shutdown is in progress (called by TorrentSession::stop())
     void signal_shutdown() noexcept {
         shutting_down_ = true;
@@ -132,17 +180,26 @@ public:
         block_timeout_callback_ = nullptr;
         // Free heap-allocated data structures immediately so memory is released
         // even if the PieceManager itself is not destroyed (e.g. due to reference
-        // cycles keeping TorrentSession alive past shutdown).
-        pieces_by_rarity_->clear();
-        piece_availability_->clear();
-        in_progress_pieces_->clear();
+        // cycles keeping TorrentSession alive past shutdown). Copy-on-write:
+        // replace, don't mutate in place (see emplace_in_progress_pieces).
+        pieces_by_rarity_ = std::make_shared<std::map<size_t, std::shared_ptr<std::unordered_set<int>>>>();
+        piece_availability_ = std::make_shared<std::vector<size_t>>();
+        in_progress_pieces_ = std::make_shared<std::map<size_t, std::shared_ptr<InProgressPiece>>>();
     }
+
+    // Runs all PieceManager state access (in_progress_pieces_, rng_, ...).
+    const auto& strand() const noexcept { return strand_; }
 
 private:
 
     asio::awaitable<bool> try_piece_download(size_t piece_index);
 
     asio::awaitable<void> block_timeout_loop();
+
+    // Expired entries are pruned; returns the surviving rejecting peer ids.
+    std::vector<PeerId> pruned_rejected_peers(const std::shared_ptr<InProgressPiece>& progress, uint32_t block_idx);
+
+    std::mt19937 rng_{std::random_device{}()};
 
     asio::io_context& io_context_;
     asio::strand<asio::io_context::executor_type> strand_;

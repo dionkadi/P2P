@@ -3,7 +3,10 @@
 #include "Bencode.hpp"
 #include <boost/asio/strand.hpp>
 #include <boost/beast.hpp>
+#include <atomic>
+#include <exception>
 #include <iostream>
+#include <thread>
 
 // Simple tracker that can be run in a separate thread
 class TestTracker {
@@ -691,12 +694,22 @@ TEST_F(IntegrationTest, RateLimiterAccuracy) {
 
     start_tracker();
 
-    // Seeder (unlimited)
+    // This test measures wall-clock transfer time against a tight budget
+    // (~4.4s). DHT/LSD bootstrap pings go to REAL internet nodes (250-300ms
+    // RTT) on the shared test io_context, and their scheduling noise corrupts
+    // the measurement (observed 14-20% variance vs the 10% tolerance) without
+    // any connection to rate-limiter behavior. Disable them here — the
+    // SessionHandle ctor spawns run() immediately, so this must happen before
+    // the handles are created.
     auto seeder = create_seeder(PEER_PORT_BASE);
+    seeder->set_enable_dht(false);
+    seeder->set_enable_lsd(false);
     SessionHandle seeder_handle(test_io, seeder, 120s);
 
     uint64_t download_rate_bps = 1024 * 1024; // 1 MB/s
     auto leecher = create_leecher(PEER_PORT_BASE + 1, 0, download_rate_bps);
+    leecher->set_enable_dht(false);
+    leecher->set_enable_lsd(false);
     auto start_time = std::chrono::steady_clock::now();
     SessionHandle leecher_handle(test_io, leecher, 120s);
     leecher_handle.wait();
@@ -1282,5 +1295,52 @@ TEST_F(TrackerDirectTest, ErrorResponse) {
     EXPECT_EQ(std::get<Integer>(resd.at("incomplete").get_variant()), 0);
     auto& peers_str = std::get<String>(resd.at("peers").get_variant());
     EXPECT_TRUE(peers_str.empty());
+}
+
+// Regression for a shutdown crash with the multi-tracker fan-out:
+// HttpTrackerClient::cancel() used to close the in-flight tcp_stream's
+// socket from the caller's thread while Beast's async_connect op was running
+// on an io thread. A cross-thread close of a socket with a pending async op
+// is UB (double deregister of the epoll descriptor state -> SEGV in
+// epoll_reactor::deregister_descriptor). It surfaced once ~80 HTTP/UDP
+// trackers announced concurrently and stop() cancelled them all at once.
+// cancel() must now unwind the connect op in-place via a cancellation
+// signal. The target below is a blackholed 10.0.0.0/8 address: the connect
+// stays pending until cancelled.
+TEST(CancellationTest, HttpAnnounceCancelMidConnect) {
+    for (int round = 0; round < 10; ++round) {
+        asio::io_context io;
+        auto client = create_tracker_client(io, "http://10.255.255.1:9/");
+        AnnounceRequestParams params;
+        params.info_hash_bytes = std::vector<std::byte>(20, std::byte{1});
+        params.peer_id = generate_peer_id();
+        params.port = 6881;
+        params.uploaded = params.downloaded = params.left = 0;
+
+        std::atomic<bool> completed{false};
+        std::exception_ptr ep;
+        asio::co_spawn(io, [&]() -> asio::awaitable<void> {
+            try {
+                co_await client->announce(params);
+            } catch (...) {
+                ep = std::current_exception();
+            }
+            completed = true;
+        }, asio::detached);
+
+        std::thread io_thread([&] { io.run(); });
+        // Let the connect go in-flight, then cancel from a foreign thread
+        // (as stop() does) while the io thread is inside async_connect.
+        std::this_thread::sleep_for(50ms);
+        client->cancel();
+        for (int i = 0; i < 200 && !completed; ++i) {
+            std::this_thread::sleep_for(10ms);
+        }
+        io_thread.join();
+        EXPECT_TRUE(completed) << "announce did not unwind after cancel()";
+        if (ep) {
+            EXPECT_THROW(std::rethrow_exception(ep), boost::system::system_error);
+        }
+    }
 }
 

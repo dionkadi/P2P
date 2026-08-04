@@ -146,6 +146,9 @@ public:
     asio::awaitable<void> announce_peer(InfoHash info_hash, uint16_t client_port);
     const NodeId& get_node_id() const { return my_node_id_; }
     uint16_t get_port() const { return socket_.local_endpoint().port(); }
+    // Number of entries in the routing table (for bootstrap-health checks:
+    // a tiny table means the initial bootstrap failed and should be retried).
+    size_t routing_table_size() const { return routing_table_.size(); }
     // Bootstrap function to discover initial nodes
     asio::awaitable<void> bootstrap(const std::vector<std::string>& bootstrap_nodes_addrs);
 
@@ -853,9 +856,10 @@ inline asio::awaitable<std::vector<EndPoint>> DHTNode::get_peers(InfoHash info_h
             discovered.size(), routing_table_.size(), nodes_to_query.size());
 
     std::set<NodeId> queried_nodes;
-    for (const auto& node : nodes_to_query) {
-        queried_nodes.insert(node.id);
-    }
+    // Nodes are inserted into queried_nodes when a query is actually
+    // spawned below, so response nodes and re-queued nodes are never
+    // queried twice. Do NOT pre-populate this set here: doing so makes
+    // every candidate appear already-queried and no queries get sent.
 
     for (int i = 0; i < 3; ++i) {
         if (shuting_down_) {
@@ -947,8 +951,8 @@ inline asio::awaitable<std::vector<EndPoint>> DHTNode::get_peers(InfoHash info_h
         std::vector<defered_t> current_queries;
         
         for (int i = 0; i < ALPHA && !nodes_to_query.empty(); ++i) {
-            auto node = nodes_to_query.back();
-            nodes_to_query.pop_back();
+            auto node = nodes_to_query.front();
+            nodes_to_query.erase(nodes_to_query.begin());
             if (node.id == my_node_id_ || queried_nodes.count(node.id)) {
                 continue;
             }
@@ -966,9 +970,12 @@ inline asio::awaitable<std::vector<EndPoint>> DHTNode::get_peers(InfoHash info_h
             auto it = std::find_if(nodes_to_query.begin(), nodes_to_query.end(), [&n](const auto& existing) {
                 return existing.id == n.id;
             });
+            // Skip nodes we have already queried (responses commonly
+            // re-list them), but do NOT mark freshly enqueued nodes as
+            // queried here - they must still be spawned in the next
+            // iteration. queried_nodes is populated at spawn time only.
             if (it == nodes_to_query.end() && !queried_nodes.count(n.id)) {
                 nodes_to_query.push_back(n);
-                queried_nodes.insert(n.id);
             }
         }
         for (const auto& peer_ep : current_peers) {

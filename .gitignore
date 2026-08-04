@@ -4,3 +4,6 @@ data
 .cache
 .vscode
 .omo
+*.torrent
+downloads
+coredump
