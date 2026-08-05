@@ -638,19 +638,34 @@ asio::awaitable<std::shared_ptr<PeerConnection>> PieceManager::pick_block_peer(
     auto available_peers = co_await get_available_peers_(piece_index);
 
     std::vector<std::shared_ptr<PeerConnection>> candidates;
+    std::vector<std::shared_ptr<PeerConnection>> proven;
+    auto now_ev = std::chrono::steady_clock::now();
     for (const auto& peer : available_peers) {
         if (exclude_peer && peer->peer_id() == *exclude_peer) continue;
         if (std::ranges::find(rejected, peer->peer_id()) != rejected.end()) continue;
         if (std::ranges::find(outstanding, peer->peer_id()) != outstanding.end()) continue;
         candidates.push_back(peer);
+        if (peer_activity_check_) {
+            auto last = peer_activity_check_(peer->peer_id());
+            if (last && now_ev - *last < kPrimaryEvidenceWindow) {
+                proven.push_back(peer);
+            }
+        }
     }
 
     if (candidates.empty()) {
         co_return nullptr;
     }
 
-    std::uniform_int_distribution<size_t> dist(0, candidates.size() - 1);
-    co_return candidates[dist(rng_)];
+    // Prefer delivery-proven peers: most unchoked peers have the piece but
+    // never send blocks (leechers), and a random pick lands on one ~197/200
+    // times — the recycling loop (choke -> resume -> random leecher -> 4s
+    // timeout -> re-pick, ~4/s) that floors throughput between seeder unchoke
+    // bursts. Only fall back to unproven candidates when no proven peer can
+    // serve this block (cold start, rare pieces).
+    auto& pick_from = proven.empty() ? candidates : proven;
+    std::uniform_int_distribution<size_t> dist(0, pick_from.size() - 1);
+    co_return pick_from[dist(rng_)];
 }
 
 asio::awaitable<std::shared_ptr<PeerConnection>> PieceManager::pick_block_peer_preferring_primary(
@@ -691,20 +706,31 @@ asio::awaitable<std::shared_ptr<PeerConnection>> PieceManager::pick_block_peer_p
         }
     }
 
-    // Fallback: random non-rejecting, non-outstanding peer.
+    // Fallback: random non-rejecting, non-outstanding peer, preferring
+    // delivery-proven peers (see pick_block_peer) to keep re-requests off the
+    // silent-leecher recycling path.
     std::vector<std::shared_ptr<PeerConnection>> candidates;
+    std::vector<std::shared_ptr<PeerConnection>> proven;
+    auto now_ev = std::chrono::steady_clock::now();
     for (const auto& peer : available_peers) {
         if (std::ranges::find(rejected, peer->peer_id()) != rejected.end()) continue;
         if (std::ranges::find(outstanding, peer->peer_id()) != outstanding.end()) continue;
         candidates.push_back(peer);
+        if (peer_activity_check_) {
+            auto last = peer_activity_check_(peer->peer_id());
+            if (last && now_ev - *last < kPrimaryEvidenceWindow) {
+                proven.push_back(peer);
+            }
+        }
     }
 
     if (candidates.empty()) {
         co_return nullptr;
     }
 
-    std::uniform_int_distribution<size_t> dist(0, candidates.size() - 1);
-    co_return candidates[dist(rng_)];
+    auto& pick_from = proven.empty() ? candidates : proven;
+    std::uniform_int_distribution<size_t> dist(0, pick_from.size() - 1);
+    co_return pick_from[dist(rng_)];
 }
 
 asio::awaitable<void> PieceManager::check_block_timeouts() {
@@ -775,7 +801,7 @@ asio::awaitable<void> PieceManager::check_block_timeouts() {
             if (!timed_out) continue;
 
             LOGWARN("Block {}/{} timed out after {}s. Cancelling and re-requesting.",
-                    piece_idx, block_idx, BLOCK_REQUEST_TIMEOUT.count());
+                    piece_idx, block_idx, std::chrono::duration_cast<std::chrono::seconds>(now - request_time).count());
 
             // Do NOT record_block_rejection here: a timeout is CONGESTION, not
             // hostility. The peer may simply be momentarily busy (the swarm
