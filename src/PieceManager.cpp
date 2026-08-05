@@ -204,9 +204,20 @@ asio::awaitable<bool> PieceManager::try_piece_download(size_t piece_index) {
     // the peer's FIFO had our block buried behind the rest of the swarm's
     // requests. A whole piece on one peer completes blocks back-to-back
     // (p -> 1 for that peer), and the resumer refills the SAME peer, keeping
-    // the deep queue continuous. Fall back to spreading only if no peer is
-    // available (cannot happen: caller checked available_peers is non-empty).
-    auto& primary = available_peers.front();
+    // the deep queue continuous.
+    //
+    // ROTATE the primary across the unchoked set: available_peers preserves
+    // get_all_connections() map order (lexicographic by peer id), so picking
+    // .front() gave EVERY window piece to one deterministic peer. When that
+    // peer is a persistent rejector (-BI4100/-DE211s/-DE220s sort before all
+    // -qB/-TR peers), its per-peer pipeline (512 blocks) overflows against a
+    // 64-piece window and it flushes hundreds of REJECTs at once, collapsing
+    // throughput (observed: 494 rejects in 40ms, 512 pieces/min -> 37/min).
+    // Rotating spreads the window over distinct primaries, each keeping its
+    // 16-deep queue, and bounds any single rejector's blast radius to ~1-2
+    // pieces. Atomic rotor so concurrent request_one_piece coroutines pick
+    // distinct indices.
+    auto& primary = available_peers[primary_rotor_.fetch_add(1, std::memory_order_relaxed) % available_peers.size()];
     {
         std::lock_guard lock(piece_progress->piece_mutex_);
         piece_progress->primary_peer = primary->peer_id();

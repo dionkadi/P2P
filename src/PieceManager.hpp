@@ -244,6 +244,19 @@ private:
 
     std::mt19937 rng_{std::random_device{}()};
 
+    // Rotating counter for whole-piece primary assignment. available_peers
+    // preserves get_all_connections() map order (lexicographic by peer id), so
+    // picking .front() deterministically gave EVERY window piece to the same
+    // peer (e.g. -BI4100/-DE211s/-DE220s sort before all -qB/-TR peers). When
+    // that peer is a persistent rejector, its pipeline overflows (per-peer cap
+    // 512 blocks vs a 64-piece window) and it flushes hundreds of REJECTs at
+    // once, collapsing throughput (observed: 494 rejects in 40ms, 512/min ->
+    // 37/min). Rotating the index across the unchoked set spreads the window
+    // over distinct primaries (each keeps its 16-deep queue), bounding any
+    // single rejector's blast radius to ~1-2 pieces. Atomic so concurrent
+    // request_one_piece coroutines pick distinct indices.
+    std::atomic<size_t> primary_rotor_{0};
+
     asio::io_context& io_context_;
     asio::strand<asio::io_context::executor_type> strand_;
     asio::steady_timer piece_request_trigger_;
