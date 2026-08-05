@@ -51,6 +51,20 @@ static constexpr auto BLOCK_REQUEST_TIMEOUT = std::chrono::seconds(4);
 static constexpr auto kPeerActivityWindow = std::chrono::seconds(30);
 static constexpr auto kHardRequestCap = std::chrono::seconds(60);
 
+// kPrimaryEvidenceWindow is the ELIGIBILITY window for the primary filter:
+// a peer that delivered a block within this window may own primary pieces.
+// Deliberately much longer than kPeerActivityWindow: the timeout deferral
+// must stay tight (30s bounds silent queues), but the filter should admit
+// every proven server, not just the currently-bursting subset. On an
+// oversubscribed shared seeder, peers deliver in 10-80s bursts; a 30s
+// eligibility window parked the 64-piece window on only the mid-burst
+// handful and the pool self-locked (evicted peers cannot re-evidence
+// without outstanding requests, and new pieces only go to evidenced peers)
+// -> 600-700 KB/s floor instead of 3-4 MB/s. 5 minutes admits all proven
+// servers while still excluding never-delivered leechers (whose contamination
+// caused the ~100 KB/s blind-rotation collapse).
+static constexpr auto kPrimaryEvidenceWindow = std::chrono::minutes(5);
+
 // libtorrent initial_picker_threshold: pick this many pieces RANDOMLY at the
 // start of a download instead of rarest-first, so a fresh leecher quickly
 // gains pieces it can upload — earning regular (non-optimistic) tit-for-tat

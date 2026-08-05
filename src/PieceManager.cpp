@@ -213,13 +213,16 @@ asio::awaitable<bool> PieceManager::try_piece_download(size_t piece_index) {
     // Concentrate the window on the proven servers — they get deep queues
     // (~4 pieces each = 64 blocks) spread across the actual workhorses. Silent
     // peers receive no primary assignment until they prove themselves; cold
-    // start falls back to the full rotor for the first pieces.
+    // start falls back to the full rotor for the first pieces. Eligibility
+    // uses kPrimaryEvidenceWindow (5 min), NOT the 30s kPeerActivityWindow
+    // used for timeout deferral — a peer between 40-80s bursts must stay
+    // eligible or the pool collapses onto the mid-burst subset.
     auto now_ev = std::chrono::steady_clock::now();
     std::vector<std::shared_ptr<PeerConnection>> evidenced;
     if (peer_activity_check_) {
         for (const auto& p : available_peers) {
             auto last = peer_activity_check_(p->peer_id());
-            if (last && now_ev - *last < kPeerActivityWindow) {
+            if (last && now_ev - *last < kPrimaryEvidenceWindow) {
                 evidenced.push_back(p);
             }
         }
