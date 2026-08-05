@@ -179,6 +179,13 @@ public:
     asio::awaitable<std::shared_ptr<PeerConnection>> pick_block_peer(
         size_t piece_index, uint32_t block_idx, const PeerId* exclude_peer = nullptr,
         bool exclude_outstanding = true);
+    // Picks a peer for a missing block, PREFERRING the piece's primary_peer
+    // (the deep-queue peer chosen at seed time) so its request queue stays
+    // continuously deep; falls back to a random peer only when the primary is
+    // choking, rejected this block, or already serving it.
+    asio::awaitable<std::shared_ptr<PeerConnection>> pick_block_peer_preferring_primary(
+        size_t piece_index, uint32_t block_idx, const std::shared_ptr<InProgressPiece>& progress,
+        bool exclude_outstanding = true);
 
     // Records that `peer_id` rejected (or failed) block `block_idx` of
     // `piece_index`. The peer is then excluded from re-requests for that block

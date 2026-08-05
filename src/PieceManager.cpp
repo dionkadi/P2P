@@ -57,7 +57,13 @@ asio::awaitable<void> PieceManager::downloader() {
         // in instead of having been locked too small (or flooded onto 1 peer).
         size_t unchoked = get_unchoked_count_ ? get_unchoked_count_() : 1;
         if (unchoked < 1) unchoked = 1;
-        max_in_progress_pieces = std::clamp<size_t>(unchoked * 2, 1, 32);
+        // One piece per unchoked peer (each piece now goes fully to a primary
+        // peer, so a piece == one serving peer's deep queue). Cap at 64 so we
+        // never spawn more in-flight requests than the pipeline gate (8 MiB per
+        // peer) or half-open pool can carry. The window is not the binding
+        // constraint today (in-flight ~124 << 512); it just needs to be >= the
+        // unchoked set so every serving peer gets a piece.
+        max_in_progress_pieces = std::clamp<size_t>(unchoked, 1, 64);
 
         size_t current_in_progress = in_progress_pieces()->size();
         if (current_in_progress < max_in_progress_pieces) {
@@ -191,23 +197,28 @@ asio::awaitable<bool> PieceManager::try_piece_download(size_t piece_index) {
     auto piece_progress = in_progress_piece(piece_index);
     uint32_t num_blocks = piece_progress->total_blocks;
 
-    // Seed a small bounded window at piece start instead of committing every
-    // block to the peers unchoked THIS instant. A fast-extension peer that is
-    // momentarily choking us REJECTs the whole committed batch at once (seen:
-    // all 16 blocks of a piece rejected in one timestamp), and the synchronous
-    // re-flood on each REJECT cascades it across peers. Requesting only a few
-    // blocks per peer lets the resume loop (one peer per missing block, runs
-    // on the strand, prunes rejected peers) fill the rest as pipeline slots
-    // free up — a momentary choke then costs a handful of blocks, not a piece.
-    size_t seed_per_peer = 2;
-    size_t seed_count = std::min<size_t>(num_blocks, available_peers.size() * seed_per_peer);
+    // Whole-piece assignment to a PRIMARY peer (qBittorrent model): give one
+    // serving peer a deep queue (all blocks of the piece) instead of spreading
+    // 2 blocks across every unchoked peer. Shallow 2-block queues made every
+    // request a 4s tail-latency gamble (~9 req/peer, 53% timeout rate), because
+    // the peer's FIFO had our block buried behind the rest of the swarm's
+    // requests. A whole piece on one peer completes blocks back-to-back
+    // (p -> 1 for that peer), and the resumer refills the SAME peer, keeping
+    // the deep queue continuous. Fall back to spreading only if no peer is
+    // available (cannot happen: caller checked available_peers is non-empty).
+    auto& primary = available_peers.front();
+    {
+        std::lock_guard lock(piece_progress->piece_mutex_);
+        piece_progress->primary_peer = primary->peer_id();
+    }
+    size_t seed_count = num_blocks;
     for (uint32_t block_idx = 0; block_idx < seed_count; ++block_idx) {
         uint32_t offset = block_idx * BLOCK_SIZE;
         uint32_t length = (block_idx == num_blocks - 1) 
             ? (piece_progress->data.size() - offset)
             : BLOCK_SIZE;
         
-        auto& peer_conn = available_peers[block_idx % available_peers.size()];
+        auto& peer_conn = primary;
 
         // Eager outstanding registration: the notify hook (record_request_sent)
         // only fires AFTER the async write completes, so without registering up
@@ -488,9 +499,16 @@ asio::awaitable<void> PieceManager::resume_piece_download(size_t piece_index) {
                     spawned_any = true;
                 }
             } else {
-                // Normal mode: one peer per block, skipping peers that already
-                // rejected it or are already serving it.
-                auto replacement = co_await pick_block_peer(piece_index, block_idx, nullptr, true);
+                // Normal mode: prefer the piece's PRIMARY peer (deep-queue
+                // model). The seed assigned the whole piece to one peer and
+                // recorded it in primary_peer; refilling the SAME peer keeps
+                // its request queue continuously deep so blocks complete
+                // back-to-back instead of each being a 4s tail-latency gamble
+                // buried behind the swarm's other requests. Fall back to a
+                // random peer only when the primary is choking, has rejected
+                // this block, or is already serving it.
+                auto replacement = co_await pick_block_peer_preferring_primary(
+                    piece_index, block_idx, piece_progress, true);
                 if (!replacement) continue;
                 // Register the block as outstanding BEFORE spawning the send.
                 // The notify hook (record_request_sent) only fires after the
@@ -599,6 +617,60 @@ asio::awaitable<std::shared_ptr<PeerConnection>> PieceManager::pick_block_peer(
     std::vector<std::shared_ptr<PeerConnection>> candidates;
     for (const auto& peer : available_peers) {
         if (exclude_peer && peer->peer_id() == *exclude_peer) continue;
+        if (std::ranges::find(rejected, peer->peer_id()) != rejected.end()) continue;
+        if (std::ranges::find(outstanding, peer->peer_id()) != outstanding.end()) continue;
+        candidates.push_back(peer);
+    }
+
+    if (candidates.empty()) {
+        co_return nullptr;
+    }
+
+    std::uniform_int_distribution<size_t> dist(0, candidates.size() - 1);
+    co_return candidates[dist(rng_)];
+}
+
+asio::awaitable<std::shared_ptr<PeerConnection>> PieceManager::pick_block_peer_preferring_primary(
+    size_t piece_index, uint32_t block_idx, const std::shared_ptr<InProgressPiece>& progress, bool exclude_outstanding)
+{
+    if (!progress || block_idx >= progress->total_blocks) {
+        co_return nullptr;
+    }
+
+    auto rejected = pruned_rejected_peers(progress, block_idx);
+
+    std::vector<PeerId> outstanding;
+    PeerId primary;
+    bool has_primary = false;
+    {
+        std::lock_guard lock(progress->piece_mutex_);
+        if (progress->primary_peer) {
+            primary = *progress->primary_peer;
+            has_primary = true;
+        }
+        if (exclude_outstanding && block_idx < progress->outstanding_requests.size()) {
+            outstanding = progress->outstanding_requests[block_idx];
+        }
+    }
+
+    auto available_peers = co_await get_available_peers_(piece_index);
+
+    // Prefer the piece's primary peer: it was chosen at seed time precisely to
+    // carry a deep, continuous queue for this piece. Only fall back to a random
+    // peer if the primary is not available (choked/disconnected), has rejected
+    // this block, or is already serving it.
+    if (has_primary) {
+        for (const auto& peer : available_peers) {
+            if (peer->peer_id() != primary) continue;
+            if (std::ranges::find(rejected, peer->peer_id()) != rejected.end()) continue;
+            if (std::ranges::find(outstanding, peer->peer_id()) != outstanding.end()) continue;
+            co_return peer;
+        }
+    }
+
+    // Fallback: random non-rejecting, non-outstanding peer.
+    std::vector<std::shared_ptr<PeerConnection>> candidates;
+    for (const auto& peer : available_peers) {
         if (std::ranges::find(rejected, peer->peer_id()) != rejected.end()) continue;
         if (std::ranges::find(outstanding, peer->peer_id()) != outstanding.end()) continue;
         candidates.push_back(peer);

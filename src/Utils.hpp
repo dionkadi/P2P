@@ -701,6 +701,13 @@ struct InProgressPiece {
     uint32_t total_blocks = 0;
     bool resume_task_active = false;
 
+    // The peer this piece is primarily requested from (whole-piece deep-queue
+    // model, matching qBittorrent's request_queue_size). The resumer prefers
+    // this peer for refills so requests complete back-to-back; falls back to
+    // pick_block_peer when the primary chokes, rejects, or is already serving
+    // the block. nullopt = no primary yet (resumer picks randomly).
+    std::optional<PeerId> primary_peer;
+
     std::vector<std::vector<PeerId>> outstanding_requests;
     std::vector<TimePoint> request_times;  // When each block was first requested (for timeout detection)
     // Peers that REJECTED a request for this block (PeerId -> rejection time).
