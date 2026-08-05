@@ -711,15 +711,14 @@ struct InProgressPiece {
     std::vector<std::vector<PeerId>> outstanding_requests;
     std::vector<TimePoint> request_times;  // When each block was first requested (for timeout detection)
     // Peers that REJECTED a request for this block (PeerId -> rejection time).
-    // Entries expire after kRejectedBlockTTL so a peer that was temporarily
-    // choked can be tried again later. Prevents the reject -> re-request same
-    // peer -> reject loop that previously burned hundreds of requests. 60s was
-    // too long: a peer that REJECTs because it momentarily choked us (fast-
-    // extension peers REJECT rather than queue when busy) stays barred for a
-    // full minute while the swarm re-fills around it, so the effective serving
-    // set shrinks and throughput decays. 15s still suppresses the hot loop but
-    // lets momentarily-busy peers back in quickly.
-    static constexpr std::chrono::seconds kRejectedBlockTTL{5s};
+    // Entries expire after kRejectedBlockTTL so a peer that rejected us can be
+    // tried again later. 60s is right for EXPLICIT REJECTS (a peer decision
+    // not to serve us): a short 5s window let the whole-piece primary
+    // re-eligibilize every cycle and recreate the reject -> re-hammer loop
+    // (517 REJECTs from one peer). Keep it long so a proven non-server stays
+    // out; the timeout path deliberately does NOT blacklist (congestion, not
+    // hostility), so healthy-but-busy peers are never frozen out.
+    static constexpr std::chrono::seconds kRejectedBlockTTL{60s};
     std::vector<std::vector<std::pair<PeerId, TimePoint>>> rejected_by;
 
     InProgressPiece(uint64_t piece_size): data(piece_size) {

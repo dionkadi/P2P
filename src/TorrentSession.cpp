@@ -1231,6 +1231,20 @@ asio::awaitable<void> TorrentSession::on_piece_rejected(std::shared_ptr<PeerConn
     co_await asio::dispatch(piece_manager_->strand(), asio::use_awaitable);
     piece_manager_->record_block_rejection(piece_index, block_index, conn->peer_id());
 
+    // DEMOTE the primary peer the moment it rejects ANY block of this piece.
+    // pick_block_peer_preferring_primary returns the primary for every block
+    // it hasn't individually rejected, so a single reject would otherwise let
+    // the resume pass re-send ALL sibling blocks back to the same peer — the
+    // reject -> re-hammer loop (observed: 517 REJECTs from one peer, 476 in a
+    // single second, after a 480-block whole-piece flood). Clearing primary_peer
+    // makes every remaining block fall through to the random non-rejecting
+    // selection, so the flood self-limits to one flush per peer.
+    if (progress->primary_peer && *progress->primary_peer == conn->peer_id()) {
+        std::lock_guard lock(progress->piece_mutex_);
+        progress->primary_peer.reset();
+        LOGINFO("Demoting primary peer {} for piece {} after reject.", conn->peer_id(), piece_index);
+    }
+
     // Defer the replacement to the resume loop instead of re-sending here:
     // on a choke-wave, one peer REJECTs many blocks at once and the old
     // inline pick+send fired a detached re-request per block into the same
