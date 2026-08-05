@@ -206,18 +206,27 @@ asio::awaitable<bool> PieceManager::try_piece_download(size_t piece_index) {
     // (p -> 1 for that peer), and the resumer refills the SAME peer, keeping
     // the deep queue continuous.
     //
-    // ROTATE the primary across the unchoked set: available_peers preserves
-    // get_all_connections() map order (lexicographic by peer id), so picking
-    // .front() gave EVERY window piece to one deterministic peer. When that
-    // peer is a persistent rejector (-BI4100/-DE211s/-DE220s sort before all
-    // -qB/-TR peers), its per-peer pipeline (512 blocks) overflows against a
-    // 64-piece window and it flushes hundreds of REJECTs at once, collapsing
-    // throughput (observed: 494 rejects in 40ms, 512 pieces/min -> 37/min).
-    // Rotating spreads the window over distinct primaries, each keeping its
-    // 16-deep queue, and bounds any single rejector's blast radius to ~1-2
-    // pieces. Atomic rotor so concurrent request_one_piece coroutines pick
-    // distinct indices.
-    auto& primary = available_peers[primary_rotor_.fetch_add(1, std::memory_order_relaxed) % available_peers.size()];
+    // PREFER primaries with DELIVERY EVIDENCE: only ~16 of the ~222 unchoked
+    // peers actually send blocks, and blind rotation parked ~48 of the 64
+    // window pieces on silent leecher primaries whose 16 blocks all
+    // batch-timeout at 4s (piece latencies 50-70s, ~100 KB/s instead of MB/s).
+    // Concentrate the window on the proven servers — they get deep queues
+    // (~4 pieces each = 64 blocks) spread across the actual workhorses. Silent
+    // peers receive no primary assignment until they prove themselves; cold
+    // start falls back to the full rotor for the first pieces.
+    auto now_ev = std::chrono::steady_clock::now();
+    std::vector<std::shared_ptr<PeerConnection>> evidenced;
+    if (peer_activity_check_) {
+        for (const auto& p : available_peers) {
+            auto last = peer_activity_check_(p->peer_id());
+            if (last && now_ev - *last < kPeerActivityWindow) {
+                evidenced.push_back(p);
+            }
+        }
+    }
+    auto& primary = evidenced.empty()
+        ? available_peers[primary_rotor_.fetch_add(1, std::memory_order_relaxed) % available_peers.size()]
+        : evidenced[primary_rotor_.fetch_add(1, std::memory_order_relaxed) % evidenced.size()];
     {
         std::lock_guard lock(piece_progress->piece_mutex_);
         piece_progress->primary_peer = primary->peer_id();
@@ -778,7 +787,14 @@ asio::awaitable<void> PieceManager::check_block_timeouts() {
                 co_await block_timeout_callback_(static_cast<uint32_t>(piece_idx), block_idx);
             }
 
-            auto replacement = co_await pick_block_peer(piece_idx, block_idx, nullptr, /*exclude_outstanding=*/true);
+            // Exclude the stalled peer(s) from the re-request: the timeout
+            // callback (send_cancel_for_block) clears the block's outstanding
+            // entries, which would otherwise make the just-stalled primary
+            // eligible again — the next pick would re-target the stall source
+            // and burn a 4s+REJECT+demote cycle per dead primary (observed:
+            // 12-16 REJECT batches right after each whole-piece batch timeout).
+            const PeerId* exclude = outstanding_ids.empty() ? nullptr : &outstanding_ids.front();
+            auto replacement = co_await pick_block_peer(piece_idx, block_idx, exclude, /*exclude_outstanding=*/true);
             if (replacement) {
                 uint32_t offset = block_idx * BLOCK_SIZE;
                 uint32_t length = (block_idx == piece_progress->total_blocks - 1)
