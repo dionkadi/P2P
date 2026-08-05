@@ -14,6 +14,7 @@
 #include <boost/url.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <clocale>
 #include <csignal>
 #include <cstddef>
@@ -21,6 +22,7 @@
 #include <cstdint>
 #include <exception>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <mutex>
 #include <optional>
@@ -820,6 +822,41 @@ int main(int argc, char* argv[]) {
 
     display.start();
 
+    // Per-second speed logger: appends "unix_ts download_bps upload_bps"
+    // to logs/speed.txt (aggregate across all torrents), so speed changes
+    // can be inspected over time instead of only in the live TUI.
+    std::thread speed_logger([&app, input_active]() {
+        std::filesystem::create_directories("logs");
+        std::ofstream out("logs/speed.txt", std::ios::app);
+        if (!out) return;
+        auto last = std::chrono::steady_clock::now();
+        uint64_t last_down = 0, last_up = 0;
+        bool first = true;
+        while (input_active->load()) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            uint64_t down = 0, up = 0;
+            for (const auto& [hash, session] : app.torrents()) {
+                auto st = session->get_state();
+                if (!st) continue;
+                down += st->total_bytes_downloaded();
+                up += st->total_bytes_uploaded();
+            }
+            auto now = std::chrono::steady_clock::now();
+            double dt = std::chrono::duration<double>(now - last).count();
+            if (!first && dt > 0 && down >= last_down) {
+                auto now_s = std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
+                out << now_s << " "
+                    << static_cast<uint64_t>((down - last_down) / dt) << " "
+                    << static_cast<uint64_t>((up - last_up) / dt) << "\n";
+                out.flush();
+            }
+            first = false;
+            last = now;
+            last_down = down;
+            last_up = up;
+        }
+    });
+
     int result;
     {
         CTRACK;
@@ -828,6 +865,9 @@ int main(int argc, char* argv[]) {
 
     display.stop();
     input_active->store(false);
+    if (speed_logger.joinable()) {
+        speed_logger.join();
+    }
     raw_tty.disable();
 
     app.save_state(state_path);
