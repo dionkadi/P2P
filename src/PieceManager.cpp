@@ -639,16 +639,25 @@ asio::awaitable<std::shared_ptr<PeerConnection>> PieceManager::pick_block_peer(
 
     std::vector<std::shared_ptr<PeerConnection>> candidates;
     std::vector<std::shared_ptr<PeerConnection>> proven;
+    std::vector<std::shared_ptr<PeerConnection>> fresh;
     auto now_ev = std::chrono::steady_clock::now();
     for (const auto& peer : available_peers) {
         if (exclude_peer && peer->peer_id() == *exclude_peer) continue;
         if (std::ranges::find(rejected, peer->peer_id()) != rejected.end()) continue;
         if (std::ranges::find(outstanding, peer->peer_id()) != outstanding.end()) continue;
         candidates.push_back(peer);
+        bool is_proven = false;
         if (peer_activity_check_) {
             auto last = peer_activity_check_(peer->peer_id());
             if (last && now_ev - *last < kPrimaryEvidenceWindow) {
                 proven.push_back(peer);
+                is_proven = true;
+            }
+        }
+        if (!is_proven) {
+            auto unchoked = peer->last_unchoke_time();
+            if (unchoked != std::chrono::steady_clock::time_point{} && now_ev - unchoked < kFreshUnchokeWindow) {
+                fresh.push_back(peer);
             }
         }
     }
@@ -663,7 +672,19 @@ asio::awaitable<std::shared_ptr<PeerConnection>> PieceManager::pick_block_peer(
     // timeout -> re-pick, ~4/s) that floors throughput between seeder unchoke
     // bursts. Only fall back to unproven candidates when no proven peer can
     // serve this block (cold start, rare pieces).
-    auto& pick_from = proven.empty() ? candidates : proven;
+    //
+    // A fraction of picks explores the fresh pool (recently unchoked, not yet
+    // proven) instead: without it the proven set can only shrink (choke,
+    // disconnect, 5-min expiry) while unproven peers get no requests, so
+    // newly-unchoked seeders can never deliver and join the set — a run locks
+    // into leecher recycling (observed: 820 KB/s peak, never MB/s; a run 3
+    // minutes later hit 3.3 MB/s only because it caught seeders at cold
+    // start). Exploration is block-level only — a silent peer costs one 4s
+    // timeout per pick, never a deep queue.
+    std::uniform_int_distribution<size_t> explore_dist(0, kDiscoveryExplorationDivisor - 1);
+    const auto& pick_from = (!fresh.empty() && explore_dist(rng_) == 0)
+        ? fresh
+        : (!proven.empty() ? proven : (!fresh.empty() ? fresh : candidates));
     std::uniform_int_distribution<size_t> dist(0, pick_from.size() - 1);
     co_return pick_from[dist(rng_)];
 }
@@ -708,18 +729,28 @@ asio::awaitable<std::shared_ptr<PeerConnection>> PieceManager::pick_block_peer_p
 
     // Fallback: random non-rejecting, non-outstanding peer, preferring
     // delivery-proven peers (see pick_block_peer) to keep re-requests off the
-    // silent-leecher recycling path.
+    // silent-leecher recycling path; a fraction of picks explores the fresh
+    // pool so newly-unchoked seeders can deliver and join the proven set.
     std::vector<std::shared_ptr<PeerConnection>> candidates;
     std::vector<std::shared_ptr<PeerConnection>> proven;
+    std::vector<std::shared_ptr<PeerConnection>> fresh;
     auto now_ev = std::chrono::steady_clock::now();
     for (const auto& peer : available_peers) {
         if (std::ranges::find(rejected, peer->peer_id()) != rejected.end()) continue;
         if (std::ranges::find(outstanding, peer->peer_id()) != outstanding.end()) continue;
         candidates.push_back(peer);
+        bool is_proven = false;
         if (peer_activity_check_) {
             auto last = peer_activity_check_(peer->peer_id());
             if (last && now_ev - *last < kPrimaryEvidenceWindow) {
                 proven.push_back(peer);
+                is_proven = true;
+            }
+        }
+        if (!is_proven) {
+            auto unchoked = peer->last_unchoke_time();
+            if (unchoked != std::chrono::steady_clock::time_point{} && now_ev - unchoked < kFreshUnchokeWindow) {
+                fresh.push_back(peer);
             }
         }
     }
@@ -728,7 +759,10 @@ asio::awaitable<std::shared_ptr<PeerConnection>> PieceManager::pick_block_peer_p
         co_return nullptr;
     }
 
-    auto& pick_from = proven.empty() ? candidates : proven;
+    std::uniform_int_distribution<size_t> explore_dist(0, kDiscoveryExplorationDivisor - 1);
+    const auto& pick_from = (!fresh.empty() && explore_dist(rng_) == 0)
+        ? fresh
+        : (!proven.empty() ? proven : (!fresh.empty() ? fresh : candidates));
     std::uniform_int_distribution<size_t> dist(0, pick_from.size() - 1);
     co_return pick_from[dist(rng_)];
 }

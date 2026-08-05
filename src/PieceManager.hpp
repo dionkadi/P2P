@@ -65,6 +65,18 @@ static constexpr auto kHardRequestCap = std::chrono::seconds(60);
 // caused the ~100 KB/s blind-rotation collapse).
 static constexpr auto kPrimaryEvidenceWindow = std::chrono::minutes(5);
 
+// Fresh-unchoke discovery: block-level picks spend 1/kDiscoveryExplorationDivisor
+// of requests on peers that unchoked us within kFreshUnchokeWindow but have not
+// yet delivered. Without this the proven set can only SHRINK (choke, disconnect,
+// 5-min expiry) — while any proven peer exists, unproven peers get no requests,
+// so newly-unchoked seeders can never deliver and join the set, and a run locks
+// into leecher recycling (observed: 820 KB/s peak, never MB/s; a run 3 minutes
+// later hit 3.3 MB/s only because it caught seeders at cold start). Exploration
+// is block-level only — never primary seeds — so a silent peer costs one 4s
+// timeout per pick, never a deep queue.
+static constexpr auto kFreshUnchokeWindow = std::chrono::seconds(15);
+static constexpr size_t kDiscoveryExplorationDivisor = 4;
+
 // libtorrent initial_picker_threshold: pick this many pieces RANDOMLY at the
 // start of a download instead of rarest-first, so a fresh leecher quickly
 // gains pieces it can upload — earning regular (non-optimistic) tit-for-tat

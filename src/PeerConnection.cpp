@@ -233,6 +233,7 @@ asio::awaitable<void> PeerConnection::message_loop() {
                 case MessageType::Unchoke: {
                     LOGDBG("Peer {} sent UNCHOKE. Setting peer_is_choking to false.", peer_id_);
                     peer_is_choking_.store(false, std::memory_order_relaxed);
+                    last_unchoke_time_ = std::chrono::steady_clock::now();
                     {
                         std::lock_guard lock(pipeline_mutex_);
                         flush_pending_requests();

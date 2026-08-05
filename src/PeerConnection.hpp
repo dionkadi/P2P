@@ -91,6 +91,8 @@ public:
 
     std::chrono::steady_clock::time_point last_data_received() const noexcept { return last_data_received_; }
     void last_data_received(std::chrono::steady_clock::time_point tp) noexcept { last_data_received_ = tp; }
+    std::chrono::steady_clock::time_point last_unchoke_time() const noexcept { return last_unchoke_time_; }
+    void last_unchoke_time(std::chrono::steady_clock::time_point tp) noexcept { last_unchoke_time_ = tp; }
     
     ExtendedMessageType extension_type(uint8_t index) const noexcept {
         std::lock_guard lock(mutex_);
@@ -254,6 +256,11 @@ protected:
     std::atomic_uint64_t bytes_uploaded_{0};
 
     std::chrono::steady_clock::time_point last_data_received_{};
+    // When this peer last unchoked us (epoch if never). Written on the
+    // message-loop thread, read on the PieceManager strand — same benign
+    // pattern as last_data_received_. Lets block picks discover freshly
+    // unchoked seeders before they have any delivery evidence.
+    std::chrono::steady_clock::time_point last_unchoke_time_{};
 
     // Request pipelining. The old window (5 requests / 256 KiB in flight) kept
     // throughput far below what peers can deliver over LAN/domestic links;
