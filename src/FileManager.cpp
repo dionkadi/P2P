@@ -212,12 +212,14 @@ std::filesystem::path FileManager::get_resume_file_path() const {
     const auto& data_file_path = state_->save_path();
     // Use the info_hash hex to make the resume file unique per torrent,
     // avoiding races when multiple single-file torrents use the same directory.
+    // The file is hidden (leading '.') and placed inside the torrent's own
+    // download folder, so it is CWD-independent and stays with the data.
     std::string hash_hex = Crypto::bytes_to_hex(state_->info_hash());
     std::filesystem::path p;
     if (info.files.size() > 1) {
-        p = data_file_path / info.name / (hash_hex + ".resume");
+        p = data_file_path / info.name / ("." + hash_hex + ".resume");
     } else {
-        p = data_file_path.parent_path() / (hash_hex + ".resume");
+        p = data_file_path / ("." + hash_hex + ".resume");
     }
     return p;
 }

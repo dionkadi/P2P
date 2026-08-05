@@ -454,7 +454,8 @@ int main(int argc, char* argv[]) {
 
         std::thread stdin_thread([&app, &input_buffer, &input_mutex, &command_log,
                                   input_active, port, &default_download_dir,
-                                  &cursor_pos, &cmd_history, &history_pos]() {
+                                  &cursor_pos, &cmd_history, &history_pos,
+                                  &state_path]() {
             while (input_active->load()) {
                 struct pollfd pfd = {STDIN_FILENO, POLLIN, 0};
                 int ret = poll(&pfd, 1, 16);
@@ -618,6 +619,11 @@ int main(int argc, char* argv[]) {
                             } else {
                                 app.remove_torrent(static_cast<size_t>(idx));
                                 command_log.info("Removed: " + session->get_display_name());
+                                // Persist the removal immediately so
+                                // client_state.bencode no longer lists the
+                                // torrent, even if the client is later killed
+                                // before the shutdown save.
+                                app.save_state(state_path);
                             }
                         }
                     } else {

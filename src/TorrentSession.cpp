@@ -1835,17 +1835,19 @@ asio::awaitable<void> TorrentSession::load_session_state(const ResumeData& data)
                 pieces_done_count, num_pieces));
         }
 
-        // Check file metadata
+        // Check file metadata: only invalidate pieces when the data file is
+        // actually MISSING (legitimate — its pieces are not on disk). We do
+        // NOT reset on mtime changes: last_write_time().time_since_epoch()
+        // is platform/clock-epoch dependent (negative here), and the resume
+        // mtime is snapshotted before the final data flush, so a comparison
+        // almost never matches across a restart — it silently wiped all
+        // progress (observed: "No valid progress found" after 681 pieces).
+        // The persisted have_bitfield is written atomically (temp+rename)
+        // and is the source of truth.
         if (!data.file_mtimes.empty()) {
             for (size_t file_idx = 0; file_idx < info.files.size(); ++file_idx) {
                 const auto &file_info = info.files[file_idx];
                 std::filesystem::path full_path = file_manager_->get_full_path_for_file(file_info);
-                const std::string file_key = file_info.path.string();
-
-                if (!data.file_mtimes.count(file_key)) {
-                    LOGWARN("File metadata missing for: {}", file_key);
-                    continue;
-                }
 
                 if (!std::filesystem::exists(full_path)) {
                     // Mark all pieces for this file as needed
@@ -1857,25 +1859,6 @@ asio::awaitable<void> TorrentSession::load_session_state(const ResumeData& data)
                         }
                     }
                     continue;
-                }
-
-                // Check modification time
-                try {
-                    auto saved_mtime = data.file_mtimes.at(file_key);
-                    auto current_mtime = std::filesystem::last_write_time(full_path).time_since_epoch().count();
-                    if (current_mtime != saved_mtime) {
-                        LOGWARN("File modification time changed for: {}", file_info.path.string());
-                        // Mark pieces as needed
-                        const auto& file_to_piece_map = *file_manager_->get_file_to_pieces_map(file_idx);
-                        for (size_t piece_idx : file_to_piece_map) {
-                            if (state_->piece_status(piece_idx) == PieceStatus::Have) {
-                                state_->piece_status(piece_idx, PieceStatus::Needed);
-                                --pieces_done_count;
-                            }
-                        }
-                    }
-                } catch (const std::exception& e) {
-                    LOGWARN("Could not check mtime for {}: {}", file_info.path.string(), e.what());
                 }
             }
         }
