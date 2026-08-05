@@ -108,7 +108,13 @@ public:
     }
     
     // Connection limit accessors
-    static constexpr size_t kUnchokeSlots = 4;
+    // Upload slots (peers WE unchoke). 4 was tuned for tiny swarms; with
+    // ~500 connections and a 512KB/s upload budget, 4 slots means we only
+    // reciprocate with 4 peers — the rest of the swarm (including leechers at
+    // our progress level who would tit-for-tat unchoke us) gets nothing from
+    // us, so our per-peer ranking decays and the throughput floor stays low.
+    // 12 lets us earn stable upload slots from a broader set (ora-3 verdict).
+    static constexpr size_t kUnchokeSlots = 12;
     size_t max_total_connections() const noexcept { return max_total_connections_; }
     size_t max_connections_per_ip() const noexcept { return max_connections_per_ip_; }
     size_t max_half_open_connections() const noexcept { return max_half_open_connections_; }

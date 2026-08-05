@@ -39,7 +39,16 @@ static constexpr auto BLOCK_REQUEST_TIMEOUT = std::chrono::seconds(4);
 // cancelling in-flight deliveries (the late-duplicate CANCEL storm). Blocks
 // whose owning peer is still delivering are NOT timed out. kHardRequestCap
 // bounds trickle peers that send something every <10s but never reach ours.
-static constexpr auto kPeerActivityWindow = std::chrono::seconds(10);
+//
+// 10s was too short: on an oversubscribed shared seeder, whole-piece
+// primaries deliver in 10-80s bursts (their per-connection share collapses
+// ~10x as the swarm grows), so a 10s window fired false batch timeouts,
+// cleared outstanding_requests, made the resumer re-request the same primary
+// -> duplicate REJECT -> demote -> 40-84s piece stalls (observed: 724
+// timeouts, 244 REJECTs, 20 demotes, all downstream of the timeout decision).
+// 30s matches the measured inter-burst cadence; kHardRequestCap (60s) still
+// bounds genuinely dead primaries.
+static constexpr auto kPeerActivityWindow = std::chrono::seconds(30);
 static constexpr auto kHardRequestCap = std::chrono::seconds(60);
 
 // libtorrent initial_picker_threshold: pick this many pieces RANDOMLY at the
