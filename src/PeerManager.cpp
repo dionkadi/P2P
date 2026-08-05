@@ -244,8 +244,17 @@ asio::awaitable<std::optional<AsyncSocket>> PeerManager::connect_to_peer(const s
                         *connect_timed_out = true;
                         bool expected = false;
                         if (socket_closed->compare_exchange_strong(expected, true)) {
-                            boost::system::error_code close_ec;
-                            raw_socket->close(close_ec);
+                            // cancel(), NOT close(): async_connect may be
+                            // mid-process on another io thread, and a
+                            // foreign-thread close races its per-endpoint
+                            // open/register (epoll_reactor::register_descriptor
+                            // SEGV — observed after raising the half-open cap
+                            // to 500 put ~500 concurrent connects in flight).
+                            // cancel() safely completes the in-flight op with
+                            // operation_aborted without touching the
+                            // descriptor registration.
+                            boost::system::error_code cancel_ec;
+                            raw_socket->cancel(cancel_ec);
                         }
                     }
                 });
@@ -262,6 +271,8 @@ asio::awaitable<std::optional<AsyncSocket>> PeerManager::connect_to_peer(const s
             if (ec || shutting_down_.load(std::memory_order_acquire)) {
                 bool expected = false;
                 if (socket_closed->compare_exchange_strong(expected, true)) {
+                    // The connect op is fully complete at this point (we
+                    // resumed after it), so closing here is safe.
                     if (raw_socket->is_open()) {
                         boost::system::error_code close_ec;
                         raw_socket->close(close_ec);
