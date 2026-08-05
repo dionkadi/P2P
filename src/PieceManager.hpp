@@ -65,17 +65,22 @@ static constexpr auto kHardRequestCap = std::chrono::seconds(60);
 // caused the ~100 KB/s blind-rotation collapse).
 static constexpr auto kPrimaryEvidenceWindow = std::chrono::minutes(5);
 
-// Fresh-unchoke discovery: block-level picks spend 1/kDiscoveryExplorationDivisor
-// of requests on peers that unchoked us within kFreshUnchokeWindow but have not
-// yet delivered. Without this the proven set can only SHRINK (choke, disconnect,
-// 5-min expiry) — while any proven peer exists, unproven peers get no requests,
-// so newly-unchoked seeders can never deliver and join the set, and a run locks
-// into leecher recycling (observed: 820 KB/s peak, never MB/s; a run 3 minutes
-// later hit 3.3 MB/s only because it caught seeders at cold start). Exploration
-// is block-level only — never primary seeds — so a silent peer costs one 4s
-// timeout per pick, never a deep queue.
+// Fresh-unchoke discovery: freshly-unchoked peers (last UNCHOKE within
+// kFreshUnchokeWindow, not yet delivery-proven) are admitted to BOTH the
+// primary pool (try_piece_download: evidenced ∪ fresh, whole-piece deep
+// queues) and a 1/kDiscoveryExplorationDivisor share of block-level picks.
+// The swarm unchokes us in ~5s-average windows; a fresh seeder's window is
+// only harvestable with a deep queue, and without it the proven set can only
+// SHRINK (choke, disconnect, 5-min expiry) — newly-unchoked seeders never
+// deliver and a run locks into leecher recycling (observed: 820 KB/s peak,
+// never MB/s; a run 3 minutes later hit 3.3 MB/s only because it caught
+// seeders at cold start). Fresh-primary contamination is bounded by the
+// proven-only primary preference (pick_block_peer_preferring_primary): a
+// silent fresh primary costs one 4s batch-timeout per piece. Exploration
+// stays block-level — a silent peer costs one 4s timeout per pick, never a
+// deep queue.
 static constexpr auto kFreshUnchokeWindow = std::chrono::seconds(15);
-static constexpr size_t kDiscoveryExplorationDivisor = 4;
+static constexpr size_t kDiscoveryExplorationDivisor = 8;
 
 // libtorrent initial_picker_threshold: pick this many pieces RANDOMLY at the
 // start of a download instead of rarest-first, so a fresh leecher quickly

@@ -217,19 +217,37 @@ asio::awaitable<bool> PieceManager::try_piece_download(size_t piece_index) {
     // uses kPrimaryEvidenceWindow (5 min), NOT the 30s kPeerActivityWindow
     // used for timeout deferral — a peer between 40-80s bursts must stay
     // eligible or the pool collapses onto the mid-burst subset.
+    //
+    // ADMIT freshly-unchoked peers too (evidenced ∪ fresh): the swarm unchokes
+    // us in ~5s-average windows, and a fresh seeder's window is only
+    // harvestable with a whole-piece deep queue — block-level exploration
+    // (1-in-8 single blocks) wastes it. Fresh-primary contamination is
+    // bounded by the proven-only preference in
+    // pick_block_peer_preferring_primary: once a fresh primary's batch times
+    // out or it chokes, the preference is skipped and blocks re-spread to
+    // proven/fresh peers — a silent leecher primary costs one 4s
+    // batch-timeout, never a permanently stuck piece.
     auto now_ev = std::chrono::steady_clock::now();
-    std::vector<std::shared_ptr<PeerConnection>> evidenced;
+    std::vector<std::shared_ptr<PeerConnection>> primary_pool;
     if (peer_activity_check_) {
         for (const auto& p : available_peers) {
+            bool is_proven = false;
             auto last = peer_activity_check_(p->peer_id());
             if (last && now_ev - *last < kPrimaryEvidenceWindow) {
-                evidenced.push_back(p);
+                primary_pool.push_back(p);
+                is_proven = true;
+            }
+            if (!is_proven) {
+                auto unchoked = p->last_unchoke_time();
+                if (unchoked != std::chrono::steady_clock::time_point{} && now_ev - unchoked < kFreshUnchokeWindow) {
+                    primary_pool.push_back(p);
+                }
             }
         }
     }
-    auto& primary = evidenced.empty()
+    auto& primary = primary_pool.empty()
         ? available_peers[primary_rotor_.fetch_add(1, std::memory_order_relaxed) % available_peers.size()]
-        : evidenced[primary_rotor_.fetch_add(1, std::memory_order_relaxed) % evidenced.size()];
+        : primary_pool[primary_rotor_.fetch_add(1, std::memory_order_relaxed) % primary_pool.size()];
     {
         std::lock_guard lock(piece_progress->piece_mutex_);
         piece_progress->primary_peer = primary->peer_id();
@@ -709,6 +727,30 @@ asio::awaitable<std::shared_ptr<PeerConnection>> PieceManager::pick_block_peer_p
         }
         if (exclude_outstanding && block_idx < progress->outstanding_requests.size()) {
             outstanding = progress->outstanding_requests[block_idx];
+        }
+    }
+
+    auto now = std::chrono::steady_clock::now();
+
+    // The primary preference applies only while the primary is PROVEN
+    // (delivered within kPrimaryEvidenceWindow). Fresh primaries (seeded via
+    // the evidenced ∪ fresh pool) must not keep capturing re-requests if they
+    // never deliver: once their batch times out or they choke, skip the
+    // preference and clear primary_peer so blocks re-spread to proven/fresh
+    // peers (mirrors the REJECT demote at TorrentSession.cpp:1250-1253). This
+    // bounds silent-leecher contamination from fresh primaries to one 4s
+    // batch-timeout per piece instead of a permanently stuck piece. A working
+    // fresh primary delivers its first block in <1s and flips proven before
+    // any resume pass needs the preference, so pick-time is a sufficient
+    // grace — no deadline state to manage.
+    if (has_primary && peer_activity_check_) {
+        auto last = peer_activity_check_(primary);
+        if (!last || now - *last >= kPrimaryEvidenceWindow) {
+            std::lock_guard lock(progress->piece_mutex_);
+            if (progress->primary_peer && *progress->primary_peer == primary) {
+                progress->primary_peer.reset();
+            }
+            has_primary = false;
         }
     }
 
