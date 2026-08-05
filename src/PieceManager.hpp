@@ -32,6 +32,16 @@ static constexpr uint32_t IN_PROGRESS_RARITY_GROUP_ID = std::numeric_limits<uint
 // tolerating normal peer latency and burst scheduling.
 static constexpr auto BLOCK_REQUEST_TIMEOUT = std::chrono::seconds(4);
 
+// Activity-aware timeout deferral (libtorrent request_queue_time semantics):
+// a peer that sent ANY block within this window is making progress — its
+// queue is just deep (whole-piece primaries sit 16-deep behind the swarm's
+// other clients), so the flat 4s budget would fire on healthy tail latency,
+// cancelling in-flight deliveries (the late-duplicate CANCEL storm). Blocks
+// whose owning peer is still delivering are NOT timed out. kHardRequestCap
+// bounds trickle peers that send something every <10s but never reach ours.
+static constexpr auto kPeerActivityWindow = std::chrono::seconds(10);
+static constexpr auto kHardRequestCap = std::chrono::seconds(60);
+
 // libtorrent initial_picker_threshold: pick this many pieces RANDOMLY at the
 // start of a download instead of rarest-first, so a fresh leecher quickly
 // gains pieces it can upload — earning regular (non-optimistic) tit-for-tat
@@ -42,6 +52,10 @@ class PieceManager : public std::enable_shared_from_this<PieceManager> {
 public:
     using GetAvailableCallback = std::function<asio::awaitable<std::vector<std::shared_ptr<PeerConnection>>>(size_t)>;
     using BlockTimeoutCallback = std::function<asio::awaitable<void>(uint32_t piece_index, uint32_t block_index)>;
+    // Returns the time this peer last delivered us a block (nullopt if never
+    // or unknown). Used by the timeout checker to defer re-requesting blocks
+    // whose owning peer is still actively serving (deep-queue tail latency).
+    using PeerActivityCheck = std::function<std::optional<TimePoint>(const PeerId&)>;
     using InProgressType = std::shared_ptr<const std::map<size_t, std::shared_ptr<InProgressPiece>>>;
     using AvailType = std::shared_ptr<const std::vector<size_t>>;
     using RarityType = std::shared_ptr<const std::map<size_t, std::shared_ptr<std::unordered_set<int>>>>;
@@ -165,6 +179,10 @@ public:
         std::lock_guard lock(mutex_);
         block_timeout_callback_ = std::move(cb); 
     }
+    void set_peer_activity_check(PeerActivityCheck cb) {
+        std::lock_guard lock(mutex_);
+        peer_activity_check_ = std::move(cb);
+    }
 
     // Scans all in-progress pieces for blocks whose request has exceeded BLOCK_REQUEST_TIMEOUT.
     // On timeout: calls the timeout callback (cancel) and re-requests from another peer.
@@ -202,6 +220,7 @@ public:
         // without clearing them TorrentSession never destructs → FileManager cache_ leaks.
         get_available_peers_ = nullptr;
         block_timeout_callback_ = nullptr;
+        peer_activity_check_ = nullptr;
         // Free heap-allocated data structures immediately so memory is released
         // even if the PieceManager itself is not destroyed (e.g. due to reference
         // cycles keeping TorrentSession alive past shutdown). Copy-on-write:
@@ -236,6 +255,7 @@ private:
     mutable std::mutex mutex_;
     GetAvailableCallback get_available_peers_;
     BlockTimeoutCallback block_timeout_callback_;
+    PeerActivityCheck peer_activity_check_;
     std::function<size_t()> get_unchoked_count_;
     std::atomic<bool> shutting_down_{false};
 };

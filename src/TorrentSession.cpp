@@ -350,6 +350,14 @@ asio::awaitable<void> TorrentSession::run() {
                                                      if (!self) co_return;
                                                      co_await self->send_cancel_for_block(piece_index, block_index, PeerId{});
                                                  });
+        piece_manager_->set_peer_activity_check([weak_cb](const PeerId& pid) -> std::optional<TimePoint> {
+            auto self = weak_cb.lock();
+            if (!self) return std::nullopt;
+            auto conn = self->peer_manager_->get_connection(pid);
+            if (!conn) return std::nullopt;
+            auto tp = conn->last_data_received();
+            return (tp == std::chrono::steady_clock::time_point{}) ? std::nullopt : std::optional<TimePoint>(tp);
+        });
         asio::co_spawn(io_context_, piece_manager_->downloader(), asio::detached);
         asio::co_spawn(strand_, periodically_save(), asio::detached);
         asio::co_spawn(strand_, peer_manager_->pex_loop(), asio::detached);

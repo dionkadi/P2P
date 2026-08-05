@@ -711,17 +711,42 @@ asio::awaitable<void> PieceManager::check_block_timeouts() {
             TimePoint request_time;
             bool already_received = false;
             bool timed_out = false;
+            std::vector<PeerId> outstanding_ids;
             {
                 std::lock_guard lock(piece_progress->piece_mutex_);
                 already_received = piece_progress->blocks_received[block_idx];
                 request_time = piece_progress->request_times[block_idx];
+                if (block_idx < piece_progress->outstanding_requests.size()) {
+                    outstanding_ids = piece_progress->outstanding_requests[block_idx];
+                }
             }
 
             if (already_received) continue;
             if (request_time == TimePoint{}) continue;
 
             if (now - request_time > BLOCK_REQUEST_TIMEOUT) {
-                timed_out = true;
+                // Activity-aware deferral (libtorrent request_queue_time): a
+                // block whose owning peer is STILL delivering data is not lost
+                // — it is queued behind that peer's backlog (whole-piece
+                // primaries sit 16-deep behind the swarm's other clients). The
+                // flat 4s budget fires on healthy tail latency, cancelling
+                // in-flight deliveries and spawning the late-duplicate CANCEL
+                // storm (621 CANCELs, 2088 REJECTs, 705 resume passes all
+                // downstream of fake timeouts). Only re-request when the owner
+                // has gone silent; kHardRequestCap bounds trickle peers.
+                bool still_active = false;
+                if (peer_activity_check_ && !outstanding_ids.empty()) {
+                    for (const auto& pid : outstanding_ids) {
+                        auto last = peer_activity_check_(pid);
+                        if (last && now - *last < kPeerActivityWindow) {
+                            still_active = true;
+                            break;
+                        }
+                    }
+                }
+                if (!still_active || now - request_time > kHardRequestCap) {
+                    timed_out = true;
+                }
             }
 
             if (!timed_out) continue;
@@ -742,7 +767,7 @@ asio::awaitable<void> PieceManager::check_block_timeouts() {
                 co_await block_timeout_callback_(static_cast<uint32_t>(piece_idx), block_idx);
             }
 
-            auto replacement = co_await pick_block_peer(piece_idx, block_idx, nullptr, /*exclude_outstanding=*/false);
+            auto replacement = co_await pick_block_peer(piece_idx, block_idx, nullptr, /*exclude_outstanding=*/true);
             if (replacement) {
                 uint32_t offset = block_idx * BLOCK_SIZE;
                 uint32_t length = (block_idx == piece_progress->total_blocks - 1)
