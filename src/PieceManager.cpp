@@ -4,7 +4,7 @@
 
 PieceManager::PieceManager(asio::io_context& io_context, std::shared_ptr<SessionState> state)
     : io_context_(io_context), strand_(asio::make_strand(io_context)),
-      piece_request_trigger_(io_context), block_timeout_timer_(io_context), state_(state) 
+      piece_request_trigger_(io_context), block_timeout_timer_(io_context), endgame_timer_(io_context), state_(state) 
 {
     const size_t num_pieces = state_->num_pieces();
     piece_availability_ = std::make_shared<std::vector<size_t>>();
@@ -58,6 +58,7 @@ asio::awaitable<void> PieceManager::downloader() {
 
         if (shutting_down_) break;
 
+        try {
         // Refit the in-flight window to the live unchoked set each wake. Each
         // UNCHOKE fires notify_one, so the window grows as the swarm staggers
         // in instead of having been locked too small (or flooded onto 1 peer).
@@ -96,20 +97,27 @@ asio::awaitable<void> PieceManager::downloader() {
                     }
                 }
                 std::vector<std::pair<PeerId, size_t>> entries(held.begin(), held.end());
-                size_t start_idx = primary_rotor_.fetch_add(1, std::memory_order_relaxed) % entries.size();
-                auto now_b = std::chrono::steady_clock::now();
-                for (size_t i = 0; i < entries.size(); ++i) {
-                    const auto& [peer, count] = entries[(start_idx + i) % entries.size()];
-                    if (count >= kMaxPiecesPerPrimary) continue;
-                    if (spawned_budget >= kMaxSpawnsPerWake) break;
-                    bool proven = false;
-                    if (peer_activity_check_) {
-                        auto last = peer_activity_check_(peer);
-                        proven = last && now_b - *last < kPrimaryEvidenceWindow;
+                if (!entries.empty()) {  // guard: % entries.size() with 0 is UB
+                    size_t start_idx = primary_rotor_.fetch_add(1, std::memory_order_relaxed) % entries.size();
+                    auto now_b = std::chrono::steady_clock::now();
+                    for (size_t i = 0; i < entries.size(); ++i) {
+                        const auto& [peer, count] = entries[(start_idx + i) % entries.size()];
+                        if (count >= kMaxPiecesPerPrimary) continue;
+                        if (spawned_budget >= kMaxSpawnsPerWake) break;
+                        bool proven = false;
+                        if (peer_activity_check_) {
+                            auto last = peer_activity_check_(peer);
+                            proven = last && now_b - *last < kPrimaryEvidenceWindow;
+                        }
+                        if (!proven) continue;
+                        // Lambda-wrapped: the co_spawn'd coroutine's synchronous
+                        // prefix runs on the executor — an exception kills only
+                        // this spawn, not the downloader loop.
+                        asio::co_spawn(io_context_, [self, peer]() -> asio::awaitable<void> {
+                            co_await self->try_seed_to_primary(peer);
+                        }, asio::detached);
+                        ++spawned_budget;
                     }
-                    if (!proven) continue;
-                    asio::co_spawn(io_context_, self->try_seed_to_primary(peer), asio::detached);
-                    ++spawned_budget;
                 }
             }
         }
@@ -123,7 +131,9 @@ asio::awaitable<void> PieceManager::downloader() {
             // Bound spawns per wake (budget fills + rotor fills combined).
             slots_to_fill = std::min(slots_to_fill, static_cast<int>(kMaxSpawnsPerWake - spawned_budget));
             for (int i = 0; i < slots_to_fill; ++i) {
-                asio::co_spawn(io_context_, self->request_one_piece(), asio::detached);
+                asio::co_spawn(io_context_, [self]() -> asio::awaitable<void> {
+                    co_await self->request_one_piece();
+                }, asio::detached);
             }
         }
 
@@ -164,6 +174,50 @@ asio::awaitable<void> PieceManager::downloader() {
                 throw ;
             }
         }
+        } catch (const std::exception& e) {
+            // The loop died silently before (a detached-co_spawn exception at
+            // needed=0 swallowed by asio::detached), taking the only endgame
+            // trigger with it — the final pieces stuck at 99.8% while the
+            // rest of the client ran. Self-heal: log and restart (no co_await
+            // allowed in a catch handler, so the restart is immediate).
+            LOGERR("Downloader loop died: {}. Restarting.", e.what());
+            asio::co_spawn(io_context_, self->downloader(), asio::detached);
+            co_return;
+        } catch (...) {
+            LOGERR("Downloader loop died with an unknown exception. Restarting.");
+            asio::co_spawn(io_context_, self->downloader(), asio::detached);
+            co_return;
+        }
+    }
+}
+
+asio::awaitable<void> PieceManager::endgame_watchdog() {
+    CTRACK_ASYNC("PieceManager::endgame_watchdog");
+    auto self = shared_from_this();
+    size_t last_completed = state_->completed_pieces();
+    auto last_completion_time = std::chrono::steady_clock::now();
+    while (!state_->is_download_complete() && !shutting_down_) {
+        try {
+            endgame_timer_.expires_after(std::chrono::seconds(1));
+            co_await endgame_timer_.async_wait(asio::use_awaitable);
+        } catch (const boost::system::system_error& e) {
+            if (e.code() != asio::error::operation_aborted) {
+                throw;
+            }
+            break;  // cancelled at shutdown
+        }
+        if (shutting_down_) break;
+
+        auto now_w = std::chrono::steady_clock::now();
+        size_t completed_now = state_->completed_pieces();
+        if (completed_now != last_completed) {
+            last_completed = completed_now;
+            last_completion_time = now_w;
+        }
+        bool stalled = now_w - last_completion_time > kEndgameStallTime;
+        if (!state_->is_in_endgame_mode()) {
+            co_await check_and_enter_endgame(stalled);
+        }
     }
 }
 
@@ -172,6 +226,7 @@ asio::awaitable<void> PieceManager::request_one_piece() {
     if (state_->is_download_complete()) {
         co_return;
     }
+    thread_local std::mt19937 rng{std::random_device{}()};
 
     // libtorrent initial_picker_threshold=4: the first few pieces are picked
     // RANDOMLY rather than rarest-first, so a fresh leecher quickly gains
@@ -191,7 +246,7 @@ asio::awaitable<void> PieceManager::request_one_piece() {
         );
         std::shuffle(
             random_candidates.begin(), random_candidates.end(),
-            std::mt19937{std::random_device{}()}
+            rng
         );
         for (size_t piece_index : random_candidates) {
             if (co_await try_piece_download(piece_index)) {
@@ -210,7 +265,7 @@ asio::awaitable<void> PieceManager::request_one_piece() {
         std::vector<int> candidates(piece_set.begin(), piece_set.end());
         std::shuffle(
             candidates.begin(), candidates.end(), 
-            std::mt19937{std::random_device{}()}
+            rng
         );
 
         for (size_t piece_index : candidates) {
@@ -234,7 +289,7 @@ asio::awaitable<void> PieceManager::request_one_piece() {
     if (!all_needed_pieces.empty()) {
         std::shuffle(
             all_needed_pieces.begin(), all_needed_pieces.end(),
-            std::mt19937{std::random_device{}()}
+            rng
         );
         
         for (size_t piece_index : all_needed_pieces) {
@@ -248,10 +303,21 @@ asio::awaitable<void> PieceManager::request_one_piece() {
 }
 
 asio::awaitable<bool> PieceManager::try_seed_to_primary(const PeerId& primary) {
+    // Early-out when nothing is Needed: with the budget-refill, at needed=0
+    // every budget spawn used to run its full synchronous prefix (the 11k-
+    // piece rarity-map copy + random_device constructions, no suspension)
+    // x up to 32/wake — an exception there propagated out of the downloader
+    // loop and asio::detached swallowed it, silently killing the loop
+    // (observed: endgame never fired at the 99.8% stall, rest of the
+    // client alive).
+    if (state_->needed_pieces() == 0) {
+        co_return false;
+    }
+    thread_local std::mt19937 rng{std::random_device{}()};
     for (const auto& [rarity, piece_set] : snapshot_pieces_by_rarity()) {
         if (rarity == 0) continue;  // Only actually-available pieces (rarity > 0)
         std::vector<int> candidates(piece_set.begin(), piece_set.end());
-        std::shuffle(candidates.begin(), candidates.end(), std::mt19937{std::random_device{}()});
+        std::shuffle(candidates.begin(), candidates.end(), rng);
         for (size_t piece_index : candidates) {
             if (co_await try_piece_download(piece_index, &primary)) {
                 co_return true;

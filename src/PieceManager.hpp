@@ -214,6 +214,12 @@ public:
     asio::awaitable<void> broadcast_outstanding_requests();
     
     asio::awaitable<void> downloader();  
+    // Independent endgame trigger: fires endgame on the count/stall
+    // conditions WITHOUT living inside the downloader loop — the loop died
+    // silently once (a detached-co_spawn exception at needed=0 swallowed by
+    // asio::detached), and with it the only endgame trigger, leaving the
+    // final pieces stuck at 99.8% with the rest of the client running.
+    asio::awaitable<void> endgame_watchdog();
     asio::awaitable<void> request_one_piece();
     asio::awaitable<void> check_and_enter_endgame(bool stalled = false);
     asio::awaitable<void> return_piece_to_queue(size_t piece_index);
@@ -298,6 +304,7 @@ public:
     void signal_shutdown() noexcept {
         shutting_down_ = true;
         block_timeout_timer_.cancel();
+        endgame_timer_.cancel();
         piece_request_trigger_.cancel();
         std::lock_guard lock(mutex_);
         // Break shared_ptr cycle: callbacks capture shared_from_this() of TorrentSession;
@@ -360,6 +367,7 @@ private:
     asio::strand<asio::io_context::executor_type> strand_;
     asio::steady_timer piece_request_trigger_;
     asio::steady_timer block_timeout_timer_;
+    asio::steady_timer endgame_timer_;
     std::shared_ptr<std::map<size_t, std::shared_ptr<InProgressPiece>>> in_progress_pieces_;
     std::shared_ptr<std::vector<size_t>> piece_availability_;
     std::shared_ptr<std::map<size_t, std::shared_ptr<std::unordered_set<int>>>> pieces_by_rarity_;

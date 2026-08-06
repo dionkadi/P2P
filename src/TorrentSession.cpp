@@ -359,6 +359,7 @@ asio::awaitable<void> TorrentSession::run() {
             return (tp == std::chrono::steady_clock::time_point{}) ? std::nullopt : std::optional<TimePoint>(tp);
         });
         asio::co_spawn(io_context_, piece_manager_->downloader(), asio::detached);
+        asio::co_spawn(io_context_, piece_manager_->endgame_watchdog(), asio::detached);
         asio::co_spawn(strand_, periodically_save(), asio::detached);
         asio::co_spawn(strand_, peer_manager_->pex_loop(), asio::detached);
     }
