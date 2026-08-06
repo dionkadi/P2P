@@ -362,7 +362,14 @@ asio::awaitable<void> PieceManager::check_and_enter_endgame() {
             return status == PieceStatus::Needed || status == PieceStatus::InProgress;
     });
 
-    if (needed_count > 0 && needed_count < state_->num_pieces() * 0.1) {
+    // Endgame redundancy only for the true tail: the 10% threshold fired at
+    // 92.4% completion (840 of 11134 pieces = 215 MB still to go), flooding
+    // every unchoked peer with duplicate requests for all 840 pieces —
+    // observed 13,151 REJECTs and the last 11 pieces stuck missing their
+    // final blocks while the flood kept them blacklisted at 99.9%. Cap the
+    // trigger at 64 pieces (a bounded redundancy window for the real tail).
+    size_t endgame_threshold = std::min<size_t>(state_->num_pieces() / 10, 64);
+    if (needed_count > 0 && needed_count < endgame_threshold) {
         LOGINFO("🎉 All pieces requested. Entering ENDGAME MODE. 🎉");
         state_->is_in_endgame_mode(true);
         asio::co_spawn(io_context_, self->broadcast_outstanding_requests(), asio::detached);
