@@ -126,15 +126,8 @@ asio::awaitable<void> PieceManager::request_one_piece() {
     }
     if (have_chain) {
         LOGDBG("Chain: popped completing primary {}", chain_primary);
-        for (const auto& [rarity, piece_set] : snapshot_pieces_by_rarity()) {
-            if (rarity == 0) continue;  // Only actually-available pieces (rarity > 0)
-            std::vector<int> candidates(piece_set.begin(), piece_set.end());
-            std::shuffle(candidates.begin(), candidates.end(), std::mt19937{std::random_device{}()});
-            for (size_t piece_index : candidates) {
-                if (co_await try_piece_download(piece_index, &chain_primary)) {
-                    co_return;
-                }
-            }
+        if (co_await try_seed_to_primary(chain_primary)) {
+            co_return;
         }
         // No needed piece available on the chained primary (it may lack the
         // remaining rare pieces or got choked) — fall through to the normal
@@ -214,6 +207,38 @@ asio::awaitable<void> PieceManager::request_one_piece() {
     }
 
     LOGDBG("No available and needed pieces to download from any unchoked peer right now.");
+}
+
+asio::awaitable<bool> PieceManager::try_seed_to_primary(const PeerId& primary) {
+    for (const auto& [rarity, piece_set] : snapshot_pieces_by_rarity()) {
+        if (rarity == 0) continue;  // Only actually-available pieces (rarity > 0)
+        std::vector<int> candidates(piece_set.begin(), piece_set.end());
+        std::shuffle(candidates.begin(), candidates.end(), std::mt19937{std::random_device{}()});
+        for (size_t piece_index : candidates) {
+            if (co_await try_piece_download(piece_index, &primary)) {
+                co_return true;
+            }
+        }
+    }
+    co_return false;
+}
+
+asio::awaitable<void> PieceManager::engage_unchoked_peer_impl(PeerId peer) {
+    CTRACK_ASYNC("PieceManager::engage_unchoked_peer_impl");
+    if (state_->is_download_complete() || state_->is_in_endgame_mode()) {
+        co_return;
+    }
+    if (co_await try_seed_to_primary(peer)) {
+        LOGDBG("Engage: seeded a piece to freshly-unchoked peer {}", peer);
+    }
+}
+
+void PieceManager::engage_unchoked_peer(const PeerId& peer_id) noexcept {
+    if (state_->is_download_complete() || state_->is_in_endgame_mode()) {
+        return;
+    }
+    auto self = shared_from_this();
+    asio::co_spawn(io_context_, self->engage_unchoked_peer_impl(peer_id), asio::detached);
 }
 
 asio::awaitable<bool> PieceManager::try_piece_download(size_t piece_index, const PeerId* preferred) {

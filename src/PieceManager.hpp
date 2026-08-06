@@ -329,9 +329,26 @@ public:
         pending_chains_.push_back(std::move(peer_id));
     }
 
+    // Engage an unchoked peer immediately: seed it ONE piece right away
+    // (try_piece_download with it as preferred) instead of waiting for the
+    // pool rotation, which reaches a fresh unchoke only every ~20-40s —
+    // each unchoke wave's window (avg ~5s) was half-wasted, producing 15s
+    // sub-500 KB/s valleys while the swarm actively unchoked us (measured:
+    // churn flowing during a valley — engagement latency, not silence).
+    // One piece per unchoke event; silent leechers cost one 4s batch
+    // timeout (bounded by B'). Skipped in endgame (broadcast covers it).
+    void engage_unchoked_peer(const PeerId& peer_id) noexcept;
+
 private:
 
     asio::awaitable<bool> try_piece_download(size_t piece_index, const PeerId* preferred = nullptr);
+
+    // Rarity-scan for a piece `primary` can serve, seeding it via the
+    // preferred-primary path (used by the chain-refill pop and the unchoke
+    // engagement). Returns true if a piece was seeded.
+    asio::awaitable<bool> try_seed_to_primary(const PeerId& primary);
+
+    asio::awaitable<void> engage_unchoked_peer_impl(PeerId peer);
 
     asio::awaitable<void> block_timeout_loop();
 
