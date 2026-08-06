@@ -89,30 +89,28 @@ static constexpr auto kPrimaryEvidenceWindow = std::chrono::minutes(5);
 static constexpr auto kFreshUnchokeWindow = std::chrono::seconds(45);
 static constexpr size_t kDiscoveryExplorationDivisor = 8;
 
-// Chain-refill gate: (kChainDivisor-1)/kChainDivisor of piece completions
-// re-seed the completing primary (push-side gate in TorrentSession). The
-// duty cycle (fraction of time a server holds a full queue) is
-// chain-dominated: duty ~= p + (1-p)*S/P, p = chain fraction, S = serving
-// set, P = pool. p=1/3 gave ~0.39 (measured ~30% duty, the KB/s valleys);
-// p=2/3 gives ~0.7. Full chaining (p=1) froze the pool (every freed slot
-// chain-consumed, rotor starved) — at 2/3 the rotor keeps 1/3 of fills
-// (~1.67/s) so onboarding continues. The 1/2+hot-tier regression (806 vs
-// 1171 KB/s) was the hot-tier's 60s cutoff excluding 10-80s-burst servers,
-// not the chain rate.
-static constexpr size_t kChainDivisor = 3;
-
 // In-flight window: kPiecesPerPeer whole pieces per currently-unchoked peer,
 // decoupled from the unchoked count. The old 1:1 formula capped in-flight at
 // the instant-unchoked set, so each primary held ONE piece and idled ~7s
 // between pieces (queue-empty -> snub-choke -> churn). Depth 4 = ~29s of
 // continuous queue per server: unchokes hold and the serving set grows.
-// Clamped to kMaxInFlightPieces; the per-peer pipeline gate (500 requests /
-// 8 MiB, PeerConnection.cpp:411-416) carries 128*16 blocks easily (~82
-// blocks/server over 25 servers). Cold start: 1 unchoked peer -> 4 pieces =
+// Clamped to kMaxInFlightPieces — the budget-refill (kMaxPiecesPerPrimary
+// per evidenced server) needs S x budget <= window: ~52 servers x 4 = 208,
+// hence 256. The per-peer pipeline gate (500 requests / 8 MiB,
+// PeerConnection.cpp:411-416) carries 256*16 blocks easily (~102
+// blocks/server over 40 servers). Cold start: 1 unchoked peer -> 4 pieces =
 // 64 blocks (8x smaller than the old 512-block flood), scaling up as the
 // swarm staggers in.
 static constexpr size_t kPiecesPerPeer = 4;
-static constexpr size_t kMaxInFlightPieces = 128;
+static constexpr size_t kMaxInFlightPieces = 256;
+
+// Budget-refill: the maximum in-flight whole pieces per evidenced primary.
+// The downloader refills every evidenced primary below this budget each
+// wake (try_seed_to_primary), so a draining server is refilled within one
+// wake — duty ~100% by construction. This replaces the chain-refill gate,
+// whose effective fraction was throttled by the queue cap + per-wake rotor
+// floods (the chain-rate experiments never moved the valleys).
+static constexpr size_t kMaxPiecesPerPrimary = 4;
 
 // Bound fill spawns per downloader wake: a drained window could otherwise
 // spawn (128 - 0) fills per wake ~ 640/s (each ~50-200us of rarity-map copy
@@ -311,23 +309,6 @@ public:
     // Runs all PieceManager state access (in_progress_pieces_, rng_, ...).
     const auto& strand() const noexcept { return strand_; }
 
-    // Chain-refill: queue a primary whose piece just completed so the next
-    // piece is seeded to the SAME peer (request_one_piece pops it and uses it
-    // as try_piece_download's preferred primary). Keeps the primary's request
-    // queue continuously deep: without it a primary serves its one 16-block
-    // piece in ~1-2s then idles 6-7s with an EMPTY queue while the rotor
-    // spreads the next pieces elsewhere, and seeders choke rate-zero peers
-    // (~4.9s avg unchoke window == the drain+idle cycle; qBittorrent holds
-    // unchokes because its per-peer queues never drain). Cap bounds the
-    // queue; drop-oldest on overflow.
-    void push_chain_primary(PeerId peer_id) noexcept {
-        std::lock_guard lock(mutex_);
-        if (pending_chains_.size() >= kMaxPendingChains) {
-            pending_chains_.pop_front();
-        }
-        pending_chains_.push_back(std::move(peer_id));
-    }
-
     // Engage an unchoked peer: re-request the missing blocks of ALL
     // in-progress pieces so the freshly-unchoked peer (if it has them) can
     // serve them. A stuck piece's blocks go DARK (no outstanding request,
@@ -366,9 +347,6 @@ private:
     // single rejector's blast radius to ~1-2 pieces. Atomic so concurrent
     // request_one_piece coroutines pick distinct indices.
     std::atomic<size_t> primary_rotor_{0};
-
-    static constexpr size_t kMaxPendingChains = 4;
-    std::deque<PeerId> pending_chains_;
 
     asio::io_context& io_context_;
     asio::strand<asio::io_context::executor_type> strand_;

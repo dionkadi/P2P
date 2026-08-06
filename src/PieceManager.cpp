@@ -68,17 +68,54 @@ asio::awaitable<void> PieceManager::downloader() {
         // flood); the window scales up as the swarm staggers in.
         max_in_progress_pieces = std::clamp<size_t>(unchoked * kPiecesPerPeer, 8, kMaxInFlightPieces);
 
+        // Budget-refill (qB model at piece granularity): count the in-flight
+        // pieces each primary holds; every EVIDENCED primary below
+        // kMaxPiecesPerPrimary gets a fill preferring it, so a draining
+        // server is refilled within one wake — duty ~100% by construction
+        // (the chain gate's effective fraction was throttled by the queue
+        // cap + per-wake rotor floods, which is why the chain-rate
+        // experiments never moved the valleys). Unproven holders (leecher
+        // primaries) get no refill — their pieces stall and B' demotes
+        // them. The remaining free slots go to the rotor for onboarding.
+        // The iteration starts at a rotor offset so no primary starves.
+        size_t spawned_budget = 0;
+        {
+            auto pieces = in_progress_pieces();
+            if (pieces && !pieces->empty()) {
+                std::map<PeerId, size_t> held;
+                for (const auto& [idx, prog] : *pieces) {
+                    std::lock_guard lock(prog->piece_mutex_);
+                    if (prog->primary_peer) {
+                        ++held[*prog->primary_peer];
+                    }
+                }
+                std::vector<std::pair<PeerId, size_t>> entries(held.begin(), held.end());
+                size_t start_idx = primary_rotor_.fetch_add(1, std::memory_order_relaxed) % entries.size();
+                auto now_b = std::chrono::steady_clock::now();
+                for (size_t i = 0; i < entries.size(); ++i) {
+                    const auto& [peer, count] = entries[(start_idx + i) % entries.size()];
+                    if (count >= kMaxPiecesPerPrimary) continue;
+                    if (spawned_budget >= kMaxSpawnsPerWake) break;
+                    bool proven = false;
+                    if (peer_activity_check_) {
+                        auto last = peer_activity_check_(peer);
+                        proven = last && now_b - *last < kPrimaryEvidenceWindow;
+                    }
+                    if (!proven) continue;
+                    asio::co_spawn(io_context_, self->try_seed_to_primary(peer), asio::detached);
+                    ++spawned_budget;
+                }
+            }
+        }
+
         size_t current_in_progress = in_progress_pieces()->size();
         if (current_in_progress < max_in_progress_pieces) {
             slots_to_fill = std::min(max_in_progress_pieces - current_in_progress, state_->needed_pieces());
         }
 
         if (slots_to_fill > 0) {
-            // Bound spawns per wake: a drained window could otherwise spawn
-            // (128 - 0) fills per wake ~ 640/s (each ~50-200us of rarity-map
-            // copy + shuffle). 32 x ~5 wakes/s = 160 attempts/s is ~80x the
-            // ~2 completions/s and costs nothing.
-            slots_to_fill = std::min(slots_to_fill, static_cast<int>(kMaxSpawnsPerWake));
+            // Bound spawns per wake (budget fills + rotor fills combined).
+            slots_to_fill = std::min(slots_to_fill, static_cast<int>(kMaxSpawnsPerWake - spawned_budget));
             for (int i = 0; i < slots_to_fill; ++i) {
                 asio::co_spawn(io_context_, self->request_one_piece(), asio::detached);
             }
@@ -117,32 +154,6 @@ asio::awaitable<void> PieceManager::request_one_piece() {
     CTRACK_ASYNC("PieceManager::request_one_piece");
     if (state_->is_download_complete()) {
         co_return;
-    }
-
-    // Chain-refill: a primary whose piece just completed is queued; seed its
-    // next piece to the SAME peer so its queue never drains (seeders choke
-    // rate-zero peers — the ~4.9s avg unchoke window == drain+idle cycle).
-    // Folded into the slot-fill path so the chain consumes exactly the window
-    // slot freed by the completion instead of racing the rotor.
-    PeerId chain_primary;
-    bool have_chain = false;
-    {
-        std::lock_guard lock(mutex_);
-        if (!pending_chains_.empty()) {
-            chain_primary = pending_chains_.front();
-            pending_chains_.pop_front();
-            have_chain = true;
-        }
-    }
-    if (have_chain) {
-        LOGDBG("Chain: popped completing primary {}", chain_primary);
-        if (co_await try_seed_to_primary(chain_primary)) {
-            co_return;
-        }
-        // No needed piece available on the chained primary (it may lack the
-        // remaining rare pieces or got choked) — fall through to the normal
-        // rotor-based selection below.
-        LOGDBG("Chain: no piece available on primary {}; rotor fallback", chain_primary);
     }
 
     // libtorrent initial_picker_threshold=4: the first few pieces are picked

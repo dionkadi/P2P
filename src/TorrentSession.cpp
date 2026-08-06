@@ -1118,11 +1118,9 @@ asio::awaitable<void> TorrentSession::on_piece_block(std::shared_ptr<PeerConnect
         auto expected_hash = std::vector<std::byte>(state_->torrent_info().pieces.begin() + piece_index * 20, state_->torrent_info().pieces.begin() + (piece_index * 20 + 20));
         // Lock just for reading progress->data during hash calculation (co_await-free)
         std::vector<std::byte> piece_data;
-        std::optional<PeerId> completing_primary;
         {
             std::lock_guard lock(progress->piece_mutex_);
             piece_data = progress->data;
-            completing_primary = progress->primary_peer;
         }
         auto actual_hash = Crypto::calculate_sha1_hash_data(piece_data);
         if (actual_hash != expected_hash) {
@@ -1142,21 +1140,6 @@ asio::awaitable<void> TorrentSession::on_piece_block(std::shared_ptr<PeerConnect
         co_await peer_manager_->send_have_message_to_all(piece_index);
         
         piece_manager_->remove_in_progress_piece(piece_index);
-
-        // Chain (kChainDivisor-1)/kChainDivisor of completions: the duty
-        // cycle (fraction of time a server holds a full queue) is
-        // chain-dominated — duty ~= p + (1-p)*S/P with p = chain fraction,
-        // S = serving set, P = pool. At p=1/3, S~15, P~140 that is ~0.39
-        // (measured ~30% — the valleys). p=2/3 -> ~0.7, and the rotor keeps
-        // 1/3 of fills (~1.67/s) so onboarding continues (the p=1 freeze
-        // had zero rotor). The earlier 1/2+hot-tier regression (806 vs 1171
-        // KB/s) was the hot-tier's 60s cutoff excluding 10-80s-burst
-        // servers (S collapsed), not the chain rate.
-        if (completing_primary && !state_->is_in_endgame_mode() && !shutting_down_.load(std::memory_order_acquire)
-            && (++chain_counter_ % kChainDivisor != 0)) {
-            piece_manager_->push_chain_primary(*completing_primary);
-            piece_manager_->notify_one();
-        }
 
         if (state_->completed_pieces() == state_->num_pieces()) {
             state_->is_download_complete(true);
