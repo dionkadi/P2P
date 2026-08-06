@@ -89,17 +89,16 @@ static constexpr auto kPrimaryEvidenceWindow = std::chrono::minutes(5);
 static constexpr auto kFreshUnchokeWindow = std::chrono::seconds(45);
 static constexpr size_t kDiscoveryExplorationDivisor = 8;
 
-// Chain-refill divisor: only 1/kChainDivisor of piece completions re-seed
-// the completing primary (push-side gate in TorrentSession). Full chaining
-// froze the serving set: every completion freed one window slot and the
-// chain re-consumed it with the SAME primary, starving the rotor so the
-// pool never grew (observed: one peer chained 151/344 pieces, two peers 69%,
-// flat 350 KB/s with 141/78 churn vs pre-fix bursts from a growing pool).
-// Chains are rate-proportional with the gate (fast completers chain more),
-// and (kChainDivisor-1)/kChainDivisor of fills return to the rotor for
-// onboarding. 1/2 measured WORSE than 1/3 (avg 806 vs 1171 KB/s): with the
-// hot-tier pool, half-chaining starved the cold onboarding and the pool
-// shrank.
+// Chain-refill gate: (kChainDivisor-1)/kChainDivisor of piece completions
+// re-seed the completing primary (push-side gate in TorrentSession). The
+// duty cycle (fraction of time a server holds a full queue) is
+// chain-dominated: duty ~= p + (1-p)*S/P, p = chain fraction, S = serving
+// set, P = pool. p=1/3 gave ~0.39 (measured ~30% duty, the KB/s valleys);
+// p=2/3 gives ~0.7. Full chaining (p=1) froze the pool (every freed slot
+// chain-consumed, rotor starved) — at 2/3 the rotor keeps 1/3 of fills
+// (~1.67/s) so onboarding continues. The 1/2+hot-tier regression (806 vs
+// 1171 KB/s) was the hot-tier's 60s cutoff excluding 10-80s-burst servers,
+// not the chain rate.
 static constexpr size_t kChainDivisor = 3;
 
 // In-flight window: kPiecesPerPeer whole pieces per currently-unchoked peer,

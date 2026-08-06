@@ -1143,14 +1143,17 @@ asio::awaitable<void> TorrentSession::on_piece_block(std::shared_ptr<PeerConnect
         
         piece_manager_->remove_in_progress_piece(piece_index);
 
-        // Chain only 1/kChainDivisor of completions: full chaining froze the
-        // serving set (every completion freed one window slot and the chain
-        // re-consumed it with the same primary, starving the rotor so the
-        // pool never grew — observed: two peers monopolized 69% of chains,
-        // flat 350 KB/s). The gate is rate-proportional — fast completers
-        // chain more — and 2/3 of fills return to the rotor for onboarding.
+        // Chain (kChainDivisor-1)/kChainDivisor of completions: the duty
+        // cycle (fraction of time a server holds a full queue) is
+        // chain-dominated — duty ~= p + (1-p)*S/P with p = chain fraction,
+        // S = serving set, P = pool. At p=1/3, S~15, P~140 that is ~0.39
+        // (measured ~30% — the valleys). p=2/3 -> ~0.7, and the rotor keeps
+        // 1/3 of fills (~1.67/s) so onboarding continues (the p=1 freeze
+        // had zero rotor). The earlier 1/2+hot-tier regression (806 vs 1171
+        // KB/s) was the hot-tier's 60s cutoff excluding 10-80s-burst
+        // servers (S collapsed), not the chain rate.
         if (completing_primary && !state_->is_in_endgame_mode() && !shutting_down_.load(std::memory_order_acquire)
-            && (++chain_counter_ % kChainDivisor == 0)) {
+            && (++chain_counter_ % kChainDivisor != 0)) {
             piece_manager_->push_chain_primary(*completing_primary);
             piece_manager_->notify_one();
         }
