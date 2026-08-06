@@ -76,7 +76,15 @@ asio::awaitable<void> PieceManager::downloader() {
             }
         }
 
-        piece_request_trigger_.expires_at(asio::steady_timer::time_point::max());
+        // Watchdog wake: bounded expiry so the loop always re-evaluates at
+        // least once per second even if every notify_one is lost. The original
+        // expires_at(max) slept until the next cancel_one — a notify firing
+        // between expires_at and async_wait (or a quiet swarm) left the loop
+        // asleep forever with an EMPTY window while needed pieces sat
+        // undownloaded (observed: 3 good minutes then permanent 0 B/s; the
+        // loop's wake logs stopped mid-run while the window drained via
+        // completions and unchokes kept firing notify_one).
+        piece_request_trigger_.expires_after(std::chrono::seconds(1));
         try {
             co_await piece_request_trigger_.async_wait(asio::use_awaitable);
         } catch (const boost::system::system_error& e) {
