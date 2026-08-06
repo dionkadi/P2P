@@ -45,6 +45,12 @@ asio::awaitable<void> PieceManager::downloader() {
     // Start the periodic block timeout checker
     asio::co_spawn(io_context_, self->block_timeout_loop(), asio::detached);
 
+    // Stall tracking for the endgame trigger: the last time a piece
+    // completed (the clock only matters once pieces have completed — the
+    // cold-start ramp is excluded by the completed>0 condition).
+    size_t last_completed = state_->completed_pieces();
+    auto last_completion_time = std::chrono::steady_clock::now();
+
     while (!state_->is_download_complete() && !shutting_down_) {
         int slots_to_fill = 0;
 
@@ -121,14 +127,25 @@ asio::awaitable<void> PieceManager::downloader() {
             }
         }
 
-        // Endgame trigger: fire whenever the needed+in-progress count drops
-        // under the threshold, regardless of try_piece_download successes —
-        // with all remaining pieces stuck InProgress, no seed ever succeeds,
-        // and the old trigger (spawned only from try_piece_download's
-        // success path) never fired — leaving the last blocks without the
-        // endgame redundancy (observed: 19 pieces stuck at 99.83%, 0 B/s).
+        // Endgame trigger: fire when the remaining work is small OR the
+        // download has made no progress for kEndgameStallTime with pieces
+        // in flight. The count-based trigger can't fire near the end with
+        // the budget-refill: the in-progress stays ~200-256 (the budget
+        // keeps the window full), so needed+InProgress never drops under
+        // the threshold — the last blocks then go dark without the endgame
+        // redundancy (observed: 0 B/s at 99.8% for minutes, endgame never
+        // fired; a restart finished it because the resume re-armed the
+        // blocks). The stall condition + the unchoke-triggered resume land
+        // the final blocks in the same run.
+        auto now_w = std::chrono::steady_clock::now();
+        size_t completed_now = state_->completed_pieces();
+        if (completed_now != last_completed) {
+            last_completed = completed_now;
+            last_completion_time = now_w;
+        }
+        bool stalled = now_w - last_completion_time > kEndgameStallTime;
         if (!state_->is_in_endgame_mode()) {
-            co_await check_and_enter_endgame();
+            co_await check_and_enter_endgame(stalled);
         }
 
         // Watchdog wake: bounded expiry so the loop always re-evaluates at
@@ -398,11 +415,10 @@ asio::awaitable<bool> PieceManager::try_piece_download(size_t piece_index, const
         ensure_resume_piece_download(piece_index);
     }
     
-    asio::co_spawn(io_context_, self->check_and_enter_endgame(), asio::detached);
     co_return true;
 }
 
-asio::awaitable<void> PieceManager::check_and_enter_endgame() {
+asio::awaitable<void> PieceManager::check_and_enter_endgame(bool stalled) {
     auto self = shared_from_this();
     
     if (state_->is_in_endgame_mode()) {
@@ -419,9 +435,15 @@ asio::awaitable<void> PieceManager::check_and_enter_endgame() {
     // every unchoked peer with duplicate requests for all 840 pieces —
     // observed 13,151 REJECTs and the last 11 pieces stuck missing their
     // final blocks while the flood kept them blacklisted at 99.9%. Cap the
-    // trigger at 64 pieces (a bounded redundancy window for the real tail).
+    // trigger at the window ceiling (a bounded redundancy window).
     size_t endgame_threshold = std::min<size_t>(state_->num_pieces() / 10, kMaxInFlightPieces);
-    if (needed_count > 0 && needed_count < endgame_threshold) {
+    // Stalled: no completion for kEndgameStallTime with pieces in flight
+    // and progress already made (excludes the cold-start ramp). The
+    // budget-refill keeps the window full, so the count condition alone can
+    // never fire near the end (observed: 0 B/s at 99.8% for minutes,
+    // endgame never fired).
+    bool no_progress = stalled && state_->completed_pieces() > 0 && in_progress_pieces()->size() > 0;
+    if ((needed_count > 0 && needed_count < endgame_threshold) || no_progress) {
         LOGINFO("🎉 All pieces requested. Entering ENDGAME MODE. 🎉");
         state_->is_in_endgame_mode(true);
         asio::co_spawn(io_context_, self->broadcast_outstanding_requests(), asio::detached);

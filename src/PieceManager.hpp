@@ -113,10 +113,18 @@ static constexpr size_t kMaxInFlightPieces = 256;
 static constexpr size_t kMaxPiecesPerPrimary = 4;
 
 // Bound fill spawns per downloader wake: a drained window could otherwise
-// spawn (128 - 0) fills per wake ~ 640/s (each ~50-200us of rarity-map copy
+// spawn (256 - 0) fills per wake ~ 640/s (each ~50-200us of rarity-map copy
 // + shuffle). 32 x ~5 wakes/s = 160 attempts/s is ~80x the ~2 completions/s
 // and costs nothing.
 static constexpr size_t kMaxSpawnsPerWake = 32;
+
+// Stall-based endgame trigger: fire endgame when no piece has completed for
+// this long while pieces remain in flight (and some progress was made — the
+// cold-start ramp is excluded). The budget-refill keeps the window full
+// (~200-256 in-progress), so the count-based trigger can never fire near
+// the end — the last blocks would go dark without the endgame redundancy
+// (observed: 0 B/s at 99.8% for minutes, endgame never fired).
+static constexpr auto kEndgameStallTime = std::chrono::seconds(30);
 
 // libtorrent initial_picker_threshold: pick this many pieces RANDOMLY at the
 // start of a download instead of rarest-first, so a fresh leecher quickly
@@ -207,7 +215,7 @@ public:
     
     asio::awaitable<void> downloader();  
     asio::awaitable<void> request_one_piece();
-    asio::awaitable<void> check_and_enter_endgame();
+    asio::awaitable<void> check_and_enter_endgame(bool stalled = false);
     asio::awaitable<void> return_piece_to_queue(size_t piece_index);
 
     // All three shared structures (in_progress_pieces_, pieces_by_rarity_,
