@@ -89,15 +89,28 @@ static constexpr auto kPrimaryEvidenceWindow = std::chrono::minutes(5);
 static constexpr auto kFreshUnchokeWindow = std::chrono::seconds(45);
 static constexpr size_t kDiscoveryExplorationDivisor = 8;
 
+// Hot-tier pool ranking (try_piece_download): HOT = delivering within
+// kHotEvidenceWindow (the currently-active server set); COLD = evidenced
+// longer ago ∪ fresh. 1/kColdPoolDivisor of fills go to COLD (onboarding),
+// the rest concentrate on HOT — raising the active servers' duty cycle and
+// steering the chain gate (completions become server-dominated, so holds
+// stop wasting on leechers). The evidenced set alone is leecher-diluted (a
+// leecher that delivered once is evidenced for 5 min), hence the 60s hot
+// window.
+static constexpr auto kHotEvidenceWindow = std::chrono::seconds(60);
+static constexpr size_t kColdPoolDivisor = 8;
+
 // Chain-refill divisor: only 1/kChainDivisor of piece completions re-seed
-// the completing primary (push-side gate in TorrentSession). Full chaining
-// froze the serving set: every completion freed one window slot and the
-// chain re-consumed it with the SAME primary, starving the rotor so the
-// pool never grew (observed: one peer chained 151/344 pieces, two peers 69%,
-// flat 350 KB/s with 141/78 churn vs pre-fix bursts from a growing pool).
-// Chains are rate-proportional with the gate (fast completers chain more),
-// and 2/3 of fills return to the rotor for onboarding.
-static constexpr size_t kChainDivisor = 3;
+// the completing primary (push-side gate in TorrentSession). The duty cycle
+// (fraction of time a server holds a full queue) is chain-dominated — the
+// chain is the only mechanism that refills a server IMMEDIATELY on
+// completion; the rotor re-picks a given server only every ~28s. 1/3 gave
+// ~30% duty (measured 13-17 servers at 100% vs ~52 for qBittorrent); 1/2
+// doubles it. p=1 froze the pool (every freed slot chain-consumed, rotor
+// starved) — with the depth-4 window that is structurally impossible at
+// 1/2: half of completions still return slots to the rotor, so onboarding
+// continues.
+static constexpr size_t kChainDivisor = 2;
 
 // In-flight window: kPiecesPerPeer whole pieces per currently-unchoked peer,
 // decoupled from the unchoked count. The old 1:1 formula capped in-flight at
