@@ -57,20 +57,28 @@ asio::awaitable<void> PieceManager::downloader() {
         // in instead of having been locked too small (or flooded onto 1 peer).
         size_t unchoked = get_unchoked_count_ ? get_unchoked_count_() : 1;
         if (unchoked < 1) unchoked = 1;
-        // One piece per unchoked peer (each piece now goes fully to a primary
-        // peer, so a piece == one serving peer's deep queue). Cap at 64 so we
-        // never spawn more in-flight requests than the pipeline gate (8 MiB per
-        // peer) or half-open pool can carry. The window is not the binding
-        // constraint today (in-flight ~124 << 512); it just needs to be >= the
-        // unchoked set so every serving peer gets a piece.
-        max_in_progress_pieces = std::clamp<size_t>(unchoked, 1, 64);
+        // kPiecesPerPeer whole pieces per unchoked peer: the old 1:1 formula
+        // capped in-flight at the instant-unchoked set, so each primary held
+        // ONE piece and idled ~7s between pieces (queue-empty -> snub-choke ->
+        // churn). Depth 4 = ~29s of continuous queue per server: unchokes
+        // hold and the serving set grows. Clamped to kMaxInFlightPieces; the
+        // per-peer pipeline gate (500 requests / 8 MiB) carries 128*16 blocks
+        // easily (~82 blocks/server over 25 servers). Cold start: 1 unchoked
+        // peer -> 4 pieces = 64 blocks (8x smaller than the old 512-block
+        // flood); the window scales up as the swarm staggers in.
+        max_in_progress_pieces = std::clamp<size_t>(unchoked * kPiecesPerPeer, 8, kMaxInFlightPieces);
 
         size_t current_in_progress = in_progress_pieces()->size();
         if (current_in_progress < max_in_progress_pieces) {
             slots_to_fill = std::min(max_in_progress_pieces - current_in_progress, state_->needed_pieces());
         }
-        
+
         if (slots_to_fill > 0) {
+            // Bound spawns per wake: a drained window could otherwise spawn
+            // (128 - 0) fills per wake ~ 640/s (each ~50-200us of rarity-map
+            // copy + shuffle). 32 x ~5 wakes/s = 160 attempts/s is ~80x the
+            // ~2 completions/s and costs nothing.
+            slots_to_fill = std::min(slots_to_fill, static_cast<int>(kMaxSpawnsPerWake));
             for (int i = 0; i < slots_to_fill; ++i) {
                 asio::co_spawn(io_context_, self->request_one_piece(), asio::detached);
             }
@@ -368,7 +376,7 @@ asio::awaitable<void> PieceManager::check_and_enter_endgame() {
     // observed 13,151 REJECTs and the last 11 pieces stuck missing their
     // final blocks while the flood kept them blacklisted at 99.9%. Cap the
     // trigger at 64 pieces (a bounded redundancy window for the real tail).
-    size_t endgame_threshold = std::min<size_t>(state_->num_pieces() / 10, 64);
+    size_t endgame_threshold = std::min<size_t>(state_->num_pieces() / 10, kMaxInFlightPieces);
     if (needed_count > 0 && needed_count < endgame_threshold) {
         LOGINFO("🎉 All pieces requested. Entering ENDGAME MODE. 🎉");
         state_->is_in_endgame_mode(true);

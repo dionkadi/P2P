@@ -95,6 +95,25 @@ static constexpr size_t kDiscoveryExplorationDivisor = 8;
 // and 2/3 of fills return to the rotor for onboarding.
 static constexpr size_t kChainDivisor = 3;
 
+// In-flight window: kPiecesPerPeer whole pieces per currently-unchoked peer,
+// decoupled from the unchoked count. The old 1:1 formula capped in-flight at
+// the instant-unchoked set, so each primary held ONE piece and idled ~7s
+// between pieces (queue-empty -> snub-choke -> churn). Depth 4 = ~29s of
+// continuous queue per server: unchokes hold and the serving set grows.
+// Clamped to kMaxInFlightPieces; the per-peer pipeline gate (500 requests /
+// 8 MiB, PeerConnection.cpp:411-416) carries 128*16 blocks easily (~82
+// blocks/server over 25 servers). Cold start: 1 unchoked peer -> 4 pieces =
+// 64 blocks (8x smaller than the old 512-block flood), scaling up as the
+// swarm staggers in.
+static constexpr size_t kPiecesPerPeer = 4;
+static constexpr size_t kMaxInFlightPieces = 128;
+
+// Bound fill spawns per downloader wake: a drained window could otherwise
+// spawn (128 - 0) fills per wake ~ 640/s (each ~50-200us of rarity-map copy
+// + shuffle). 32 x ~5 wakes/s = 160 attempts/s is ~80x the ~2 completions/s
+// and costs nothing.
+static constexpr size_t kMaxSpawnsPerWake = 32;
+
 // libtorrent initial_picker_threshold: pick this many pieces RANDOMLY at the
 // start of a download instead of rarest-first, so a fresh leecher quickly
 // gains pieces it can upload — earning regular (non-optimistic) tit-for-tat
