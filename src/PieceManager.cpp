@@ -277,29 +277,20 @@ asio::awaitable<bool> PieceManager::try_piece_download(size_t piece_index, const
     // proven/fresh peers — a silent leecher primary costs one 4s
     // batch-timeout, never a permanently stuck piece.
     //
-    // HOT/COLD tiers: the evidenced set alone is leecher-diluted (a leecher
-    // that delivered once is evidenced for 5 min), so fills concentrate on
-    // HOT (delivering within kHotEvidenceWindow) with 1/kColdPoolDivisor
-    // going to COLD (evidenced-cold ∪ fresh) for onboarding.
     auto now_ev = std::chrono::steady_clock::now();
-    std::vector<std::shared_ptr<PeerConnection>> hot_pool;
-    std::vector<std::shared_ptr<PeerConnection>> cold_pool;
+    std::vector<std::shared_ptr<PeerConnection>> primary_pool;
     if (peer_activity_check_) {
         for (const auto& p : available_peers) {
             bool is_proven = false;
             auto last = peer_activity_check_(p->peer_id());
             if (last && now_ev - *last < kPrimaryEvidenceWindow) {
-                if (now_ev - *last < kHotEvidenceWindow) {
-                    hot_pool.push_back(p);
-                } else {
-                    cold_pool.push_back(p);
-                }
+                primary_pool.push_back(p);
                 is_proven = true;
             }
             if (!is_proven) {
                 auto unchoked = p->last_unchoke_time();
                 if (unchoked != std::chrono::steady_clock::time_point{} && now_ev - unchoked < kFreshUnchokeWindow) {
-                    cold_pool.push_back(p);
+                    primary_pool.push_back(p);
                 }
             }
         }
@@ -320,24 +311,8 @@ asio::awaitable<bool> PieceManager::try_piece_download(size_t piece_index, const
         }
     }
     if (!primary) {
-        // Hot-tier ranking: 1/kColdPoolDivisor of fills go to the cold tier
-        // (evidenced-cold ∪ fresh) for onboarding; the rest concentrate on
-        // the currently-serving HOT set — raising the active servers' duty
-        // cycle and steering the chain gate (completions become
-        // server-dominated, so holds stop wasting on leechers). Empty HOT
-        // (cold start) falls through to the full pool. The split uses the
-        // atomic rotor (try_piece_download runs off-strand — no rng_).
-        if (hot_pool.empty()) {
-            auto& pool = cold_pool.empty() ? available_peers : cold_pool;
-            primary = pool[primary_rotor_.fetch_add(1, std::memory_order_relaxed) % pool.size()];
-        } else {
-            auto idx = primary_rotor_.fetch_add(1, std::memory_order_relaxed);
-            if (idx % kColdPoolDivisor == 0 && !cold_pool.empty()) {
-                primary = cold_pool[idx % cold_pool.size()];
-            } else {
-                primary = hot_pool[idx % hot_pool.size()];
-            }
-        }
+        auto& pool = primary_pool.empty() ? available_peers : primary_pool;
+        primary = pool[primary_rotor_.fetch_add(1, std::memory_order_relaxed) % pool.size()];
     }
     {
         std::lock_guard lock(piece_progress->piece_mutex_);
