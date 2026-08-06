@@ -195,6 +195,7 @@ private:
     AsyncRateLimiter<> upload_limiter_;
     AsyncRateLimiter<> download_limiter_;
     std::atomic<bool> shutting_down_{false};
+    size_t chain_counter_{0}; // 1/kChainDivisor of completions re-seed the completing primary
     asio::steady_timer completion_timer_;
     std::function<void()> on_complete_;
     std::chrono::seconds tracker_announce_interval_;

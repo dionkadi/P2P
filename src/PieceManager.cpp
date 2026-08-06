@@ -109,6 +109,7 @@ asio::awaitable<void> PieceManager::request_one_piece() {
         }
     }
     if (have_chain) {
+        LOGDBG("Chain: popped completing primary {}", chain_primary);
         for (const auto& [rarity, piece_set] : snapshot_pieces_by_rarity()) {
             if (rarity == 0) continue;  // Only actually-available pieces (rarity > 0)
             std::vector<int> candidates(piece_set.begin(), piece_set.end());
@@ -122,6 +123,7 @@ asio::awaitable<void> PieceManager::request_one_piece() {
         // No needed piece available on the chained primary (it may lack the
         // remaining rare pieces or got choked) — fall through to the normal
         // rotor-based selection below.
+        LOGDBG("Chain: no piece available on primary {}; rotor fallback", chain_primary);
     }
 
     // libtorrent initial_picker_threshold=4: the first few pieces are picked
@@ -286,6 +288,7 @@ asio::awaitable<bool> PieceManager::try_piece_download(size_t piece_index, const
         for (const auto& p : available_peers) {
             if (p->peer_id() == *preferred) {
                 primary = p;
+                LOGDBG("Chain: piece {} seeded to completing primary {}", piece_index, *preferred);
                 break;
             }
         }

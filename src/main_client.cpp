@@ -825,14 +825,17 @@ int main(int argc, char* argv[]) {
     // Per-second speed logger: appends "unix_ts download_bps upload_bps"
     // to logs/speed.txt (aggregate across all torrents), so speed changes
     // can be inspected over time instead of only in the live TUI.
-    std::thread speed_logger([&app, input_active]() {
+    // Logs while the app runs, regardless of interactive mode (input_active
+    // is false under --non-interactive, which would otherwise starve it).
+    auto speed_log_active = std::make_shared<std::atomic<bool>>(true);
+    std::thread speed_logger([&app, speed_log_active]() {
         std::filesystem::create_directories("logs");
         std::ofstream out("logs/speed.txt", std::ios::app);
         if (!out) return;
         auto last = std::chrono::steady_clock::now();
         uint64_t last_down = 0, last_up = 0;
         bool first = true;
-        while (input_active->load()) {
+        while (speed_log_active->load()) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
             uint64_t down = 0, up = 0;
             for (const auto& [hash, session] : app.torrents()) {
@@ -864,6 +867,7 @@ int main(int argc, char* argv[]) {
     }
 
     display.stop();
+    speed_log_active->store(false);
     input_active->store(false);
     if (speed_logger.joinable()) {
         speed_logger.join();

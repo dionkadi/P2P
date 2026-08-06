@@ -1143,14 +1143,14 @@ asio::awaitable<void> TorrentSession::on_piece_block(std::shared_ptr<PeerConnect
         
         piece_manager_->remove_in_progress_piece(piece_index);
 
-        // Chain-refill: seed the next piece to the same primary so its queue
-        // never drains (seeders choke rate-zero peers; empty per-primary
-        // queues between pieces were the ~4.9s unchoke-window churn). The
-        // downloader consumes the hint via request_one_piece -> preferred
-        // primary, using the window slot this completion just freed. Skipped
-        // in endgame (broadcast covers it) and when the primary was already
-        // demoted (B'/reject cleared primary_peer — the rotor covers it).
-        if (completing_primary && !state_->is_in_endgame_mode() && !shutting_down_.load(std::memory_order_acquire)) {
+        // Chain only 1/kChainDivisor of completions: full chaining froze the
+        // serving set (every completion freed one window slot and the chain
+        // re-consumed it with the same primary, starving the rotor so the
+        // pool never grew — observed: two peers monopolized 69% of chains,
+        // flat 350 KB/s). The gate is rate-proportional — fast completers
+        // chain more — and 2/3 of fills return to the rotor for onboarding.
+        if (completing_primary && !state_->is_in_endgame_mode() && !shutting_down_.load(std::memory_order_acquire)
+            && (++chain_counter_ % kChainDivisor == 0)) {
             piece_manager_->push_chain_primary(*completing_primary);
             piece_manager_->notify_one();
         }

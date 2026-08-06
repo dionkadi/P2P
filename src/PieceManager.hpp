@@ -79,9 +79,21 @@ static constexpr auto kPrimaryEvidenceWindow = std::chrono::minutes(5);
 // proven-only primary preference (pick_block_peer_preferring_primary): a
 // silent fresh primary costs one 4s batch-timeout per piece. Exploration
 // stays block-level — a silent peer costs one 4s timeout per pick, never a
-// deep queue.
-static constexpr auto kFreshUnchokeWindow = std::chrono::seconds(15);
+// deep queue. kFreshUnchokeWindow is 60s (was 15s): rotor fills spread over
+// a ~19-peer pool reach a freshly-unchoked seed only every ~22s, so a 15s
+// window expired before onboarding; 60s gives 2-3 rotation opportunities.
+static constexpr auto kFreshUnchokeWindow = std::chrono::seconds(60);
 static constexpr size_t kDiscoveryExplorationDivisor = 8;
+
+// Chain-refill divisor: only 1/kChainDivisor of piece completions re-seed
+// the completing primary (push-side gate in TorrentSession). Full chaining
+// froze the serving set: every completion freed one window slot and the
+// chain re-consumed it with the SAME primary, starving the rotor so the
+// pool never grew (observed: one peer chained 151/344 pieces, two peers 69%,
+// flat 350 KB/s with 141/78 churn vs pre-fix bursts from a growing pool).
+// Chains are rate-proportional with the gate (fast completers chain more),
+// and 2/3 of fills return to the rotor for onboarding.
+static constexpr size_t kChainDivisor = 3;
 
 // libtorrent initial_picker_threshold: pick this many pieces RANDOMLY at the
 // start of a download instead of rarest-first, so a fresh leecher quickly

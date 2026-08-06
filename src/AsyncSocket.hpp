@@ -314,7 +314,13 @@ public:
     AsyncUdpSocket(AsyncUdpSocket&&) noexcept = default;
     AsyncUdpSocket& operator=(AsyncUdpSocket&&) noexcept = default;
 
-    asio::awaitable<void> send_to(std::span<const std::byte> data, const udp::endpoint& remote) {
+    // Takes both arguments BY VALUE: a suspended async_send_to may outlive
+    // the caller's coroutine frame (detached DHT query sends), and a
+    // reference into that frame is a stack-use-after-return the moment the
+    // frame dies (ASan: endpoint::is_v4() read of a returned frame in the
+    // send_to error path). DHT messages are small and low-rate; the copies
+    // are negligible.
+    asio::awaitable<void> send_to(std::vector<std::byte> data, udp::endpoint remote) {
         if (!socket_.is_open()) {
             socket_.open(udp::v4());
         }
