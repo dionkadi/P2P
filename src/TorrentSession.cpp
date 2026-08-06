@@ -1422,11 +1422,12 @@ asio::awaitable<void> TorrentSession::on_choke_status_changed(std::shared_ptr<Pe
             }
         }
 
-        // Engage the unchoking peer immediately: seed it one piece right
-        // away instead of waiting for the pool rotation (~20-40s), which
-        // wasted each unchoke window (~5s avg) and produced the sub-500
-        // KB/s valleys while the swarm actively unchoked us.
-        piece_manager_->engage_unchoked_peer(conn->peer_id());
+        // Re-request the in-progress pieces' missing blocks: a stuck
+        // piece's blocks go dark (no outstanding request, no armed timer,
+        // no resume trigger) once no available peer has them, and an
+        // unchoke is the only event that can re-arm them — the freshly
+        // unchoked peer can serve them within its window.
+        piece_manager_->resume_all_in_progress();
         piece_manager_->notify_one();
         co_return;
     }

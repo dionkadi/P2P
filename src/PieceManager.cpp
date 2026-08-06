@@ -84,6 +84,16 @@ asio::awaitable<void> PieceManager::downloader() {
             }
         }
 
+        // Endgame trigger: fire whenever the needed+in-progress count drops
+        // under the threshold, regardless of try_piece_download successes —
+        // with all remaining pieces stuck InProgress, no seed ever succeeds,
+        // and the old trigger (spawned only from try_piece_download's
+        // success path) never fired — leaving the last blocks without the
+        // endgame redundancy (observed: 19 pieces stuck at 99.83%, 0 B/s).
+        if (!state_->is_in_endgame_mode()) {
+            co_await check_and_enter_endgame();
+        }
+
         // Watchdog wake: bounded expiry so the loop always re-evaluates at
         // least once per second even if every notify_one is lost. The original
         // expires_at(max) slept until the next cancel_one — a notify firing
@@ -223,22 +233,19 @@ asio::awaitable<bool> PieceManager::try_seed_to_primary(const PeerId& primary) {
     co_return false;
 }
 
-asio::awaitable<void> PieceManager::engage_unchoked_peer_impl(PeerId peer) {
-    CTRACK_ASYNC("PieceManager::engage_unchoked_peer_impl");
-    if (state_->is_download_complete() || state_->is_in_endgame_mode()) {
-        co_return;
-    }
-    if (co_await try_seed_to_primary(peer)) {
-        LOGDBG("Engage: seeded a piece to freshly-unchoked peer {}", peer);
-    }
-}
-
-void PieceManager::engage_unchoked_peer(const PeerId& peer_id) noexcept {
-    if (state_->is_download_complete() || state_->is_in_endgame_mode()) {
+void PieceManager::resume_all_in_progress() noexcept {
+    auto pieces = in_progress_pieces();
+    if (!pieces) {
         return;
     }
-    auto self = shared_from_this();
-    asio::co_spawn(io_context_, self->engage_unchoked_peer_impl(peer_id), asio::detached);
+    std::vector<size_t> indices;
+    indices.reserve(pieces->size());
+    for (const auto& [idx, _] : *pieces) {
+        indices.push_back(idx);
+    }
+    for (size_t idx : indices) {
+        ensure_resume_piece_download(idx);
+    }
 }
 
 asio::awaitable<bool> PieceManager::try_piece_download(size_t piece_index, const PeerId* preferred) {
