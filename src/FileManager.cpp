@@ -367,25 +367,42 @@ asio::awaitable<void> FileManager::verify_pieces() {
     CTRACK_ASYNC("FileManager::verify_pieces");
     const size_t num_pieces = state_->num_pieces();
 
-    for (size_t i : std::views::iota(0UL, num_pieces) 
-                       | std::views::filter([&](size_t idx) { 
-                            return state_->piece_status(idx) == PieceStatus::Have; 
-                        })
-    )  {
-        if (!co_await verify_piece(i)) {
-            LOGCRITICAL("Hash mismatch for piece {} during verification. Marking as Needed.", i);
-            state_->piece_status(i, PieceStatus::Needed);
-            state_->add_completed_pieces(-1);
-        } else {
+    // Verify EVERY piece against the data file, not just pieces already
+    // marked Have. The persisted bitfield can understate the disk (pieces
+    // lost to the old mtime-wipe logic, or the file written by another
+    // client), and valid-but-unmarked pieces would otherwise be re-downloaded
+    // — the client "needed" 5887 pieces while the disk held 9488 valid and
+    // re-downloaded ~1.1 GB it already owned. Hashing 2.9 GB takes ~10-20s
+    // once per startup.
+    //
+    // The counter is REBUILT from the result instead of incremented: the old
+    // code added +1 per valid piece on top of the load count, double-counting
+    // and drifting past 100% across restarts (observed 11556/11134, so
+    // is_download_complete() could never fire and the torrent never finished).
+    size_t have_count = 0;
+    size_t lost_count = 0;
+    for (size_t i : std::views::iota(0UL, num_pieces)) {
+        PieceStatus status = state_->piece_status(i);
+        if (status == PieceStatus::Skipped) continue;
+        if (co_await verify_piece(i)) {
             state_->piece_status(i, PieceStatus::Have);
-            state_->add_completed_pieces(1);
+            ++have_count;
+        } else {
+            if (status == PieceStatus::Have) {
+                ++lost_count;
+            }
+            state_->piece_status(i, PieceStatus::Needed);
         }
     }
+    state_->completed_pieces(have_count);
 
-    if (size_t pieces_done_count = state_->completed_pieces(); pieces_done_count > 0) {
-        float progress = (static_cast<float>(pieces_done_count) / num_pieces) * 100.0f;
+    if (lost_count > 0) {
+        LOGWARN("Verification: {} previously-Have pieces no longer valid on disk, marked Needed.", lost_count);
+    }
+    if (have_count > 0) {
+        float progress = (static_cast<float>(have_count) / num_pieces) * 100.0f;
         LOGINFO("Verification complete. Found {}/{} valid pieces ({:.2f}% progress).", 
-                pieces_done_count, num_pieces, progress
+                have_count, num_pieces, progress
         );
     }
 }
