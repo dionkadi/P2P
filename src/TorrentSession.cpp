@@ -1118,9 +1118,11 @@ asio::awaitable<void> TorrentSession::on_piece_block(std::shared_ptr<PeerConnect
         auto expected_hash = std::vector<std::byte>(state_->torrent_info().pieces.begin() + piece_index * 20, state_->torrent_info().pieces.begin() + (piece_index * 20 + 20));
         // Lock just for reading progress->data during hash calculation (co_await-free)
         std::vector<std::byte> piece_data;
+        std::optional<PeerId> completing_primary;
         {
             std::lock_guard lock(progress->piece_mutex_);
             piece_data = progress->data;
+            completing_primary = progress->primary_peer;
         }
         auto actual_hash = Crypto::calculate_sha1_hash_data(piece_data);
         if (actual_hash != expected_hash) {
@@ -1140,6 +1142,18 @@ asio::awaitable<void> TorrentSession::on_piece_block(std::shared_ptr<PeerConnect
         co_await peer_manager_->send_have_message_to_all(piece_index);
         
         piece_manager_->remove_in_progress_piece(piece_index);
+
+        // Chain-refill: seed the next piece to the same primary so its queue
+        // never drains (seeders choke rate-zero peers; empty per-primary
+        // queues between pieces were the ~4.9s unchoke-window churn). The
+        // downloader consumes the hint via request_one_piece -> preferred
+        // primary, using the window slot this completion just freed. Skipped
+        // in endgame (broadcast covers it) and when the primary was already
+        // demoted (B'/reject cleared primary_peer — the rotor covers it).
+        if (completing_primary && !state_->is_in_endgame_mode() && !shutting_down_.load(std::memory_order_acquire)) {
+            piece_manager_->push_chain_primary(*completing_primary);
+            piece_manager_->notify_one();
+        }
 
         if (state_->completed_pieces() == state_->num_pieces()) {
             state_->is_download_complete(true);

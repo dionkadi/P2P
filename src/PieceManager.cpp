@@ -93,6 +93,37 @@ asio::awaitable<void> PieceManager::request_one_piece() {
         co_return;
     }
 
+    // Chain-refill: a primary whose piece just completed is queued; seed its
+    // next piece to the SAME peer so its queue never drains (seeders choke
+    // rate-zero peers — the ~4.9s avg unchoke window == drain+idle cycle).
+    // Folded into the slot-fill path so the chain consumes exactly the window
+    // slot freed by the completion instead of racing the rotor.
+    PeerId chain_primary;
+    bool have_chain = false;
+    {
+        std::lock_guard lock(mutex_);
+        if (!pending_chains_.empty()) {
+            chain_primary = pending_chains_.front();
+            pending_chains_.pop_front();
+            have_chain = true;
+        }
+    }
+    if (have_chain) {
+        for (const auto& [rarity, piece_set] : snapshot_pieces_by_rarity()) {
+            if (rarity == 0) continue;  // Only actually-available pieces (rarity > 0)
+            std::vector<int> candidates(piece_set.begin(), piece_set.end());
+            std::shuffle(candidates.begin(), candidates.end(), std::mt19937{std::random_device{}()});
+            for (size_t piece_index : candidates) {
+                if (co_await try_piece_download(piece_index, &chain_primary)) {
+                    co_return;
+                }
+            }
+        }
+        // No needed piece available on the chained primary (it may lack the
+        // remaining rare pieces or got choked) — fall through to the normal
+        // rotor-based selection below.
+    }
+
     // libtorrent initial_picker_threshold=4: the first few pieces are picked
     // RANDOMLY rather than rarest-first, so a fresh leecher quickly gains
     // tradeable pieces. Rarest-first at 0% picks pieces almost nobody needs,
@@ -167,7 +198,7 @@ asio::awaitable<void> PieceManager::request_one_piece() {
     LOGDBG("No available and needed pieces to download from any unchoked peer right now.");
 }
 
-asio::awaitable<bool> PieceManager::try_piece_download(size_t piece_index) {
+asio::awaitable<bool> PieceManager::try_piece_download(size_t piece_index, const PeerId* preferred) {
     CTRACK_ASYNC("PieceManager::try_piece_download");
     auto self = shared_from_this();
 
@@ -245,9 +276,24 @@ asio::awaitable<bool> PieceManager::try_piece_download(size_t piece_index) {
             }
         }
     }
-    auto& primary = primary_pool.empty()
-        ? available_peers[primary_rotor_.fetch_add(1, std::memory_order_relaxed) % available_peers.size()]
-        : primary_pool[primary_rotor_.fetch_add(1, std::memory_order_relaxed) % primary_pool.size()];
+    // Chain-refill: a preferred primary (its piece just completed) keeps the
+    // next piece too, so its queue never drains. It is present in
+    // available_peers iff still unchoked, and having just delivered a
+    // verified piece it is trivially proven — the preference is safe without
+    // re-checking the pool.
+    std::shared_ptr<PeerConnection> primary;
+    if (preferred) {
+        for (const auto& p : available_peers) {
+            if (p->peer_id() == *preferred) {
+                primary = p;
+                break;
+            }
+        }
+    }
+    if (!primary) {
+        auto& pool = primary_pool.empty() ? available_peers : primary_pool;
+        primary = pool[primary_rotor_.fetch_add(1, std::memory_order_relaxed) % pool.size()];
+    }
     {
         std::lock_guard lock(piece_progress->piece_mutex_);
         piece_progress->primary_peer = primary->peer_id();

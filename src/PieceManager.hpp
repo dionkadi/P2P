@@ -9,6 +9,7 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <map>
 #include <memory>
@@ -273,9 +274,26 @@ public:
     // Runs all PieceManager state access (in_progress_pieces_, rng_, ...).
     const auto& strand() const noexcept { return strand_; }
 
+    // Chain-refill: queue a primary whose piece just completed so the next
+    // piece is seeded to the SAME peer (request_one_piece pops it and uses it
+    // as try_piece_download's preferred primary). Keeps the primary's request
+    // queue continuously deep: without it a primary serves its one 16-block
+    // piece in ~1-2s then idles 6-7s with an EMPTY queue while the rotor
+    // spreads the next pieces elsewhere, and seeders choke rate-zero peers
+    // (~4.9s avg unchoke window == the drain+idle cycle; qBittorrent holds
+    // unchokes because its per-peer queues never drain). Cap bounds the
+    // queue; drop-oldest on overflow.
+    void push_chain_primary(PeerId peer_id) noexcept {
+        std::lock_guard lock(mutex_);
+        if (pending_chains_.size() >= kMaxPendingChains) {
+            pending_chains_.pop_front();
+        }
+        pending_chains_.push_back(std::move(peer_id));
+    }
+
 private:
 
-    asio::awaitable<bool> try_piece_download(size_t piece_index);
+    asio::awaitable<bool> try_piece_download(size_t piece_index, const PeerId* preferred = nullptr);
 
     asio::awaitable<void> block_timeout_loop();
 
@@ -296,6 +314,9 @@ private:
     // single rejector's blast radius to ~1-2 pieces. Atomic so concurrent
     // request_one_piece coroutines pick distinct indices.
     std::atomic<size_t> primary_rotor_{0};
+
+    static constexpr size_t kMaxPendingChains = 4;
+    std::deque<PeerId> pending_chains_;
 
     asio::io_context& io_context_;
     asio::strand<asio::io_context::executor_type> strand_;
