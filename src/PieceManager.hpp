@@ -79,10 +79,14 @@ static constexpr auto kPrimaryEvidenceWindow = std::chrono::minutes(5);
 // proven-only primary preference (pick_block_peer_preferring_primary): a
 // silent fresh primary costs one 4s batch-timeout per piece. Exploration
 // stays block-level — a silent peer costs one 4s timeout per pick, never a
-// deep queue. kFreshUnchokeWindow is 60s (was 15s): rotor fills spread over
-// a ~19-peer pool reach a freshly-unchoked seed only every ~22s, so a 15s
-// window expired before onboarding; 60s gives 2-3 rotation opportunities.
-static constexpr auto kFreshUnchokeWindow = std::chrono::seconds(60);
+// deep queue.
+//
+// kFreshUnchokeWindow: 15s was too short (rotor fills reach a fresh seed
+// only every ~22s — onboarding missed), 60s over-admitted: with the depth-4
+// window (kPiecesPerPeer), every freshly-unchoked leecher parked FOUR whole
+// pieces and stalled (observed 9x timeout bill, 4.3k REJECTs at 1.28 MB/s).
+// 45s halves leecher residency while keeping ~2 onboarding rotations.
+static constexpr auto kFreshUnchokeWindow = std::chrono::seconds(45);
 static constexpr size_t kDiscoveryExplorationDivisor = 8;
 
 // Chain-refill divisor: only 1/kChainDivisor of piece completions re-seed
