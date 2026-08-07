@@ -1117,7 +1117,7 @@ asio::awaitable<void> PieceManager::check_block_timeouts() {
                         }
                     }
                 }
-                if (!still_active || now - request_time > (tail ? kHardRequestCapTail : kHardRequestCap)) {
+                if (!still_active || now - request_time > kHardRequestCap) {
                     timed_out = true;
                 }
             }
