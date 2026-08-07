@@ -839,8 +839,13 @@ std::vector<PeerId> PieceManager::pruned_rejected_peers(const std::shared_ptr<In
     auto now = std::chrono::steady_clock::now();
     std::lock_guard lock(progress->piece_mutex_);
     auto& rejected = progress->rejected_by[block_idx];
+    // At the tail (needed==0), the seeds reject because they are BUSY (queue
+    // full), not hostile — a 20s re-entry (kRejectedBlockTTLTail) catches
+    // the capacity window when their queues drain; the 60s bulk TTL exiles
+    // the only holders of the last pieces (observed: crawl to 0).
+    const auto ttl = state_->needed_pieces() == 0 ? kRejectedBlockTTLTail : InProgressPiece::kRejectedBlockTTL;
     std::erase_if(rejected, [&](const auto& entry) {
-        return now - entry.second > InProgressPiece::kRejectedBlockTTL;
+        return now - entry.second > ttl;
     });
     for (const auto& [pid, when] : rejected) {
         result.push_back(pid);
@@ -1048,6 +1053,10 @@ asio::awaitable<void> PieceManager::check_block_timeouts() {
         co_return;
     }
 
+    // Tail regime: all pieces started (needed==0). The timeout deferral and
+    // the reject-TTL behave differently here (see below).
+    bool tail = state_->needed_pieces() == 0;
+
     // Snapshot shared_ptrs to avoid use-after-free from concurrent map mutation
     // while suspended at co_await (see broadcast_outstanding_requests for details).
     auto pieces_snapshot = in_progress_pieces();
@@ -1093,7 +1102,16 @@ asio::awaitable<void> PieceManager::check_block_timeouts() {
                 if (peer_activity_check_ && !outstanding_ids.empty()) {
                     for (const auto& pid : outstanding_ids) {
                         auto last = peer_activity_check_(pid);
-                        if (last && now - *last < kPeerActivityWindow) {
+                        // At the tail (needed==0), a known server's accepted-
+                        // but-queued requests must NOT be cancelled on the 4s
+                        // budget: the oversubscribed seeds' queue wait exceeds
+                        // it (10-267s), and each cancel re-queues + re-floods
+                        // (observed: 25 timeouts/s at the tail -> REJECTs ->
+                        // 60s exiles of the only holders -> crawl to 0). The
+                        // 5-min evidence window keeps proven servers' blocks
+                        // alive to kHardRequestCap; the stuck gate + fan-out
+                        // bound genuinely dead owners.
+                        if (last && now - *last < (tail ? kPrimaryEvidenceWindow : kPeerActivityWindow)) {
                             still_active = true;
                             break;
                         }

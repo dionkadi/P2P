@@ -161,6 +161,12 @@ static constexpr size_t kEndgameFanout = 6;
 // 15s): the fan-out engages sooner, holding the tail closer to MB/s.
 static constexpr auto kStuckPieceWindow = std::chrono::seconds(10);
 
+// Tail reject-TTL: at needed==0, a rejecting seed is BUSY (queue full), not
+// hostile — 20s re-entry catches the capacity window when its queue drains.
+// The 60s bulk TTL (InProgressPiece::kRejectedBlockTTL) exiles the only
+// holders of the last pieces (observed: crawl to 0).
+static constexpr auto kRejectedBlockTTLTail = std::chrono::seconds(20);
+
 // libtorrent initial_picker_threshold: pick this many pieces RANDOMLY at the
 // start of a download instead of rarest-first, so a fresh leecher quickly
 // gains pieces it can upload — earning regular (non-optimistic) tit-for-tat
