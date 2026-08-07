@@ -167,6 +167,13 @@ static constexpr auto kStuckPieceWindow = std::chrono::seconds(10);
 // holders of the last pieces (observed: crawl to 0).
 static constexpr auto kRejectedBlockTTLTail = std::chrono::seconds(20);
 
+// Tail hard-request cap: at needed==0, the oversubscribed seeds' queue wait
+// exceeds the 60s bulk cap (observed: 1035 of the tail's timeouts were
+// "after 60s" — the cap cancelling accepted-but-queued blocks, re-queueing
+// them, and the churn volume driving the rejects). The stuck gate + fan-out
+// already bound genuinely-dead owners at the tail, so the cap can be long.
+static constexpr auto kHardRequestCapTail = std::chrono::seconds(120);
+
 // libtorrent initial_picker_threshold: pick this many pieces RANDOMLY at the
 // start of a download instead of rarest-first, so a fresh leecher quickly
 // gains pieces it can upload — earning regular (non-optimistic) tit-for-tat
