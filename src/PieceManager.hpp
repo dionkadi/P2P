@@ -167,6 +167,15 @@ static constexpr auto kStuckPieceWindow = std::chrono::seconds(10);
 // holders of the last pieces (observed: crawl to 0).
 static constexpr auto kRejectedBlockTTLTail = std::chrono::seconds(20);
 
+// qB-model tail scheduler: at needed==0, each seed's request depth is
+// bounded to this many blocks across the STUCK pieces (no arrival for
+// kStuckPieceWindow), refilled continuously. 24 x 16 KiB = 384 KiB per
+// seed -> 4-13s back-of-queue wait at the measured 30-100 KB/s per-
+// connection share — inside the 60s hard cap, so the cancels stop, the
+// churn stops, and the tail lands at the seeds' aggregate share (qB's
+// mechanism: bounded per-peer queues, continuous refill, spanning pieces).
+static constexpr size_t kTailBlocksPerPeer = 24;
+
 // libtorrent initial_picker_threshold: pick this many pieces RANDOMLY at the
 // start of a download instead of rarest-first, so a fresh leecher quickly
 // gains pieces it can upload — earning regular (non-optimistic) tit-for-tat
@@ -263,6 +272,9 @@ public:
     asio::awaitable<void> endgame_watchdog();
     asio::awaitable<void> request_one_piece();
     asio::awaitable<void> check_and_enter_endgame(bool stalled = false);
+    // qB-model tail scheduler: bounds each seed's request depth across the
+    // stuck pieces at needed==0 (see kTailBlocksPerPeer).
+    asio::awaitable<void> tail_scheduler_pass();
     asio::awaitable<void> return_piece_to_queue(size_t piece_index);
 
     // All three shared structures (in_progress_pieces_, pieces_by_rarity_,

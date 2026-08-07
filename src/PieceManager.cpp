@@ -138,6 +138,14 @@ asio::awaitable<void> PieceManager::downloader() {
             }
         }
 
+        // qB-model tail scheduler: at needed==0, bound each seed's request
+        // depth across the stuck pieces — shallow per-seed queues make the
+        // waits fit the 60s cap, so the cancels stop and the tail lands at
+        // the seeds' aggregate share.
+        if (state_->needed_pieces() == 0 && !state_->is_in_endgame_mode()) {
+            co_await tail_scheduler_pass();
+        }
+
         // Endgame trigger: fire when the remaining work is small OR the
         // download has made no progress for kEndgameStallTime with pieces
         // in flight. The count-based trigger can't fire near the end with
@@ -488,6 +496,107 @@ asio::awaitable<bool> PieceManager::try_piece_download(size_t piece_index, const
     co_return true;
 }
 
+asio::awaitable<void> PieceManager::tail_scheduler_pass() {
+    // qB-model tail scheduler: bound each seed's request depth to
+    // kTailBlocksPerPeer across the STUCK pieces (no arrival for
+    // kStuckPieceWindow), refilled continuously. The seeds' per-connection
+    // queues stay shallow (24 x 16 KiB = 384 KiB -> 4-13s back-of-queue
+    // wait at the measured 30-100 KB/s per-connection share), so accepted
+    // requests are served within the 60s cap — the cancels stop, the churn
+    // stops, and the tail lands at the seeds' aggregate share.
+    auto pieces = in_progress_pieces();
+    if (!pieces || pieces->empty()) {
+        co_return;
+    }
+    auto now = std::chrono::steady_clock::now();
+    std::vector<size_t> stuck;
+    std::map<PeerId, size_t> per_peer_outstanding;
+    for (const auto& [idx, prog] : *pieces) {
+        bool is_stuck = false;
+        {
+            std::lock_guard lock(prog->piece_mutex_);
+            is_stuck = prog->last_progress != TimePoint{} && now - prog->last_progress > kStuckPieceWindow;
+            if (is_stuck) {
+                stuck.push_back(idx);
+            }
+            // Total per-seed depth across ALL pieces (includes the resumer's
+            // primary refills) — the cap bounds the whole connection's
+            // queue, not just the scheduler's share.
+            for (const auto& owners : prog->outstanding_requests) {
+                for (const auto& pid : owners) {
+                    ++per_peer_outstanding[pid];
+                }
+            }
+        }
+    }
+    if (stuck.empty()) {
+        co_return;
+    }
+
+    for (size_t piece_idx : stuck) {
+        auto progress = in_progress_piece(piece_idx);
+        if (!progress) continue;
+        auto holders = co_await get_available_peers_(piece_idx);
+        // Least-loaded holders first.
+        std::sort(holders.begin(), holders.end(), [&](const auto& a, const auto& b) {
+            return per_peer_outstanding[a->peer_id()] < per_peer_outstanding[b->peer_id()];
+        });
+        for (const auto& peer : holders) {
+            auto& count = per_peer_outstanding[peer->peer_id()];
+            if (count >= kTailBlocksPerPeer) continue;
+            // Pick the missing block with the FEWEST current owners
+            // (redundancy without the flood); skip owners already
+            // outstanding or recently rejecting.
+            uint32_t best_block = UINT32_MAX;
+            size_t best_owners = SIZE_MAX;
+            {
+                std::lock_guard lock(progress->piece_mutex_);
+                for (uint32_t b = 0; b < progress->total_blocks; ++b) {
+                    if (progress->blocks_received[b]) continue;
+                    if (b >= progress->outstanding_requests.size()) continue;
+                    auto& owners = progress->outstanding_requests[b];
+                    if (std::find(owners.begin(), owners.end(), peer->peer_id()) != owners.end()) continue;
+                    bool rejected = false;
+                    if (b < progress->rejected_by.size()) {
+                        for (const auto& [pid, when] : progress->rejected_by[b]) {
+                            if (pid == peer->peer_id() && now - when < kRejectedBlockTTLTail) {
+                                rejected = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (rejected) continue;
+                    if (owners.size() < best_owners) {
+                        best_owners = owners.size();
+                        best_block = b;
+                    }
+                }
+            }
+            if (best_block == UINT32_MAX) continue;
+            uint32_t offset = best_block * BLOCK_SIZE;
+            uint32_t length = (best_block == progress->total_blocks - 1)
+                ? (progress->data.size() - offset)
+                : BLOCK_SIZE;
+            {
+                std::lock_guard lock(progress->piece_mutex_);
+                if (best_block < progress->outstanding_requests.size()) {
+                    auto& owners = progress->outstanding_requests[best_block];
+                    if (std::find(owners.begin(), owners.end(), peer->peer_id()) == owners.end()) {
+                        owners.push_back(peer->peer_id());
+                    }
+                }
+            }
+            asio::co_spawn(io_context_,
+                [peer, piece_idx, offset, length]() -> asio::awaitable<void> {
+                    co_await peer->send_request(piece_idx, offset, length);
+                },
+                asio::detached
+            );
+            ++count;
+        }
+    }
+}
+
 asio::awaitable<void> PieceManager::check_and_enter_endgame(bool stalled) {
     auto self = shared_from_this();
     
@@ -728,20 +837,6 @@ asio::awaitable<void> PieceManager::resume_piece_download(size_t piece_index) {
         }
 
         bool endgame = state_->is_in_endgame_mode();
-        // Tail redundancy: when every piece is started (needed=0), the
-        // single-peer picks can't land the final blocks (the churning
-        // seeds' windows) — the bounded multi-peer fan-out does. The fan-out
-        // applies ONLY to pieces making no progress (no block arrival for
-        // kStuckPieceWindow): applying it to the whole tail (200+ in-
-        // progress pieces at needed=0) flooded the swarm and broke the bulk
-        // (observed: MB/s -> collapse at ~98%).
-        bool tail_redundancy = !endgame && state_->needed_pieces() == 0;
-        bool piece_stuck = false;
-        if (tail_redundancy) {
-            std::lock_guard lock(piece_progress->piece_mutex_);
-            piece_stuck = piece_progress->last_progress != TimePoint{}
-                && std::chrono::steady_clock::now() - piece_progress->last_progress > kStuckPieceWindow;
-        }
         bool spawned_any = false;
         for (uint32_t block_idx : missing_indices) {
             uint32_t offset = block_idx * BLOCK_SIZE;
@@ -749,7 +844,7 @@ asio::awaitable<void> PieceManager::resume_piece_download(size_t piece_index) {
                 ? (piece_progress->data.size() - offset)
                 : BLOCK_SIZE;
 
-            if (endgame || (tail_redundancy && piece_stuck)) {
+            if (endgame) {
                 // Endgame: request from a few unchoked peers that have not
                 // recently rejected this block (redundancy is the point; the
                 // ALL-peers fan-out flooded the swarm and drew REJECT storms
