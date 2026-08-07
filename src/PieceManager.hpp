@@ -126,6 +126,15 @@ static constexpr size_t kMaxSpawnsPerWake = 32;
 // (observed: 0 B/s at 99.8% for minutes, endgame never fired).
 static constexpr auto kEndgameStallTime = std::chrono::seconds(30);
 
+// Count-based endgame trigger: fire when needed+in-progress drops below
+// this. Deliberately SMALL (32, not the 256 window ceiling): the endgame's
+// all-peers redundancy floods the swarm — firing it at ~98% (which the
+// window-scale threshold did, given the budget keeps ~200-256 in-progress)
+// collapsed the tail to <100 KB/s via REJECT storms. The normal path
+// handles the common final pieces at MB/s; endgame engages only for the
+// true tail (or via the stall backstop).
+static constexpr size_t kEndgamePieceThreshold = 32;
+
 // libtorrent initial_picker_threshold: pick this many pieces RANDOMLY at the
 // start of a download instead of rarest-first, so a fresh leecher quickly
 // gains pieces it can upload — earning regular (non-optimistic) tit-for-tat

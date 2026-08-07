@@ -500,9 +500,12 @@ asio::awaitable<void> PieceManager::check_and_enter_endgame(bool stalled) {
     // 92.4% completion (840 of 11134 pieces = 215 MB still to go), flooding
     // every unchoked peer with duplicate requests for all 840 pieces —
     // observed 13,151 REJECTs and the last 11 pieces stuck missing their
-    // final blocks while the flood kept them blacklisted at 99.9%. Cap the
-    // trigger at the window ceiling (a bounded redundancy window).
-    size_t endgame_threshold = std::min<size_t>(state_->num_pieces() / 10, kMaxInFlightPieces);
+    // final blocks while the flood kept them blacklisted at 99.9%. The
+    // window-scale cap (256) fired at ~98% given the budget keeps ~200-256
+    // in-progress, collapsing the tail to <100 KB/s via REJECT storms;
+    // kEndgamePieceThreshold (32) engages the redundancy only for the true
+    // tail (the stall backstop covers stuck pieces at any progress).
+    size_t endgame_threshold = std::min<size_t>(state_->num_pieces() / 10, kEndgamePieceThreshold);
     // Stalled: no completion for kEndgameStallTime with pieces in flight
     // and progress already made (excludes the cold-start ramp). The
     // budget-refill keeps the window full, so the count condition alone can
