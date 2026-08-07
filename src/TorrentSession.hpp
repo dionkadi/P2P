@@ -195,6 +195,7 @@ private:
     AsyncRateLimiter<> upload_limiter_;
     AsyncRateLimiter<> download_limiter_;
     std::atomic<bool> shutting_down_{false};
+    std::chrono::steady_clock::time_point last_resume_all_{}; // unchoke-resume gate: re-arm dark blocks at most every 5s
     asio::steady_timer completion_timer_;
     std::function<void()> on_complete_;
     std::chrono::seconds tracker_announce_interval_;

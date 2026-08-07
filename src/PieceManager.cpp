@@ -45,11 +45,12 @@ asio::awaitable<void> PieceManager::downloader() {
     // Start the periodic block timeout checker
     asio::co_spawn(io_context_, self->block_timeout_loop(), asio::detached);
 
-    // Stall tracking for the endgame trigger: the last time a piece
-    // completed (the clock only matters once pieces have completed — the
-    // cold-start ramp is excluded by the completed>0 condition).
-    size_t last_completed = state_->completed_pieces();
-    auto last_completion_time = std::chrono::steady_clock::now();
+    // Stall tracking for the endgame trigger: the completion-rate window —
+    // the endgame fires when fewer than kEndgameMinCompletionsPerWindow
+    // pieces complete within kEndgameStallTime (the old last-completion
+    // test was reset by the tail's trickle).
+    auto stall_window_start = std::chrono::steady_clock::now();
+    size_t completed_at_window_start = state_->completed_pieces();
 
     while (!state_->is_download_complete() && !shutting_down_) {
         int slots_to_fill = 0;
@@ -149,11 +150,12 @@ asio::awaitable<void> PieceManager::downloader() {
         // the final blocks in the same run.
         auto now_w = std::chrono::steady_clock::now();
         size_t completed_now = state_->completed_pieces();
-        if (completed_now != last_completed) {
-            last_completed = completed_now;
-            last_completion_time = now_w;
+        bool stalled = false;
+        if (now_w - stall_window_start >= kEndgameStallTime) {
+            stalled = (completed_now - completed_at_window_start) < kEndgameMinCompletionsPerWindow;
+            stall_window_start = now_w;
+            completed_at_window_start = completed_now;
         }
-        bool stalled = now_w - last_completion_time > kEndgameStallTime;
         if (!state_->is_in_endgame_mode()) {
             co_await check_and_enter_endgame(stalled);
         }
@@ -194,8 +196,8 @@ asio::awaitable<void> PieceManager::downloader() {
 asio::awaitable<void> PieceManager::endgame_watchdog() {
     CTRACK_ASYNC("PieceManager::endgame_watchdog");
     auto self = shared_from_this();
-    size_t last_completed = state_->completed_pieces();
-    auto last_completion_time = std::chrono::steady_clock::now();
+    auto stall_window_start = std::chrono::steady_clock::now();
+    size_t completed_at_window_start = state_->completed_pieces();
     while (!state_->is_download_complete() && !shutting_down_) {
         try {
             endgame_timer_.expires_after(std::chrono::seconds(1));
@@ -210,11 +212,12 @@ asio::awaitable<void> PieceManager::endgame_watchdog() {
 
         auto now_w = std::chrono::steady_clock::now();
         size_t completed_now = state_->completed_pieces();
-        if (completed_now != last_completed) {
-            last_completed = completed_now;
-            last_completion_time = now_w;
+        bool stalled = false;
+        if (now_w - stall_window_start >= kEndgameStallTime) {
+            stalled = (completed_now - completed_at_window_start) < kEndgameMinCompletionsPerWindow;
+            stall_window_start = now_w;
+            completed_at_window_start = completed_now;
         }
-        bool stalled = now_w - last_completion_time > kEndgameStallTime;
         if (!state_->is_in_endgame_mode()) {
             co_await check_and_enter_endgame(stalled);
         }
@@ -511,7 +514,7 @@ asio::awaitable<void> PieceManager::check_and_enter_endgame(bool stalled) {
     // budget-refill keeps the window full, so the count condition alone can
     // never fire near the end (observed: 0 B/s at 99.8% for minutes,
     // endgame never fired).
-    bool no_progress = stalled && state_->completed_pieces() > 0 && in_progress_pieces()->size() > 0;
+    bool no_progress = stalled && state_->completed_pieces() >= kEndgamePieceThreshold && in_progress_pieces()->size() > 0;
     if ((needed_count > 0 && needed_count < endgame_threshold) || no_progress) {
         LOGINFO("🎉 All pieces requested. Entering ENDGAME MODE. 🎉");
         state_->is_in_endgame_mode(true);
@@ -731,10 +734,13 @@ asio::awaitable<void> PieceManager::resume_piece_download(size_t piece_index) {
                 : BLOCK_SIZE;
 
             if (endgame) {
-                // Endgame: request from all unchoked peers that have not
-                // recently rejected this block (redundancy is the point).
+                // Endgame: request from a few unchoked peers that have not
+                // recently rejected this block (redundancy is the point; the
+                // ALL-peers fan-out flooded the swarm and drew REJECT storms
+                // at the tail).
                 auto rejected = pruned_rejected_peers(piece_progress, block_idx);
                 auto available_peers = co_await get_available_peers_(piece_index);
+                size_t fanout = 0;
                 for (const auto& peer_conn : available_peers) {
                     if (peer_conn->peer_is_choking()) continue;
                     if (std::ranges::find(rejected, peer_conn->peer_id()) != rejected.end()) continue;
@@ -745,6 +751,7 @@ asio::awaitable<void> PieceManager::resume_piece_download(size_t piece_index) {
                         asio::detached
                     );
                     spawned_any = true;
+                    if (++fanout >= kEndgameFanout) break;
                 }
             } else {
                 // Normal mode: prefer the piece's PRIMARY peer (deep-queue

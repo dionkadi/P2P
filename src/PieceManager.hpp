@@ -118,13 +118,16 @@ static constexpr size_t kMaxPiecesPerPrimary = 4;
 // and costs nothing.
 static constexpr size_t kMaxSpawnsPerWake = 32;
 
-// Stall-based endgame trigger: fire endgame when no piece has completed for
-// this long while pieces remain in flight (and some progress was made — the
-// cold-start ramp is excluded). The budget-refill keeps the window full
-// (~200-256 in-progress), so the count-based trigger can never fire near
-// the end — the last blocks would go dark without the endgame redundancy
-// (observed: 0 B/s at 99.8% for minutes, endgame never fired).
-static constexpr auto kEndgameStallTime = std::chrono::seconds(30);
+// Rate-based endgame stall: fire endgame when fewer than
+// kEndgameMinCompletionsPerWindow pieces complete within the
+// kEndgameStallTime window (while pieces remain in flight and progress was
+// made). The old last-completion-time test was reset by a trickle (1 piece
+// per 30-60s at the tail), so the endgame never fired during the slow tail
+// (observed: endgame=0 while the last ~40 pieces crawled). The budget-refill
+// also keeps the window full (~200-256 in-progress), so the count-based
+// trigger alone can't cover the tail.
+static constexpr auto kEndgameStallTime = std::chrono::seconds(60);
+static constexpr size_t kEndgameMinCompletionsPerWindow = 8;
 
 // Count-based endgame trigger: fire when needed+in-progress drops below
 // this. Deliberately SMALL (32, not the 256 window ceiling): the endgame's
@@ -134,6 +137,12 @@ static constexpr auto kEndgameStallTime = std::chrono::seconds(30);
 // handles the common final pieces at MB/s; endgame engages only for the
 // true tail (or via the stall backstop).
 static constexpr size_t kEndgamePieceThreshold = 32;
+
+// Endgame fan-out: at most this many peers are asked for a missing block in
+// endgame mode. The ALL-peers fan-out flooded the swarm and drew REJECT
+// storms at the tail; a few duplicates provide the redundancy without the
+// flood.
+static constexpr size_t kEndgameFanout = 3;
 
 // libtorrent initial_picker_threshold: pick this many pieces RANDOMLY at the
 // start of a download instead of rarest-first, so a fresh leecher quickly

@@ -1409,12 +1409,15 @@ asio::awaitable<void> TorrentSession::on_choke_status_changed(std::shared_ptr<Pe
             }
         }
 
-        // Re-request the in-progress pieces' missing blocks: a stuck
-        // piece's blocks go dark (no outstanding request, no armed timer,
-        // no resume trigger) once no available peer has them, and an
-        // unchoke is the only event that can re-arm them — the freshly
-        // unchoked peer can serve them within its window.
-        piece_manager_->resume_all_in_progress();
+        // Gate the unchoke-triggered resume: every unchoke (~1.5/s) flooding
+        // the resumer for all in-progress pieces drew ~7 REJECTs/s at the
+        // tail (peer queue caps), blacklisting blocks and stalling the
+        // finish. Re-arm the dark blocks at most every 5s.
+        auto now_c = std::chrono::steady_clock::now();
+        if (now_c - last_resume_all_ > std::chrono::seconds(5)) {
+            last_resume_all_ = now_c;
+            piece_manager_->resume_all_in_progress();
+        }
         piece_manager_->notify_one();
         co_return;
     }
