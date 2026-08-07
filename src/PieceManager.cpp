@@ -514,7 +514,8 @@ asio::awaitable<void> PieceManager::check_and_enter_endgame(bool stalled) {
     // budget-refill keeps the window full, so the count condition alone can
     // never fire near the end (observed: 0 B/s at 99.8% for minutes,
     // endgame never fired).
-    bool no_progress = stalled && state_->completed_pieces() >= kEndgamePieceThreshold && in_progress_pieces()->size() > 0;
+    bool no_progress = stalled && state_->completed_pieces() >= kEndgamePieceThreshold
+        && needed_count < kEndgamePieceThreshold * 2 && in_progress_pieces()->size() > 0;
     if ((needed_count > 0 && needed_count < endgame_threshold) || no_progress) {
         LOGINFO("🎉 All pieces requested. Entering ENDGAME MODE. 🎉");
         state_->is_in_endgame_mode(true);

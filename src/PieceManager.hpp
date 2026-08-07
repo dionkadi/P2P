@@ -126,8 +126,15 @@ static constexpr size_t kMaxSpawnsPerWake = 32;
 // (observed: endgame=0 while the last ~40 pieces crawled). The budget-refill
 // also keeps the window full (~200-256 in-progress), so the count-based
 // trigger alone can't cover the tail.
+//
+// The threshold is ~1 MB/s (256/60s): the tail's single-peer request path
+// can't land the last ~40 pieces (churning seeds), and the endgame's
+// broadcast lands them in seconds (observed: endgame at 16:40:06, finish at
+// 16:40:09 — after a 2-minute dead zone at the old 8/60s threshold). A
+// count guard (needed+InProgress < 64, in check_and_enter_endgame) keeps
+// the broadcast's flood away from mid-download stalls.
 static constexpr auto kEndgameStallTime = std::chrono::seconds(60);
-static constexpr size_t kEndgameMinCompletionsPerWindow = 8;
+static constexpr size_t kEndgameMinCompletionsPerWindow = 256;
 
 // Count-based endgame trigger: fire when needed+in-progress drops below
 // this. Deliberately SMALL (32, not the 256 window ceiling): the endgame's
