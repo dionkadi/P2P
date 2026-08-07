@@ -151,6 +151,12 @@ static constexpr size_t kEndgamePieceThreshold = 32;
 // flood.
 static constexpr size_t kEndgameFanout = 3;
 
+// Per-piece stuck gate: a piece is "stuck" when no block has arrived for
+// this long. The resumer's multi-peer fan-out (tail redundancy) applies
+// only to stuck pieces — the whole-tail fan-out flooded the swarm and
+// broke the bulk (observed: MB/s -> collapse at ~98%).
+static constexpr auto kStuckPieceWindow = std::chrono::seconds(15);
+
 // libtorrent initial_picker_threshold: pick this many pieces RANDOMLY at the
 // start of a download instead of rarest-first, so a fresh leecher quickly
 // gains pieces it can upload — earning regular (non-optimistic) tit-for-tat

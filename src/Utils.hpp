@@ -700,6 +700,11 @@ struct InProgressPiece {
     uint32_t received_count = 0;
     uint32_t total_blocks = 0;
     bool resume_task_active = false;
+    // Last block arrival time — the per-piece stuck gate: the resumer's
+    // multi-peer fan-out (tail redundancy) applies only to pieces with no
+    // arrival for kStuckPieceWindow, so the tail's stuck blocks get the
+    // redundancy without flooding the whole window.
+    TimePoint last_progress{};
 
     // The peer this piece is primarily requested from (whole-piece deep-queue
     // model, matching qBittorrent's request_queue_size). The resumer prefers

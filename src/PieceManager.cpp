@@ -446,6 +446,7 @@ asio::awaitable<bool> PieceManager::try_piece_download(size_t piece_index, const
     {
         std::lock_guard lock(piece_progress->piece_mutex_);
         piece_progress->primary_peer = primary->peer_id();
+        piece_progress->last_progress = std::chrono::steady_clock::now();
     }
     size_t seed_count = num_blocks;
     for (uint32_t block_idx = 0; block_idx < seed_count; ++block_idx) {
@@ -729,12 +730,18 @@ asio::awaitable<void> PieceManager::resume_piece_download(size_t piece_index) {
         bool endgame = state_->is_in_endgame_mode();
         // Tail redundancy: when every piece is started (needed=0), the
         // single-peer picks can't land the final blocks (the churning
-        // seeds' windows) — the bounded multi-peer fan-out does (qB keeps
-        // every unchoked peer's queue full with the final blocks; we
-        // replicate that at the tail without waiting for the endgame's
-        // fragile triggers — observed: endgame=0 with the tail crawling at
-        // ~10 KB/s while qB's tail holds MB/s).
+        // seeds' windows) — the bounded multi-peer fan-out does. The fan-out
+        // applies ONLY to pieces making no progress (no block arrival for
+        // kStuckPieceWindow): applying it to the whole tail (200+ in-
+        // progress pieces at needed=0) flooded the swarm and broke the bulk
+        // (observed: MB/s -> collapse at ~98%).
         bool tail_redundancy = !endgame && state_->needed_pieces() == 0;
+        bool piece_stuck = false;
+        if (tail_redundancy) {
+            std::lock_guard lock(piece_progress->piece_mutex_);
+            piece_stuck = piece_progress->last_progress != TimePoint{}
+                && std::chrono::steady_clock::now() - piece_progress->last_progress > kStuckPieceWindow;
+        }
         bool spawned_any = false;
         for (uint32_t block_idx : missing_indices) {
             uint32_t offset = block_idx * BLOCK_SIZE;
@@ -742,7 +749,7 @@ asio::awaitable<void> PieceManager::resume_piece_download(size_t piece_index) {
                 ? (piece_progress->data.size() - offset)
                 : BLOCK_SIZE;
 
-            if (endgame || tail_redundancy) {
+            if (endgame || (tail_redundancy && piece_stuck)) {
                 // Endgame: request from a few unchoked peers that have not
                 // recently rejected this block (redundancy is the point; the
                 // ALL-peers fan-out flooded the swarm and drew REJECT storms

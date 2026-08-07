@@ -1084,6 +1084,7 @@ asio::awaitable<void> TorrentSession::on_piece_block(std::shared_ptr<PeerConnect
         std::ranges::copy(block_data, progress->data.begin() + begin);
         progress->blocks_received[block_index] = true;
         ++progress->received_count;
+        progress->last_progress = std::chrono::steady_clock::now();
 
         // Block is done: clear rejection history so it never blocks a re-request.
         if (block_index < progress->rejected_by.size()) {
