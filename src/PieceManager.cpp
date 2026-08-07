@@ -727,6 +727,14 @@ asio::awaitable<void> PieceManager::resume_piece_download(size_t piece_index) {
         }
 
         bool endgame = state_->is_in_endgame_mode();
+        // Tail redundancy: when every piece is started (needed=0), the
+        // single-peer picks can't land the final blocks (the churning
+        // seeds' windows) — the bounded multi-peer fan-out does (qB keeps
+        // every unchoked peer's queue full with the final blocks; we
+        // replicate that at the tail without waiting for the endgame's
+        // fragile triggers — observed: endgame=0 with the tail crawling at
+        // ~10 KB/s while qB's tail holds MB/s).
+        bool tail_redundancy = !endgame && state_->needed_pieces() == 0;
         bool spawned_any = false;
         for (uint32_t block_idx : missing_indices) {
             uint32_t offset = block_idx * BLOCK_SIZE;
@@ -734,7 +742,7 @@ asio::awaitable<void> PieceManager::resume_piece_download(size_t piece_index) {
                 ? (piece_progress->data.size() - offset)
                 : BLOCK_SIZE;
 
-            if (endgame) {
+            if (endgame || tail_redundancy) {
                 // Endgame: request from a few unchoked peers that have not
                 // recently rejected this block (redundancy is the point; the
                 // ALL-peers fan-out flooded the swarm and drew REJECT storms
