@@ -146,16 +146,20 @@ static constexpr size_t kEndgameMinCompletionsPerWindow = 256;
 static constexpr size_t kEndgamePieceThreshold = 32;
 
 // Endgame fan-out: at most this many peers are asked for a missing block in
-// endgame mode. The ALL-peers fan-out flooded the swarm and drew REJECT
-// storms at the tail; a few duplicates provide the redundancy without the
-// flood.
-static constexpr size_t kEndgameFanout = 3;
+// endgame mode or for a stuck tail piece. The ALL-peers fan-out flooded the
+// swarm and drew REJECT storms at the tail; a few duplicates provide the
+// redundancy without the flood. 6 (up from 3): the stuck-gate bounds the
+// fan-out to stalled pieces only, so the per-pass volume (~40 stuck x 2
+// blocks x 6 ~ 480) stays under the peers' queue caps while landing the
+// tail at MB/s.
+static constexpr size_t kEndgameFanout = 6;
 
 // Per-piece stuck gate: a piece is "stuck" when no block has arrived for
 // this long. The resumer's multi-peer fan-out (tail redundancy) applies
 // only to stuck pieces — the whole-tail fan-out flooded the swarm and
-// broke the bulk (observed: MB/s -> collapse at ~98%).
-static constexpr auto kStuckPieceWindow = std::chrono::seconds(15);
+// broke the bulk (observed: MB/s -> collapse at ~98%). 10s (down from
+// 15s): the fan-out engages sooner, holding the tail closer to MB/s.
+static constexpr auto kStuckPieceWindow = std::chrono::seconds(10);
 
 // libtorrent initial_picker_threshold: pick this many pieces RANDOMLY at the
 // start of a download instead of rarest-first, so a fresh leecher quickly
