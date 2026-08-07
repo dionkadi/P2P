@@ -748,7 +748,7 @@ int main(int argc, char* argv[]) {
             if (half_col) {
                 auto c = Gradient{{RGB{220,50,50}, RGB{220,180,30}, RGB{50,200,50}}}
                     .at(bar_cols > 1 ? static_cast<double>(filled_cols - 1) / (bar_cols - 1) : 1.0);
-                torrents_body += c.to_ansi_foreground() + "▌" + std::string(style::reset);
+                torrents_body += c.to_ansi_foreground() + " " + std::string(style::reset);
             }
             for (size_t i = 0; i < empty_cols; ++i) {
                 torrents_body += Text{" "}.color(style::bright_black).str();
