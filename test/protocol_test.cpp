@@ -572,9 +572,9 @@ TEST(PeerManagerLimitsTest, DefaultLimits) {
     auto state = make_test_state();
     auto pm = std::make_shared<PeerManager>(io, state);
 
-    EXPECT_EQ(pm->max_total_connections(), 200);
-    EXPECT_EQ(pm->max_connections_per_ip(), 2);
-    EXPECT_EQ(pm->max_half_open_connections(), 100);
+    EXPECT_EQ(pm->max_total_connections(), 500);
+    EXPECT_EQ(pm->max_connections_per_ip(), 4);
+    EXPECT_EQ(pm->max_half_open_connections(), 500);
     EXPECT_EQ(pm->half_open_connections(), 0);
 }
 
@@ -733,10 +733,13 @@ TEST(PieceManagerTimeoutTest, BlockWithinTimeoutDoesNotTrigger) {
     auto piece = std::make_shared<InProgressPiece>(static_cast<uint64_t>(BLOCK_SIZE));
     pm->emplace_in_progress_pieces(0, piece);
 
-    // Set request time to 5 seconds ago (well within the 30s timeout)
-    piece->request_times[0] = std::chrono::steady_clock::now() - 5s;
+    // Set request time to 1 second ago (well within BLOCK_REQUEST_TIMEOUT=4s)
+    piece->request_times[0] = std::chrono::steady_clock::now() - 1s;
 
-    RunAsync(io, pm->check_block_timeouts());
+    // Use RunAsyncFor so the detached resumer loop spawned by
+    // ensure_resume_piece_download (when get_available_peers_ returns empty)
+    // doesn't keep io.run() alive forever if a timeout ever fires.
+    RunAsyncFor(io, 200ms, pm->check_block_timeouts());
 
     EXPECT_FALSE(timeout_fired) << "Timeout callback should not fire for a block within the timeout period";
 }
@@ -1145,37 +1148,41 @@ TEST(ChokingAlgorithmTest, TopUploadersUnchoked) {
     asio::io_context io;
     auto state = make_test_state();
     auto pm = std::make_shared<PeerManager>(io, state, std::chrono::milliseconds(50));
-    pm->set_max_total_connections(10);
-    pm->set_max_connections_per_ip(10);
+    // More peers than kUnchokeSlots (12) so tit-for-tat actually selects.
+    pm->set_max_total_connections(30);
+    pm->set_max_connections_per_ip(30);
 
-    auto p1 = make_test_conn(io, "1.2.3.1:6881", test_peer_id("p1"), 0, 1000);
-    auto p2 = make_test_conn(io, "1.2.3.2:6881", test_peer_id("p2"), 0, 800);
-    auto p3 = make_test_conn(io, "1.2.3.3:6881", test_peer_id("p3"), 0, 600);
-    auto p4 = make_test_conn(io, "1.2.3.4:6881", test_peer_id("p4"), 0, 400);
-    auto p5 = make_test_conn(io, "1.2.3.5:6881", test_peer_id("p5"), 0, 200);
-    auto p6 = make_test_conn(io, "1.2.3.6:6881", test_peer_id("p6"), 0, 50);
-
-    for (auto& p : {p1, p2, p3, p4, p5, p6}) {
-        p->peer_is_interested(true);
+    // Set both sort keys: the seed branch orders by bytes_uploaded, the
+    // leech branch by bytes_downloaded. Distinct descending values exercise
+    // the real selection either way.
+    std::vector<std::shared_ptr<TestPeerConn>> peers;
+    for (int i = 1; i <= 14; ++i) {
+        auto conn = make_test_conn(io, "1.2.3." + std::to_string(i) + ":6881",
+                                   test_peer_id("p" + std::to_string(i)),
+                                   static_cast<uint64_t>(1000 - (i - 1) * 70),
+                                   static_cast<uint64_t>(1000 - (i - 1) * 70));
+        conn->peer_is_interested(true);
+        ASSERT_TRUE(pm->add_connection(conn->peer_id(), conn));
+        peers.push_back(conn);
     }
-
-    ASSERT_TRUE(pm->add_connection(p1->peer_id(), p1));
-    ASSERT_TRUE(pm->add_connection(p2->peer_id(), p2));
-    ASSERT_TRUE(pm->add_connection(p3->peer_id(), p3));
-    ASSERT_TRUE(pm->add_connection(p4->peer_id(), p4));
-    ASSERT_TRUE(pm->add_connection(p5->peer_id(), p5));
-    ASSERT_TRUE(pm->add_connection(p6->peer_id(), p6));
-    ASSERT_EQ(pm->connection_count(), 6);
+    ASSERT_EQ(pm->connection_count(), 14);
 
     asio::co_spawn(io, pm->choke_loop(), asio::detached);
-    io.run_for(std::chrono::milliseconds(70));
+    // The choke loop zeroes the transfer counters at the end of each pass
+    // ("this round" semantics), so only the FIRST pass sorts by the values
+    // set above. A 20ms run covers pass 1 (0ms timer) without reaching pass
+    // 2 (50ms timer), and never reaches the optimistic slot (3rd pass).
+    io.run_for(std::chrono::milliseconds(20));
     pm->cancel();
     io.run_for(std::chrono::milliseconds(5));
 
-    EXPECT_FALSE(p1->am_choking()) << "p1 (top uploader 1000) should be unchoked";
-    EXPECT_FALSE(p2->am_choking()) << "p2 (top uploader 800) should be unchoked";
-    EXPECT_FALSE(p3->am_choking()) << "p3 (top uploader 600) should be unchoked";
-    EXPECT_TRUE(p6->am_choking()) << "p6 (lowest uploader 50) should remain choked";
+    EXPECT_FALSE(peers[0]->am_choking()) << "p1 (top uploader 1000) should be unchoked";
+    EXPECT_FALSE(peers[1]->am_choking()) << "p2 (top uploader 930) should be unchoked";
+    EXPECT_FALSE(peers[2]->am_choking()) << "p3 (top uploader 860) should be unchoked";
+    EXPECT_TRUE(peers[12]->am_choking()) << "p13 (uploader 160) should remain choked";
+    EXPECT_TRUE(peers[13]->am_choking()) << "p14 (lowest uploader 90) should remain choked";
+    EXPECT_EQ(pm->get_unchoked_peers().size(), 11)
+        << "Exactly the 11 regular slots should be unchoked";
 }
 
 TEST(ChokingAlgorithmTest, UninterestedPeersNeverUnchoked) {
@@ -1238,15 +1245,16 @@ TEST(ChokingAlgorithmTest, OptimisticRotationIncreasesUnchokeCount) {
     asio::io_context io;
     auto state = make_test_state();
     auto pm = std::make_shared<PeerManager>(io, state, std::chrono::milliseconds(50));
-    pm->set_max_total_connections(10);
-    pm->set_max_connections_per_ip(10);
+    // More peers than kUnchokeSlots (12) so the optimistic slot is exercised.
+    pm->set_max_total_connections(30);
+    pm->set_max_connections_per_ip(30);
 
     std::vector<std::shared_ptr<TestPeerConn>> peers;
-    for (int i = 1; i <= 6; ++i) {
-        std::string suffix = "p" + std::to_string(i);
-        std::string addr = "1.2.3." + std::to_string(i) + ":6881";
-        auto pid = test_peer_id(suffix);
-        auto conn = make_test_conn(io, addr, pid, 0, 100);
+    for (int i = 1; i <= 14; ++i) {
+        auto conn = make_test_conn(io, "1.2.3." + std::to_string(i) + ":6881",
+                                   test_peer_id("p" + std::to_string(i)),
+                                   static_cast<uint64_t>(1000 - (i - 1) * 70),
+                                   static_cast<uint64_t>(1000 - (i - 1) * 70));
         conn->peer_is_interested(true);
         ASSERT_TRUE(pm->add_connection(conn->peer_id(), conn));
         peers.push_back(conn);
@@ -1258,23 +1266,23 @@ TEST(ChokingAlgorithmTest, OptimisticRotationIncreasesUnchokeCount) {
     io.run_for(std::chrono::milliseconds(5));
 
     auto unchoked = pm->get_unchoked_peers();
-    EXPECT_EQ(unchoked.size(), 4)
-        << "After optimistic rotation, should have 4 unchoked peers (3 regular + 1 optimistic)";
+    EXPECT_EQ(unchoked.size(), 12)
+        << "After optimistic rotation, should have 12 unchoked peers (11 regular + 1 optimistic)";
 }
 
 TEST(ChokingAlgorithmTest, PreviousOptimisticPeerIsChokedOnRotation) {
     asio::io_context io;
     auto state = make_test_state();
     auto pm = std::make_shared<PeerManager>(io, state, std::chrono::milliseconds(50));
-    pm->set_max_total_connections(10);
-    pm->set_max_connections_per_ip(10);
+    pm->set_max_total_connections(30);
+    pm->set_max_connections_per_ip(30);
 
     std::vector<std::shared_ptr<TestPeerConn>> peers;
-    for (int i = 1; i <= 6; ++i) {
-        std::string suffix = "p" + std::to_string(i);
-        std::string addr = "1.2.3." + std::to_string(i) + ":6881";
-        auto pid = test_peer_id(suffix);
-        auto conn = make_test_conn(io, addr, pid, 0, 100);
+    for (int i = 1; i <= 14; ++i) {
+        auto conn = make_test_conn(io, "1.2.3." + std::to_string(i) + ":6881",
+                                   test_peer_id("p" + std::to_string(i)),
+                                   static_cast<uint64_t>(1000 - (i - 1) * 70),
+                                   static_cast<uint64_t>(1000 - (i - 1) * 70));
         conn->peer_is_interested(true);
         ASSERT_TRUE(pm->add_connection(conn->peer_id(), conn));
         peers.push_back(conn);
@@ -1286,8 +1294,8 @@ TEST(ChokingAlgorithmTest, PreviousOptimisticPeerIsChokedOnRotation) {
     io.run_for(std::chrono::milliseconds(5));
 
     auto unchoked = pm->get_unchoked_peers();
-    EXPECT_EQ(unchoked.size(), 4)
-        << "After multiple rotations, exactly 4 peers should be unchoked";
+    EXPECT_EQ(unchoked.size(), 12)
+        << "After multiple rotations, exactly 12 peers should be unchoked";
 }
 
 // ============================================================

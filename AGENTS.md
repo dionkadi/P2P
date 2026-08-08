@@ -24,7 +24,7 @@ P2P is a C++23 BitTorrent client (`build/client`) + tracker server (`build/track
 - One integration case: `./build/p2p_test --gtest_filter=IntegrationTest.BasicDownload`
 - Unit suites: `BencodeTest`, `BufferWriterTest`/`BufferReaderTest`, `CryptoTest`, `BackoffTest`, `MagnetUriTest`, `ClientConfigTest`, `TorrentFileTest`, `SessionStateTest`, `AsyncRateLimiterTest`, `ProtocolTest` (many sub-suites), `FileManagerTest`, `DHTNetworkTest`, `TrackerDirectTest`, `BanUnitTest`, `ClientAppShutdownTest`.
 - Integration quirks: `IntegrationTest` shares one `asio::io_context` fixture across all cases — state can leak between tests. Rerun individually before chasing flakiness. Known timeouts: `TrackerFailover` (180s), `LargeTorrentManyPieces` (600s), `ChokingAlgorithm` (sleeps 15s). Full suite >90s even when passing.
-- Integration tests spin up an in-process tracker on ports 6880/6880; `#include` `src/` headers directly.
+- Integration tests spin up an in-process tracker on ports 16880/16880; `#include` `src/` headers directly.
 - Test helpers in `test/helper.hpp`: `RunAsync`, `RunAsyncFor`.
 - `test/output.txt` is a tracked LeakSanitizer crash-log artifact — ignore it.
 

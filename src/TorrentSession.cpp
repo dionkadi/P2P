@@ -231,20 +231,19 @@ asio::awaitable<bool> TorrentSession::init() {
         if (resume_opt) {
             ResumeData resume = ResumeData::deserialize(*resume_opt);
             co_await load_session_state(resume);
-            if (state_->completed_pieces() == state_->num_pieces()) {
-                state_->is_download_complete(true);
-                LOGINFO("File is already complete and verified. Nothing to download.");
-                completion_timer_.cancel();
-            }
         } else {
             piece_manager_->build_piece_rarity();
         }
 
-        // Hybrid mode: after loading resume data, verify any pieces
-        // we already have on disk (marked Have by resume data).
-        // Only checks pieces that were already Have — newly pre-allocated
-        // files (zeros) are never verified, avoiding false CORRUPTION logs.
-        if (mode_ == Mode::Hybrid && !state_->is_download_complete()) {
+        // Verify the pieces claimed Have by the resume data against disk
+        // before trusting them (any download mode): the file may have been
+        // modified, truncated, or replaced since the previous session.
+        // verify_pieces hashes every piece, marks corrupted ones Needed for
+        // re-download, and rebuilds completed_pieces from the result — so a
+        // resume that claims 100% is re-checked rather than trusted. Fresh
+        // downloads (no resume data) skip this: pre-allocated zeroed files
+        // would hash as corrupted and produce false CORRUPTION logs.
+        if (resume_opt) {
             co_await file_manager_->verify_pieces();
             if (state_->completed_pieces() == state_->num_pieces()) {
                 state_->is_download_complete(true);

@@ -30,9 +30,12 @@ private:
 
 class IntegrationTest: public ::testing::Test {
 protected:
-    static constexpr int TRACKER_HTTP_PORT = 6880;
-    static constexpr int TRACKER_UDP_PORT = 6880;
-    static constexpr int PEER_PORT_BASE = 6881;
+    // Ports must not collide with the host's docker deployments (ariang
+    // publishes 6880/tcp, aria2 6800+6888) — the suite should not depend on
+    // a specific port being free.
+    static constexpr int TRACKER_HTTP_PORT = 16880;
+    static constexpr int TRACKER_UDP_PORT = 16880;
+    static constexpr int PEER_PORT_BASE = 16881;
 
     TempDir temp_dir;
     std::filesystem::path torrent_path;
