@@ -36,7 +36,9 @@ public:
         std::string peer_addr,
         const PeerId& my_id,
         std::shared_ptr<SessionState> state,
-        std::shared_ptr<IPeerConnectionEvents> events
+        std::shared_ptr<IPeerConnectionEvents> events,
+        bool mse_enabled,
+        bool inbound
     );
 
     PeerConnection(const PeerConnection&) = delete;
@@ -248,6 +250,8 @@ protected:
     AsyncSocket socket_;
     std::string peer_addr_;
     PeerId peer_id_{};
+    bool mse_enabled_{false};
+    bool inbound_{false};
 
     std::shared_ptr<AsyncRateLimiter<>> upload_limiter_;
     std::shared_ptr<AsyncRateLimiter<>> download_limiter_;

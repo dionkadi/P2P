@@ -221,6 +221,93 @@ static asio::awaitable<void> proxy_connect_tunnel(
     }
 }
 
+// Parse a tracker announce response body (BEP-3). Tolerant of the quirks of
+// real-world HTTP trackers: trailing data after the bencoded dictionary,
+// missing or odd-typed "interval", and "peers" in either compact (BEP-23)
+// or non-compact list-of-dicts form. Throws std::runtime_error when the
+// body is not a bencoded dictionary at all.
+inline TrackerAnnounceResult parse_tracker_response_body(std::span<const std::byte> body) {
+    // decode() is strict and rejects trailing data ("Trailing data left
+    // after decoding"); decode_prefix parses the first value and ignores
+    // the rest.
+    size_t consumed = 0;
+    Value decoded_body = decode_prefix(body, consumed);
+    const auto* dict = std::get_if<std::unique_ptr<Dict>>(&decoded_body.get_variant());
+    if (!dict) {
+        throw std::runtime_error("Tracker response body is not a dictionary");
+    }
+
+    TrackerAnnounceResult result;
+    result.interval_seconds = 1800; // BEP-3 fallback when "interval" is absent
+    if (auto interval_it = (*dict)->find("interval"); interval_it != (*dict)->end()) {
+        if (const auto* interval = std::get_if<Integer>(&interval_it->second.get_variant())) {
+            result.interval_seconds = static_cast<int>(*interval);
+        }
+    }
+
+    auto peers_it = (*dict)->find("peers");
+    if (peers_it == (*dict)->end()) {
+        return result;
+    }
+
+    if (const auto* peers_str = std::get_if<String>(&peers_it->second.get_variant())) {
+        // Compact 6-byte IP:port format (BEP-23). Tolerate a trailing
+        // remainder instead of failing the whole announce.
+        if (peers_str->length() % 6 != 0) {
+            LOGWARN("Tracker 'peers' length {} is not a multiple of 6; truncating", peers_str->length());
+        }
+        for (size_t i = 0; i + 6 <= peers_str->length(); i += 6) {
+            asio::ip::address_v4::bytes_type ip_bytes;
+            std::copy_n(peers_str->data() + i, 4, ip_bytes.begin());
+
+            uint16_t port_bytes;
+            std::memcpy(&port_bytes, peers_str->data() + i + 4, 2);
+            uint16_t port_host = ntohs(port_bytes);
+            result.peers.push_back(asio::ip::address_v4(ip_bytes).to_string() + ":" + std::to_string(port_host));
+        }
+    } else if (const auto* peers_list = std::get_if<std::unique_ptr<List>>(&peers_it->second.get_variant())) {
+        // Non-compact list-of-dicts (BEP-3): {"ip": str, "port": int}.
+        for (const auto& entry : **peers_list) {
+            const auto* entry_dict = std::get_if<std::unique_ptr<Dict>>(&entry.get_variant());
+            if (!entry_dict) continue;
+            const Dict& d = **entry_dict;
+            auto ip_it = d.find("ip");
+            auto port_it = d.find("port");
+            if (ip_it == d.end() || port_it == d.end()) continue;
+            const auto* ip_str = std::get_if<String>(&ip_it->second.get_variant());
+            const auto* port_int = std::get_if<Integer>(&port_it->second.get_variant());
+            if (!ip_str || !port_int) continue;
+            if (ip_str->find(':') != std::string::npos) {
+                LOGDBG("Tracker returned IPv6 peer {}; skipping (IPv4-only peer path)", *ip_str);
+                continue;
+            }
+            result.peers.push_back(*ip_str + ":" + std::to_string(static_cast<uint16_t>(*port_int)));
+        }
+    } else {
+        LOGWARN("Tracker 'peers' field has unexpected type; ignoring");
+    }
+    return result;
+}
+
+// Extract the tracker's own "failure reason" (BEP-3) from a non-200 body.
+// Returns "" when the body isn't a bencoded dict or has no such key.
+inline std::string parse_tracker_failure_reason(std::span<const std::byte> body) {
+    try {
+        size_t consumed = 0;
+        Value err_body = decode_prefix(body, consumed);
+        if (const auto* err_dict = std::get_if<std::unique_ptr<Dict>>(&err_body.get_variant())) {
+            if (auto it = (*err_dict)->find("failure reason"); it != (*err_dict)->end()) {
+                if (const auto* s = std::get_if<String>(&it->second.get_variant())) {
+                    return *s;
+                }
+            }
+        }
+    } catch (...) {
+        // Body isn't bencode — no failure reason available.
+    }
+    return {};
+}
+
 // Template helper: performs HTTP/HTTPS announce request/response cycle.
 // Works with both beast::tcp_stream and beast::ssl_stream<beast::tcp_stream>.
 // `proxy` (http proxy host, port) is non-empty when the connection was made
@@ -269,28 +356,11 @@ asio::awaitable<TrackerAnnounceResult> http_announce_impl(
         co_await http::async_read(stream, buffer, res, asio::use_awaitable);
 
         if (res.result() == http::status::ok) {
-            // Success — parse and return below
-            Value decoded_body = decode({reinterpret_cast<std::byte *>(res.body().data()), res.body().size()});
-            const auto* dict = std::get_if<std::unique_ptr<Dict>>(&decoded_body.get_variant());
-            if (!dict) {
-                throw std::runtime_error("Tracker response body is not a dictionary");
-            }
-
-            TrackerAnnounceResult result;
-            result.interval_seconds = std::get<Integer>((*dict)->at("interval").get_variant());
-            const auto& peers_str = std::get<String>((*dict)->at("peers").get_variant());
-            if (peers_str.length() % 6 != 0) {
-                throw std::runtime_error("Invalid peers list length in tracker response");
-            }
-            for (size_t i = 0; i < peers_str.length(); i += 6) {
-                asio::ip::address_v4::bytes_type ip_bytes;
-                std::copy_n(peers_str.data() + i, 4, ip_bytes.begin());
-
-                uint16_t port_bytes;
-                std::memcpy(&port_bytes, peers_str.data() + i + 4, 2);
-                uint16_t port_host = ntohs(port_bytes);
-                result.peers.push_back(asio::ip::address_v4(ip_bytes).to_string() + ":" + std::to_string(port_host));
-            }
+            // Success — parse and return below. Real-world HTTP trackers
+            // append trailing data (newlines, chunked-encoding remnants);
+            // parse_tracker_response_body tolerates it.
+            TrackerAnnounceResult result = parse_tracker_response_body(
+                {reinterpret_cast<const std::byte *>(res.body().data()), res.body().size()});
             co_return result;
         }
 
@@ -359,8 +429,12 @@ asio::awaitable<TrackerAnnounceResult> http_announce_impl(
             continue;
         }
 
+        // Surface the tracker's own BEP-3 "failure reason" when the body is
+        // bencoded, so the error message is actionable instead of "<none>".
+        std::string failure_reason = parse_tracker_failure_reason(
+            {reinterpret_cast<const std::byte *>(res.body().data()), res.body().size()});
         throw std::runtime_error("Tracker returned non-200 status: " + std::to_string(res.result_int()) +
-                                 " (" + std::string(res.reason()) + ")");
+                                 (failure_reason.empty() ? std::string{} : " (" + failure_reason + ")"));
     }
 
     throw std::runtime_error("Tracker returned too many redirects (" + std::to_string(max_redirects) + ")");
@@ -602,7 +676,10 @@ inline asio::awaitable<TrackerAnnounceResult> HttpTrackerClient::announce(const 
 inline asio::awaitable<TrackerAnnounceResult> HttpsTrackerClient::announce(const AnnounceRequestParams& params) {
     CTRACK_ASYNC("HttpsTrackerClient::announce");
     auto self = shared_from_this();
-    boost::asio::ssl::context ssl_ctx(boost::asio::ssl::context::tlsv12_client);
+    // tls_client lets OpenSSL negotiate the highest mutually supported
+    // version. Hardcoding tlsv12_client rejects trackers running legacy TLS
+    // servers ("tlsv1 alert protocol version").
+    boost::asio::ssl::context ssl_ctx(boost::asio::ssl::context::tls_client);
     ssl_ctx.set_default_verify_paths();
     // Same strand rationale as HttpTrackerClient::announce.
     auto stream = std::make_shared<beast::ssl_stream<beast::tcp_stream>>(asio::make_strand(io_context_), ssl_ctx);

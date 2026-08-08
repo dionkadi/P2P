@@ -26,6 +26,7 @@ struct ClientConfig {
     bool enable_dht = true;
     bool enable_lsd = true;
     bool enable_pex = true;
+    bool enable_encryption = true; // MSE (BitTorrent protocol encryption)
     std::vector<std::string> dht_bootstrap_nodes = {
         "router.bittorrent.com:6881",
         "dht.transmissionbt.com:6881",
@@ -47,6 +48,7 @@ struct ClientConfig {
         d["enable_dht"] = Value(static_cast<Integer>(enable_dht ? 1 : 0));
         d["enable_lsd"] = Value(static_cast<Integer>(enable_lsd ? 1 : 0));
         d["enable_pex"] = Value(static_cast<Integer>(enable_pex ? 1 : 0));
+        d["enable_encryption"] = Value(static_cast<Integer>(enable_encryption ? 1 : 0));
 
         List nodes;
         for (const auto& n : dht_bootstrap_nodes) {
@@ -107,6 +109,7 @@ struct ClientConfig {
         get_bool("enable_dht", cfg.enable_dht);
         get_bool("enable_lsd", cfg.enable_lsd);
         get_bool("enable_pex", cfg.enable_pex);
+        get_bool("enable_encryption", cfg.enable_encryption);
         get_list("dht_bootstrap_nodes", cfg.dht_bootstrap_nodes);
 
         return cfg;

@@ -227,7 +227,7 @@ void ClientApp::stop_all() {
 
 void ClientApp::init_dht(uint16_t port) {
     if (dht_node_ || !config_.enable_dht) return;
-    dht_node_ = std::make_shared<DHTNode>(io_context_, port);
+    dht_node_ = std::make_shared<DHTNode>(io_context_, port, DHTNode::load_or_generate_node_id(), true);
     dht_node_->start();
     auto bootstrap_nodes = config_.dht_bootstrap_nodes; // copy for async bootstrap
     asio::co_spawn(io_context_, [dht = dht_node_, bootstrap_nodes = std::move(bootstrap_nodes)]() -> asio::awaitable<void> {
@@ -244,6 +244,7 @@ void ClientApp::spawn_session(const std::shared_ptr<TorrentSession>& session) {
     // Apply connection limits from config (otherwise PeerManager defaults are used
     // and --max-connections / --max-half-open / --max-connections-per-ip are no-ops).
     session->set_connection_limits(config_.max_connections, config_.max_connections_per_ip, config_.max_half_open);
+    session->set_enable_mse(config_.enable_encryption);
     asio::co_spawn(io_context_,
         [session]() -> asio::awaitable<void> {
             try {

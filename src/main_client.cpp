@@ -319,6 +319,7 @@ int main(int argc, char* argv[]) {
     cmd_run.add_argument("--no-dht").help("Disable DHT").flag();
     cmd_run.add_argument("--no-lsd").help("Disable local peer discovery").flag();
     cmd_run.add_argument("--no-pex").help("Disable peer exchange").flag();
+    cmd_run.add_argument("--no-encryption").help("Disable protocol encryption (MSE)").flag();
     cmd_run.add_argument("--selective").help("Prompt for file selection before download").flag();
     cmd_run.add_argument("--non-interactive").help("Disable interactive TUI commands").flag();
     cmd_run.add_argument("--profile").help("Enable CTRACK function profiling and print results on exit").flag();
@@ -380,6 +381,7 @@ int main(int argc, char* argv[]) {
         c.enable_dht = !p.is_used("--no-dht");
         c.enable_lsd = !p.is_used("--no-lsd");
         c.enable_pex = !p.is_used("--no-pex");
+        c.enable_encryption = !p.is_used("--no-encryption");
         return c;
     };
 
@@ -421,6 +423,7 @@ int main(int argc, char* argv[]) {
     cfg.enable_dht = cli_overrides.enable_dht;
     cfg.enable_lsd = cli_overrides.enable_lsd;
     cfg.enable_pex = cli_overrides.enable_pex;
+    cfg.enable_encryption = cli_overrides.enable_encryption;
 
     ClientApp app(cfg);
     std::string default_download_dir = cfg.download_dir;

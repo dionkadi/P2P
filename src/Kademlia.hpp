@@ -24,6 +24,8 @@
 #include <cstdint>
 #include <cstdlib>
 #include <exception>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <future>
 #include <iterator>
@@ -107,6 +109,15 @@ public:
     bool needs_refresh(size_t bucket_idx) const;
     void touch(size_t bucket_idx);
     size_t size() const;
+    // All live entries across every bucket (for cross-session persistence).
+    std::vector<BucketEntry> all_entries() const {
+        std::lock_guard lock(mutex_);
+        std::vector<BucketEntry> out;
+        for (const auto& kb : buckets_) {
+            out.insert(out.end(), kb.bucket.begin(), kb.bucket.end());
+        }
+        return out;
+    }
 private:
     NodeId my_node_id_;
     std::array<KBucket, 160> buckets_;    
@@ -120,16 +131,72 @@ struct PeerInfo {
 
 class DHTNode : public std::enable_shared_from_this<DHTNode> {
 public:
-    explicit DHTNode(asio::io_context& io_context, uint16_t port, const NodeId& nid = generate_id(NODE_ID_PREFIX))
+    // Persisted-state path: ~/.config/p2p/dht_state.bencode (same home-dir
+    // convention as client_state.bencode). Callers that want warm-start DHT
+    // pass load_or_generate_node_id() as the node id and persist_state=true;
+    // tests keep the defaults (fresh id, no file I/O).
+    static std::filesystem::path state_file_path() {
+        const char* home = std::getenv("HOME");
+        return std::filesystem::path(home ? home : ".") / ".config" / "p2p" / "dht_state.bencode";
+    }
+
+    static std::vector<std::byte> read_state_bytes(const std::filesystem::path& path) {
+        std::ifstream ifs(path, std::ios::binary);
+        std::string contents((std::istreambuf_iterator<char>(ifs)),
+                             std::istreambuf_iterator<char>());
+        std::vector<std::byte> out;
+        out.reserve(contents.size());
+        for (char c : contents) {
+            out.push_back(static_cast<std::byte>(c));
+        }
+        return out;
+    }
+
+    static NodeId load_or_generate_node_id() {
+        try {
+            auto path = state_file_path();
+            if (std::filesystem::exists(path)) {
+                auto data = read_state_bytes(path);
+                if (!data.empty()) {
+                    auto v = decode(data);
+                    if (const auto* d = std::get_if<std::unique_ptr<Dict>>(&v.get_variant())) {
+                        if (auto it = (*d)->find("i"); it != (*d)->end()) {
+                            if (const auto* id_str = std::get_if<String>(&it->second.get_variant())) {
+                                auto bytes = Crypto::hex_to_bytes(*id_str);
+                                if (bytes.size() == 20) {
+                                    NodeId nid{};
+                                    std::ranges::copy(bytes, nid.begin());
+                                    LOGINFO("DHT: restored node ID {} from {}", *id_str, path.string());
+                                    return nid;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (const std::exception& e) {
+            LOGWARN("DHT: failed to load persisted node ID: {}", e.what());
+        }
+        return generate_id(NODE_ID_PREFIX);
+    }
+
+    explicit DHTNode(asio::io_context& io_context, uint16_t port,
+                     const NodeId& nid = generate_id(NODE_ID_PREFIX),
+                     bool persist_state = false)
         : io_context_(io_context)
         , my_node_id_(nid)
         , routing_table_(my_node_id_)
         , socket_(io_context_, port)
         , refresh_timer_(io_context_)
         , cleanup_timer_(io_context_)
+        , persist_timer_(io_context_)
+        , persist_state_(persist_state)
     {
         LOGINFO("DHT Node started with ID: {}", Crypto::bytes_to_hex(my_node_id_));
         LOGINFO("DHT Node listening on UDP port {}", port);
+        if (persist_state_) {
+            load_persisted_state();
+        }
     }
 
     void start();
@@ -159,6 +226,9 @@ private:
     AsyncUdpSocket socket_;
     asio::steady_timer refresh_timer_;
     asio::steady_timer cleanup_timer_;
+    asio::steady_timer persist_timer_;
+    bool persist_state_{false};
+    std::mutex persist_mutex_;
     std::atomic_bool shuting_down_{false};
 
     std::mt19937_64 rng_{std::random_device{}()};
@@ -228,6 +298,9 @@ private:
 
     void routing_table_refresh_loop();
     void cleanup_loop();
+    void persist_loop();
+    void save_persisted_state();
+    void load_persisted_state();
 
     asio::awaitable<void> send_krpc_response(const Value& response, udp::endpoint remote);
     asio::awaitable<void> send_krpc_error(const String& transaction_id, Integer error_code, const String& error_message, udp::endpoint remote);
@@ -443,6 +516,9 @@ inline void DHTNode::start() {
 
     routing_table_refresh_loop();
     cleanup_loop();
+    if (persist_state_) {
+        persist_loop();
+    }
 }
 
 inline void DHTNode::stop() {
@@ -450,6 +526,10 @@ inline void DHTNode::stop() {
     socket_.close();
     refresh_timer_.cancel();
     cleanup_timer_.cancel();
+    persist_timer_.cancel();
+    if (persist_state_) {
+        save_persisted_state();
+    }
 
     // Extract queries under lock, then complete outside lock to avoid
     // reentrancy when completion handlers resume coroutines that access
@@ -467,6 +547,115 @@ inline void DHTNode::stop() {
     }
 
     LOGINFO("DHT Node stopped.");
+}
+
+inline void DHTNode::save_persisted_state() {
+    // Guarded by persist_mutex_: the 10-min persist loop and stop() can
+    // race on the same file.
+    std::lock_guard lock(persist_mutex_);
+    try {
+        auto entries = routing_table_.all_entries();
+        Dict root;
+        root["i"] = Value(Crypto::bytes_to_hex(my_node_id_));
+        List nodes;
+        for (const auto& e : entries) {
+            if (!e.endpoint.address().is_v4()) {
+                continue;
+            }
+            Dict nd;
+            nd["i"] = Value(Crypto::bytes_to_hex(e.id));
+            nd["ip"] = Value(e.endpoint.address().to_string());
+            nd["p"] = Value(static_cast<Integer>(e.endpoint.port()));
+            nodes.push_back(Value(std::move(nd)));
+        }
+        root["n"] = Value(std::move(nodes));
+
+        auto bytes = encode(Value(std::move(root)));
+        auto path = state_file_path();
+        std::filesystem::create_directories(path.parent_path());
+        std::ofstream ofs(path, std::ios::binary | std::ios::trunc);
+        ofs.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+        LOGINFO("DHT: persisted {} routing entries to {}", entries.size(), path.string());
+    } catch (const std::exception& e) {
+        LOGWARN("DHT: failed to persist state: {}", e.what());
+    }
+}
+
+inline void DHTNode::load_persisted_state() {
+    try {
+        auto path = state_file_path();
+        if (!std::filesystem::exists(path)) {
+            return;
+        }
+        auto data = read_state_bytes(path);
+        if (data.empty()) {
+            return;
+        }
+        auto v = decode(data);
+        const auto* root = std::get_if<std::unique_ptr<Dict>>(&v.get_variant());
+        if (!root) {
+            return;
+        }
+        auto it = (*root)->find("n");
+        if (it == (*root)->end()) {
+            return;
+        }
+        const auto* nodes = std::get_if<std::unique_ptr<List>>(&it->second.get_variant());
+        if (!nodes) {
+            return;
+        }
+        size_t added = 0;
+        for (const auto& nv : **nodes) {
+            const auto* nd = std::get_if<std::unique_ptr<Dict>>(&nv.get_variant());
+            if (!nd) {
+                continue;
+            }
+            auto id_it = (*nd)->find("i");
+            auto ip_it = (*nd)->find("ip");
+            auto p_it = (*nd)->find("p");
+            if (id_it == (*nd)->end() || ip_it == (*nd)->end() || p_it == (*nd)->end()) {
+                continue;
+            }
+            const auto* id_str = std::get_if<String>(&id_it->second.get_variant());
+            const auto* ip_str = std::get_if<String>(&ip_it->second.get_variant());
+            const auto* p_int = std::get_if<Integer>(&p_it->second.get_variant());
+            if (!id_str || !ip_str || !p_int) {
+                continue;
+            }
+            auto id_bytes = Crypto::hex_to_bytes(*id_str);
+            if (id_bytes.size() != 20) {
+                continue;
+            }
+            boost::system::error_code ec;
+            auto addr = asio::ip::make_address(*ip_str, ec);
+            if (ec || !addr.is_v4()) {
+                continue;
+            }
+            BucketEntry entry;
+            std::ranges::copy(id_bytes, entry.id.begin());
+            entry.endpoint = udp::endpoint(addr, static_cast<uint16_t>(*p_int));
+            entry.status = NodeStatus::Good;
+            entry.last_seen = std::chrono::steady_clock::now();
+            entry.last_replied = entry.last_seen;
+            routing_table_.insert(entry);
+            ++added;
+        }
+        LOGINFO("DHT: loaded {} persisted routing entries from {}", added, path.string());
+    } catch (const std::exception& e) {
+        LOGWARN("DHT: failed to load persisted state: {}", e.what());
+    }
+}
+
+inline void DHTNode::persist_loop() {
+    auto self = shared_from_this();
+    persist_timer_.expires_after(std::chrono::minutes(10));
+    persist_timer_.async_wait([self](boost::system::error_code ec) {
+        if (ec) {
+            return; // cancelled during shutdown
+        }
+        self->save_persisted_state();
+        self->persist_loop();
+    });
 }
 
 inline String DHTNode::generate_transaction_id() {

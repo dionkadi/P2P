@@ -291,7 +291,7 @@ asio::awaitable<void> TorrentSession::run() {
                     AsyncSocket new_socket = co_await self->peer_server_->accept();
                     auto endpoint = new_socket.remote_endpoint();
                     std::string addr = endpoint.address().to_string() + ":" + std::to_string(endpoint.port());
-                    asio::co_spawn(self->io_context_, self->handle_new_connection(std::move(new_socket), addr), asio::detached);
+                    asio::co_spawn(self->io_context_, self->handle_new_connection(std::move(new_socket), addr, true), asio::detached);
                 } catch (const std::exception& e) {
                     LOGERR("Error accepting new peer connection: {}", e.what());
                 }
@@ -304,7 +304,7 @@ asio::awaitable<void> TorrentSession::run() {
     if (enable_dht_) {
         // Lazily create a per-session DHT node if no shared node was provided.
         if (!dht_node_) {
-            dht_node_ = std::make_shared<DHTNode>(io_context_, peer_port_);
+            dht_node_ = std::make_shared<DHTNode>(io_context_, peer_port_, DHTNode::load_or_generate_node_id(), true);
         }
         // Only start/bootstrap if we own this DHT node (not externally managed).
         if (!external_dht_node_) {
@@ -510,11 +510,12 @@ void TorrentSession::record_request_sent(size_t piece_index, uint32_t begin, uin
     progress->request_times[block_index] = std::chrono::steady_clock::now();
 }
 
-asio::awaitable<void> TorrentSession::handle_new_connection(AsyncSocket socket, std::string peer_addr) {
+asio::awaitable<void> TorrentSession::handle_new_connection(AsyncSocket socket, std::string peer_addr, bool inbound) {
     // LOGDBG("Incomming {}", peer_addr);
     std::shared_ptr<PeerConnection> conn = nullptr;
     try {
-        conn = co_await PeerConnection::create(io_context_, std::move(socket), peer_addr, my_peer_id_, state_, shared_from_this());
+        conn = co_await PeerConnection::create(io_context_, std::move(socket), peer_addr, my_peer_id_, state_, shared_from_this(),
+                                               enable_mse_, inbound);
     } catch (const boost::system::system_error& e) {
         LOGERR("Network error during PeerConnection::create for {}: {}", peer_addr, e.what());
         peer_manager_->release_half_open();
@@ -784,7 +785,7 @@ asio::awaitable<void> TorrentSession::announce_tracker_for(std::string event) {
                             auto socket = co_await peer_manager->connect_to_peer(peer_addr);
                             if (socket) {
                                 if (auto self = weak_this.lock()) {
-                                    co_await self->handle_new_connection(std::move(*socket), peer_addr);
+                                    co_await self->handle_new_connection(std::move(*socket), peer_addr, false);
                                 }
                             }
                         },
@@ -917,7 +918,7 @@ asio::awaitable<void> TorrentSession::discovered_peers_loop() {
                         auto socket = co_await peer_manager->connect_to_peer(addr);
                         if (socket) {
                             if (auto self = weak_self.lock()) {
-                                co_await self->handle_new_connection(std::move(*socket), addr);
+                                co_await self->handle_new_connection(std::move(*socket), addr, false);
                             }
                         }
                     }, 
@@ -965,7 +966,15 @@ asio::awaitable<void> TorrentSession::dht_announce_loop() {
             }
         }
 
-        if (dht_peers.empty()) {
+        if (metadata_download_active_) {
+            // Magnet sessions live and die by peer discovery: keep probing at
+            // the short cadence until metadata arrives, even when a lookup
+            // returns peers (often junk/honeypot pools on public trackers).
+            // Parking at 30 minutes on a non-empty result starves a magnet
+            // whose real seeders are only reachable after the DHT warms up.
+            empty_dht_lookups_ = 0;
+            dht_announce_timer_.expires_after(std::chrono::seconds(30));
+        } else if (dht_peers.empty()) {
             // The first lookup usually runs before the DHT routing table is
             // bootstrapped (it starts empty), so it finds nothing.  Retry
             // quickly a few times instead of sleeping 30 minutes on a useless
@@ -1564,6 +1573,21 @@ asio::awaitable<void> TorrentSession::on_extended_message(std::shared_ptr<PeerCo
     conn->update_extension_type(0, ExtendedMessageType::Handshake);
     auto remote_id = static_cast<uint8_t>(payload[0]);
     auto message_type = conn->extension_type(remote_id);
+    if (message_type == ExtendedMessageType::UNKNOWN) {
+        // Two sender conventions exist in the wild:
+        //  - Transmission-style peers send with their OWN advertised IDs
+        //    (already resolved via the map built from their extended
+        //    handshake above);
+        //  - libtorrent-style peers (qBittorrent) send with the IDs WE
+        //    advertised in our extended handshake (ut_pex=1, ut_metadata=3,
+        //    see PeerConnection::perform_handshake).
+        // Fall back to our own advertised map so both are handled.
+        if (remote_id == 1) {
+            message_type = ExtendedMessageType::ut_pex;
+        } else if (remote_id == 3) {
+            message_type = ExtendedMessageType::ut_metadata;
+        }
+    }
 
     // LOGDBG("Received extended message type {} (ID: {}) from peer {}",
     //        static_cast<int>(message_type), remote_id, conn->peer_id());

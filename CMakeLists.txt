@@ -65,9 +65,11 @@ add_executable(p2p_test
     test/crypto_test.cpp
     test/dht_test.cpp
     test/magnet_test.cpp
+    test/mse_test.cpp
     test/protocol_test.cpp
     test/torrentfile_test.cpp
     test/sessionstate_test.cpp
+    test/trackerclient_test.cpp
     test/asyncratelimiter_test.cpp
     test/filemanager_test.cpp
     test/integration_test.cpp

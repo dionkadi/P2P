@@ -24,9 +24,9 @@ TEST(ClientConfigTest, DefaultValues) {
     EXPECT_EQ(cfg.peer_port, 6881);
     EXPECT_EQ(cfg.upload_rate_limit, 0u);
     EXPECT_EQ(cfg.download_rate_limit, 0u);
-    EXPECT_EQ(cfg.max_connections, 200u);
-    EXPECT_EQ(cfg.max_connections_per_ip, 2u);
-    EXPECT_EQ(cfg.max_half_open, 100u);
+    EXPECT_EQ(cfg.max_connections, 500u);
+    EXPECT_EQ(cfg.max_connections_per_ip, 4u);
+    EXPECT_EQ(cfg.max_half_open, 500u);
     EXPECT_EQ(cfg.block_request_timeout_seconds, 30u);
     EXPECT_EQ(cfg.peer_ban_corrupt_threshold, 3u);
     EXPECT_EQ(cfg.peer_ban_duration_minutes, 60u);
@@ -172,7 +172,7 @@ TEST(ClientConfigTest, CLIFlagParsingDefaultsPreserved) {
     auto argv = make_argv({"client", "--port", "7000"});
     ClientConfig cfg = ClientConfig::from_cli(static_cast<int>(argv.size()), argv.data());
     EXPECT_EQ(cfg.peer_port, 7000);
-    EXPECT_EQ(cfg.max_connections, 200u);
+    EXPECT_EQ(cfg.max_connections, 500u);
     EXPECT_TRUE(cfg.enable_dht);
 }
 
@@ -195,7 +195,7 @@ TEST(ClientConfigTest, ConfigFileSaveAndLoad) {
     EXPECT_EQ(loaded.download_dir, "/tmp/p2p_test");
     EXPECT_TRUE(loaded.enable_lsd);
     EXPECT_TRUE(loaded.enable_pex);
-    EXPECT_EQ(loaded.max_connections, 200u);
+    EXPECT_EQ(loaded.max_connections, 500u);
 
     std::remove(tmp_path.c_str());
 }

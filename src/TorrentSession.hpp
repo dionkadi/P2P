@@ -71,6 +71,7 @@ public:
     void set_tracker_announce_interval(std::chrono::seconds interval) { tracker_announce_interval_ = interval; }
     void set_enable_dht(bool enabled) noexcept { enable_dht_ = enabled; }
     void set_enable_lsd(bool enabled) noexcept { enable_lsd_ = enabled; }
+    void set_enable_mse(bool enabled) noexcept { enable_mse_ = enabled; }
     // Use a shared DHT node (managed externally by ClientApp) instead of creating one.
     // The external node must already be started and will not be stopped by this session.
     void set_shared_dht_node(std::shared_ptr<DHTNode> node) noexcept { dht_node_ = node; external_dht_node_ = node; }
@@ -146,7 +147,7 @@ private:
     asio::awaitable<void> tracker_announce_loop();
     asio::awaitable<void> announce_tracker_for(std::string event = "");
     asio::awaitable<void> discovered_peers_loop();
-    asio::awaitable<void> handle_new_connection(AsyncSocket socket, std::string peer_addr);
+    asio::awaitable<void> handle_new_connection(AsyncSocket socket, std::string peer_addr, bool inbound);
     asio::awaitable<void> periodically_save();
     asio::awaitable<void> dht_announce_loop();
     asio::awaitable<void> request_metadata_from_peer(std::shared_ptr<PeerConnection> conn);
@@ -186,6 +187,7 @@ private:
     std::vector<std::string> dht_bootstrap_nodes_;
     bool enable_dht_{true};
     bool enable_lsd_{true};
+    bool enable_mse_{true};
 
     bool metadata_download_active_{false};
     std::vector<std::byte> metadata_buffer_;

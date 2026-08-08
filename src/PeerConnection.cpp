@@ -8,7 +8,8 @@ asio::awaitable<std::shared_ptr<PeerConnection>>
 PeerConnection::create(
     asio::io_context& io_context, AsyncSocket socket, std::string peer_addr,
     const PeerId& my_id, std::shared_ptr<SessionState> state,
-    std::shared_ptr<IPeerConnectionEvents> events
+    std::shared_ptr<IPeerConnectionEvents> events,
+    bool mse_enabled, bool inbound
 ) {
     CTRACK_ASYNC("PeerConnection::create");
     struct EnableMakeShared : public PeerConnection {
@@ -26,6 +27,8 @@ PeerConnection::create(
         io_context, std::move(socket), std::move(peer_addr), 
         std::move(state), std::move(events)
     );
+    conn->mse_enabled_ = mse_enabled;
+    conn->inbound_ = inbound;
 
     LOGDBG("PeerConnection object created for {}. About to call perform_handshake.", conn->peer_addr());
     bool success = co_await conn->perform_handshake(my_id);
@@ -80,9 +83,49 @@ asio::awaitable<bool> PeerConnection::perform_handshake(const PeerId& my_id) {
             .fast_extension = true
         };
 
-        co_await socket_.send_raw(my_handshake.serialize());
+        std::vector<std::byte> handshake_buffer;
+        bool handshake_sent = false;
 
-        std::vector<std::byte> handshake_buffer = co_await socket_.receive_raw(HANDSHAKE_BASE_LEN);
+        if (mse_enabled_) {
+            if (inbound_) {
+                // Responder: detect MSE vs plaintext by the peer's first byte.
+                auto [result, peer_hs] = co_await socket_.mse_handshake_acceptor(info_hash_arr);
+                if (result == AsyncSocket::MseResult::Failed) {
+                    LOGWARN("MSE acceptor handshake failed for {}", peer_addr_);
+                    co_return false;
+                }
+                if (result != AsyncSocket::MseResult::Plaintext) {
+                    // MSE completed: the peer's handshake was decrypted and
+                    // returned; send ours now (encrypted if RC4 was selected).
+                    co_await socket_.send_raw(my_handshake.serialize());
+                    handshake_buffer = std::move(peer_hs);
+                    handshake_sent = true;
+                }
+                // Plaintext: the first byte stays buffered; fall through to
+                // the plaintext path below.
+            } else {
+                // Initiator: MSE first, plaintext fallback on a fresh
+                // connection (matches libtorrent's pe_enabled behavior).
+                auto [result, peer_hs] = co_await socket_.mse_handshake_initiator(
+                    info_hash_arr, my_handshake.serialize());
+                if (result != AsyncSocket::MseResult::Failed) {
+                    // Our handshake was already sent inside the MSE exchange.
+                    handshake_buffer = std::move(peer_hs);
+                    handshake_sent = true;
+                } else {
+                    LOGDBG("MSE initiator failed for {}; retrying plaintext on a fresh connection", peer_addr_);
+                    socket_.close();
+                    auto [ip, port] = decode_address(peer_addr_);
+                    co_await socket_.connect(ip, port);
+                }
+            }
+        }
+
+        if (!handshake_sent) {
+            co_await socket_.send_raw(my_handshake.serialize());
+            handshake_buffer = co_await socket_.receive_raw(HANDSHAKE_BASE_LEN);
+        }
+
         Handshake peer_handshake = Handshake::deserialize(handshake_buffer);
 
         if (peer_handshake.info_hash_bytes != info_hash_arr) {

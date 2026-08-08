@@ -33,7 +33,7 @@ P2P is a C++23 BitTorrent client (`build/client`) + tracker server (`build/track
 - Client subcommands: only `create` and `run`.
 - `client run <torrent> [dest]` accepts a `.torrent` path. Magnets go through interactive `m <magnet> [dest]` or saved-state restore, not the positional arg.
 - Interactive TUI on by default; `h` shows: `a` (add .torrent), `m` (add magnet), `d` (download dir), `t` (add tracker), `f` (fetch trackers), `s`/`p`/`r` (stop/resume/remove by index), `q` (quit). `--non-interactive` disables it.
-- `--config` and `--save-config` are pre-scanned manually (~`main_client.cpp:283-287`) before argparse — argparse never registers them.
+- `--config` and `--save-config` are pre-scanned manually (`main_client.cpp:290-297`) before argparse — argparse never registers them.
 - Without a positional torrent, client reloads `~/.config/p2p/client_state.bencode`.
 - Config lookup: `./p2p.conf` first, then `~/.config/p2p/p2p.conf`.
 - Tracker: `--port` sets HTTP+UDP to the same value; `--http-port`/`--udp-port` splits them.
@@ -44,10 +44,9 @@ P2P is a C++23 BitTorrent client (`build/client`) + tracker server (`build/track
 - `src/main_tracker.cpp` — HTTP+UDP tracker listeners, live stats (`LiveDisplay` from vendored `progress_bar.hpp`).
 - `ClientApp` owns torrent sessions; `TorrentSession` owns per-torrent subsystems (`PieceManager`, `PeerManager`, `FileManager`, DHT node, LSD discovery, tracker clients).
 - `src/` has 21 headers + 8 library `.cpp` + 2 mains; template/coroutine/inline-heavy. `include/` has 3 vendored headers.
-- `build/`, `data/`, `logs/`, `.cache/`, `.omo/` are gitignored. `downloads.resume` is untracked at root.
-- `docs/` has BEP references (BEP5, BEP9, BEP11) + architecture notes — useful for protocol work.
+- `build/`, `downloads/`, `data/`, `logs/`, `coredump/`, `.cache/`, `.omo/`, `*.torrent` are gitignored. Resume state lives in `downloads/.{infohash}.resume`; root `*.torrent` files (bl.torrent etc.) are untracked local test data, and `coredump/core.client.txt` is a crash artifact.
+- `docs/` has BEP references (BEP5, BEP9, BEP11) + `PeerManager.md`/`plan.md` — useful for protocol work.
 - `PRINCIPLES.md` is generic software engineering philosophy — skip it for project-specific decisions.
-- Root `config.json` is OpenCode agent configuration.
 
 ## Conventions
 

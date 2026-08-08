@@ -229,7 +229,7 @@ TEST(PeerConnectionPieceMessageTest, ParsesStandardPieceMessageFromPeer) {
 
     asio::co_spawn(
         io,
-        PeerConnection::create(io, AsyncSocket(std::move(sockets.client)), peer_addr, my_id, state, events),
+        PeerConnection::create(io, AsyncSocket(std::move(sockets.client)), peer_addr, my_id, state, events, false, false),
         [&connection_promise](std::exception_ptr e, std::shared_ptr<PeerConnection> conn) mutable {
             if (e) {
                 connection_promise.set_exception(e);
