@@ -347,7 +347,7 @@ asio::awaitable<TrackerAnnounceResult> http_announce_impl(
         http::request<http::string_body> req{http::verb::get,
             absolute_form ? "http://" + current_host + full_target : full_target, 11};
         req.set(http::field::host, current_host);
-        req.set(http::field::user_agent, "Cpp-P2P-Client/1.0");
+        req.set(http::field::user_agent, "qBittorrent/5.2.3");
 
         co_await http::async_write(stream, req, asio::use_awaitable);
 

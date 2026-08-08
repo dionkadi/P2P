@@ -125,8 +125,13 @@ inline std::pair<std::string, uint16_t> decode_address(const std::string& addr) 
     return {ip, port};
 }
 
-static constexpr std::string_view PEER_ID_PREFIX = "-PU0001-";
-static constexpr std::string_view NODE_ID_PREFIX = "-PU0001-";
+// Peer ID advertises as qBittorrent 5.2.3 (client identity spoofing for
+// anti-leech/privacy optics; format matches real qB: "-qB5230-" + 12
+// alphanumerics).
+static constexpr std::string_view PEER_ID_PREFIX = "-qB5230-";
+// DHT node IDs in real clients (libtorrent) are 20 random bytes — no ASCII
+// prefix. An ASCII prefix is a fingerprint in KRPC "id" fields.
+static constexpr std::string_view NODE_ID_PREFIX = "";
 static constexpr std::string_view ALPHANUM = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
 constexpr std::array<std::byte, 20> generate_id(std::string_view prefix = "") {

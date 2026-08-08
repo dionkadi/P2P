@@ -160,7 +160,7 @@ asio::awaitable<bool> PeerConnection::perform_handshake(const PeerId& my_id) {
             m_dict["ut_metadata"] = Value(static_cast<Integer>(3));
             Dict ehs_dict;
             ehs_dict["m"] = Value(std::move(m_dict));
-            ehs_dict["v"] = Value("My C++ Client 1.0");
+            ehs_dict["v"] = Value("qBittorrent/5.2.3");
 
             auto encoded_payload = encode(Value(ehs_dict));
             message.insert(message.end(), encoded_payload.begin(), encoded_payload.end());

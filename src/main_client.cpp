@@ -86,7 +86,7 @@ template <typename Stream>
 static std::vector<std::string> http_get_trackers(Stream& stream, const std::string& host, const std::string& target) {
     http::request<http::string_body> req{http::verb::get, target, 11};
     req.set(http::field::host, host);
-    req.set(http::field::user_agent, "Cpp-P2P-Client/1.0");
+    req.set(http::field::user_agent, "qBittorrent/5.2.3");
     http::write(stream, req);
 
     beast::flat_buffer buffer;
