@@ -649,7 +649,16 @@ inline asio::awaitable<TrackerAnnounceResult> HttpTrackerClient::announce(const 
             proxy ? proxy->first : host_,
             proxy ? proxy->second : std::to_string(port_), asio::use_awaitable);
         stream->expires_after(std::chrono::seconds(30));
-        co_await stream->async_connect(results, asio::use_awaitable);
+        // The connect op's internal work runs on the stream's strand, but
+        // its FINAL completion (range_connect_op::process, which closes the
+        // socket between endpoint attempts) executes on the handler's plain
+        // io executor. A concurrent cancel() closes the socket on the
+        // strand -> both deregister the epoll descriptor -> SEGV. Binding
+        // the completion to the strand serializes it with cancel()'s close;
+        // append() pins the stream so it outlives the pending op.
+        co_await stream->async_connect(results,
+            asio::bind_executor(stream->get_executor(),
+                asio::append(asio::use_awaitable, stream)));
 
         auto result = co_await http_announce_impl(*stream, io_context_, host_, target_, params, proxy);
 
@@ -702,7 +711,11 @@ inline asio::awaitable<TrackerAnnounceResult> HttpsTrackerClient::announce(const
             proxy ? proxy->second : std::to_string(port_), asio::use_awaitable);
         auto& lowest = beast::get_lowest_layer(*stream);
         lowest.expires_after(std::chrono::seconds(30));
-        co_await lowest.async_connect(results, asio::use_awaitable);
+        // Same completion-to-strand binding and stream pinning as
+        // HttpTrackerClient::announce.
+        co_await lowest.async_connect(results,
+            asio::bind_executor(lowest.get_executor(),
+                asio::append(asio::use_awaitable, stream)));
         if (proxy) {
             co_await proxy_connect_tunnel(lowest, host_, std::to_string(port_));
         }

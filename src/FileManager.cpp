@@ -3,6 +3,27 @@
 #include <fstream>
 #include <boost/asio/experimental/awaitable_operators.hpp>
 
+namespace {
+
+// The FileManager's pool tasks run on dedicated worker threads. Invoking an
+// asio completion handler INLINE there resumes the awaiting coroutine on the
+// pool worker — the session's run() chain can then complete on that worker,
+// and releasing the last shared_ptr<TorrentSession> destroys FileManager ->
+// ThreadPool on one of its own jthreads (self-join -> "Resource deadlock
+// avoided" -> terminate; observed when removing a torrent mid-download).
+// Posting the completion back to the handler's executor keeps every coroutine
+// resume/teardown on io threads.
+template <typename Handler, typename... Args>
+void post_to_handler_executor(Handler&& handler, Args&&... args) {
+    auto executor = asio::get_associated_executor(handler);
+    asio::post(executor, [h = std::forward<Handler>(handler),
+                          ...captured = std::forward<Args>(args)]() mutable {
+        std::move(h)(std::move(captured)...);
+    });
+}
+
+} // namespace
+
 FileManager::FileManager(std::shared_ptr<SessionState> state)
     : state_(state),
       file_io_pool_(4),
@@ -231,7 +252,7 @@ asio::awaitable<void> FileManager::async_write_to_file(const std::filesystem::pa
                 [path, offset, data, cancelled, locker = file_locker_, handler = std::move(completion_handler)]
                 () mutable {
                     if (cancelled->load()) {
-                        std::move(handler)(make_error_code(std::errc::operation_canceled));
+                        post_to_handler_executor(std::move(handler), make_error_code(std::errc::operation_canceled));
                         return;
                     }
                     try {
@@ -264,14 +285,14 @@ asio::awaitable<void> FileManager::async_write_to_file(const std::filesystem::pa
                         output_file.flush();
 
                         if (cancelled->load()) {
-                            std::move(handler)(make_error_code(std::errc::operation_canceled));
+                            post_to_handler_executor(std::move(handler), make_error_code(std::errc::operation_canceled));
                             return;
                         }
 
-                        std::move(handler)(std::error_code{});
+                        post_to_handler_executor(std::move(handler), std::error_code{});
                     } catch (const std::exception& e) {
                         LOGERR("File write error for {}: {}", path.string(), e.what());
-                        std::move(handler)(make_error_code(std::errc::io_error));
+                        post_to_handler_executor(std::move(handler), make_error_code(std::errc::io_error));
                     }
                 }
             );
@@ -287,7 +308,7 @@ asio::awaitable<std::vector<std::byte>> FileManager::async_read_from_file(const 
                 [path, offset, size, cancelled, handler = std::move(completion_handler)]
                 () mutable {
                     if (cancelled->load()) {
-                        std::move(handler)(make_error_code(std::errc::operation_canceled), std::vector<std::byte>{});
+                        post_to_handler_executor(std::move(handler), make_error_code(std::errc::operation_canceled), std::vector<std::byte>{});
                         return;
                     }
                     try {
@@ -327,14 +348,14 @@ asio::awaitable<std::vector<std::byte>> FileManager::async_read_from_file(const 
                         }
 
                         if (cancelled->load()) {
-                            std::move(handler)(make_error_code(std::errc::operation_canceled), std::vector<std::byte>{});
+                            post_to_handler_executor(std::move(handler), make_error_code(std::errc::operation_canceled), std::vector<std::byte>{});
                             return;
                         }
                         
-                        std::move(handler)(std::error_code{}, std::move(buffer));
+                        post_to_handler_executor(std::move(handler), std::error_code{}, std::move(buffer));
                     } catch (const std::exception& e) {
                         LOGERR("File read error: {}", e.what());
-                        std::move(handler)(make_error_code(std::errc::io_error), std::vector<std::byte>{});
+                        post_to_handler_executor(std::move(handler), make_error_code(std::errc::io_error), std::vector<std::byte>{});
                     }
                 }
             );
@@ -680,7 +701,7 @@ asio::awaitable<std::map<std::string, int64_t>> FileManager::async_get_file_mtim
                             // Decide how to handle this error. For now, log and skip.
                         }
                     }
-                    std::move(h)(boost::system::error_code{}, std::move(mtimes));
+                    post_to_handler_executor(std::move(h), boost::system::error_code{}, std::move(mtimes));
                 }
             );
         },
