@@ -3,6 +3,7 @@
 #include <boost/asio.hpp>
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -69,14 +70,19 @@ public:
     asio::awaitable<TrackerAnnounceResult> announce(const AnnounceRequestParams& params) override;
     const std::string get_url() const override { return "udp://" + url_str_; }
     void cancel() override {
-        // Closing the socket completes a BARE pending receive with
-        // operation_aborted, but the `||` compositions in connect_to_tracker
-        // and announce do NOT complete when a branch errors — their retry
-        // timers (15s/30s/60s/120s backoff) would stay armed, holding the
-        // io_context alive for minutes after shutdown. Firing the abort
-        // timer completes those compositions via a success branch instead.
-        boost::system::error_code ec;
-        socket_.close(ec);
+        // Fire the abort timer so the `||` compositions in connect_to_tracker
+        // and announce complete via their abort branch and exit promptly (a
+        // bare receive aborted by a socket close never completes the
+        // wait_for_one_success group — it would sit on its backoff timer).
+        // Deliberately do NOT close the socket from here: closing it on a
+        // foreign thread while the group's cancellation handler is cancelling
+        // the pending receive on that same socket races
+        // epoll_reactor::deregister_descriptor (UAF -> SEGV — the same hazard
+        // the HTTP/HTTPS clients avoid by dispatching their close onto the
+        // stream's strand). The abort branch alone terminates the
+        // compositions; the socket stays open until the client is destroyed,
+        // by which time no op is pending on it.
+        cancelled_ = true;
         abort_timer_.expires_at(asio::steady_timer::time_point::min());
     }
 
@@ -86,7 +92,8 @@ private:
 
     asio::io_context& io_context_;
     asio::ip::udp::socket socket_;
-    asio::steady_timer abort_timer_;
+    asio::steady_timer abort_timer_; // fired by cancel() to break the receive||timer waits
+    std::atomic<bool> cancelled_{false};
     std::string host_;
     int port_;
     asio::ip::udp::endpoint tracker_endpoint_;
@@ -500,6 +507,11 @@ inline asio::awaitable<void> UdpTrackerClient::ensure_resolved() {
     if (resolved_) co_return;
     asio::ip::udp::resolver resolver(io_context_);
     auto results = co_await resolver.async_resolve(host_, std::to_string(port_), asio::use_awaitable);
+    if (cancelled_) {
+        // Cancelled while the (uncancellable) DNS resolve was in flight:
+        // don't open a socket the abort branch will never use.
+        co_return;
+    }
     tracker_endpoint_ = *results.begin();
     socket_.open(tracker_endpoint_.protocol());
     resolved_ = true;
