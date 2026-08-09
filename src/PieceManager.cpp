@@ -1,10 +1,15 @@
 #include "PieceManager.hpp"
 
+#include <boost/asio/experimental/awaitable_operators.hpp>
+
 #include <random>
+
+using namespace boost::asio::experimental::awaitable_operators;
 
 PieceManager::PieceManager(asio::io_context& io_context, std::shared_ptr<SessionState> state)
     : io_context_(io_context), strand_(asio::make_strand(io_context)),
-      piece_request_trigger_(io_context), block_timeout_timer_(io_context), endgame_timer_(io_context), state_(state) 
+      piece_request_trigger_(io_context), block_timeout_timer_(io_context), endgame_timer_(io_context),
+      shutdown_timer_(io_context), state_(state) 
 {
     const size_t num_pieces = state_->num_pieces();
     piece_availability_ = std::make_shared<std::vector<size_t>>();
@@ -13,6 +18,7 @@ PieceManager::PieceManager(asio::io_context& io_context, std::shared_ptr<Session
     pieces_by_rarity_ = std::make_shared<std::map<size_t, std::shared_ptr<std::unordered_set<int>>>>();
 
     piece_request_trigger_.expires_at(asio::steady_timer::time_point::max());
+    shutdown_timer_.expires_at(asio::steady_timer::time_point::max());
 }
 
 std::map<std::string, std::string> PieceManager::get_in_progress_for_resume() const {
@@ -915,13 +921,15 @@ asio::awaitable<void> PieceManager::resume_piece_download(size_t piece_index) {
         // idle poll costs nothing in recovery latency. (The first pass runs
         // immediately — the wait is only for idle retries.)
         timer.expires_after(std::chrono::seconds(2));
-        try {
-            co_await timer.async_wait(asio::use_awaitable);
-        } catch (const boost::system::system_error& e) {
-            if (e.code() == asio::error::operation_aborted) {
-                co_return;
-            }
-            throw;
+        // Race the idle wait against the shutdown gate so signal_shutdown()
+        // wakes a parked resumer immediately; otherwise it lingers up to 2s,
+        // pinning the io_context during a graceful drain.
+        auto idle_result = co_await (
+            timer.async_wait(asio::as_tuple(asio::use_awaitable)) ||
+            shutdown_timer_.async_wait(asio::as_tuple(asio::use_awaitable))
+        );
+        if (idle_result.index() == 1) {
+            co_return; // shutdown signalled
         }
     }
 }

@@ -168,14 +168,15 @@ void ClientApp::stop_all() {
         return;
     }
 
-    // Fallback: if run() hasn't finished within 5s of shutdown (a stuck op
-    // keeping the io_context alive — e.g. an uncancelled timer), force-stop
-    // so it returns. Woken early when the drain completes; joined in
-    // ~ClientApp before the io_context is destroyed. Created for every path,
-    // including the empty branch.
+    // Fallback: if run() hasn't finished within 2s of shutdown (an op still
+    // keeping the io_context alive — e.g. uncancellable DNS resolves from the
+    // tracker fan-out storm, which can take several seconds to drain
+    // naturally), force-stop so the process exits promptly. Woken early when
+    // the drain completes; joined in ~ClientApp before the io_context is
+    // destroyed. Created for every path, including the empty branch.
     force_stop_thread_ = std::jthread([this](std::stop_token st) {
         std::unique_lock lock(shutdown_mutex_);
-        if (!shutdown_cv_.wait_for(lock, st, std::chrono::seconds(5),
+        if (!shutdown_cv_.wait_for(lock, st, std::chrono::seconds(2),
                                    [this] { return run_finished_.load(); })) {
             if (!io_context_.stopped()) {
                 io_context_.stop();

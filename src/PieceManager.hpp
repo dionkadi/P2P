@@ -359,6 +359,7 @@ public:
         block_timeout_timer_.cancel();
         endgame_timer_.cancel();
         piece_request_trigger_.cancel();
+        shutdown_timer_.expires_at(asio::steady_timer::time_point::min());
         std::lock_guard lock(mutex_);
         // Break shared_ptr cycle: callbacks capture shared_from_this() of TorrentSession;
         // without clearing them TorrentSession never destructs → FileManager cache_ leaks.
@@ -421,6 +422,10 @@ private:
     asio::steady_timer piece_request_trigger_;
     asio::steady_timer block_timeout_timer_;
     asio::steady_timer endgame_timer_;
+    // Fired by signal_shutdown() to wake coroutines parked in long waits
+    // (the resumer's 2s idle poll) so they exit promptly during a graceful
+    // drain instead of pinning the io_context for up to the wait duration.
+    asio::steady_timer shutdown_timer_;
     std::shared_ptr<std::map<size_t, std::shared_ptr<InProgressPiece>>> in_progress_pieces_;
     std::shared_ptr<std::vector<size_t>> piece_availability_;
     std::shared_ptr<std::map<size_t, std::shared_ptr<std::unordered_set<int>>>> pieces_by_rarity_;
