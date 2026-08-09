@@ -1288,7 +1288,13 @@ public:
         render_thread_ = std::jthread{[this](std::stop_token stoken) {
             while (!stoken.stop_requested()) {
                 render_all();
-                std::this_thread::sleep_for(config_.interval);
+                // Sleep in small increments so stop() can join promptly
+                // instead of waiting out the full frame interval (up to 1s
+                // of extra shutdown latency after quitting).
+                const auto wake_at = std::chrono::steady_clock::now() + config_.interval;
+                while (!stoken.stop_requested() && std::chrono::steady_clock::now() < wake_at) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                }
             }
             // Force one final render loop to guarantee 100% finished states are printed
             render_all();

@@ -839,7 +839,13 @@ int main(int argc, char* argv[]) {
         uint64_t last_down = 0, last_up = 0;
         bool first = true;
         while (speed_log_active->load()) {
-            std::this_thread::sleep_for(std::chrono::seconds(1));
+            // Sleep in small increments so the join after shutdown returns
+            // promptly instead of waiting out the full 1s tick.
+            const auto wake_at = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+            while (speed_log_active->load() && std::chrono::steady_clock::now() < wake_at) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+            if (!speed_log_active->load()) break;
             uint64_t down = 0, up = 0;
             for (const auto& [hash, session] : app.torrents()) {
                 auto st = session->get_state();
@@ -882,5 +888,12 @@ int main(int argc, char* argv[]) {
     if (ctrack::profiling_is_enabled())
         ctrack::result_print();
 
-    return result;
+    // Skip normal teardown: destroying the io_context joins the resolver
+    // thread pool, which waits for the one in-flight getaddrinfo (up to
+    // the system DNS timeout — tens of seconds when the ~250-tracker
+    // fan-out storms the resolver; these ops cannot be cancelled). The
+    // state was just saved and the logger flushes synchronously on info,
+    // so nothing is lost by exiting directly; the OS reclaims any
+    // coroutine frames still suspended in DNS.
+    std::_Exit(result);
 }
