@@ -473,19 +473,29 @@ int main(int argc, char* argv[]) {
                     continue;
                 }
 
-                std::string cmd_line;
+                // Multiple lines may arrive in one read (a paste or a piped
+                // script); collect them all and dispatch each below instead
+                // of letting the last line overwrite the earlier ones.
+                std::vector<std::string> cmd_lines;
                 {
                     std::lock_guard lock(input_mutex);
                     for (ssize_t i = 0; i < n; ++i) {
                         char c = buf[i];
                         if (c == '\n' || c == '\r') {
-                            cmd_line = std::move(input_buffer);
+                            cmd_lines.push_back(std::move(input_buffer));
                             input_buffer.clear();
                             cursor_pos = 0;
                         } else if (c == 127 || c == '\b') {
                             if (cursor_pos > 0 && !input_buffer.empty()) {
-                                input_buffer.erase(cursor_pos - 1, 1);
-                                --cursor_pos;
+                                // Delete the whole UTF-8 character, not a
+                                // single byte: stepping back past the
+                                // continuation bytes lands on the lead byte.
+                                size_t start = cursor_pos - 1;
+                                while (start > 0 && (static_cast<unsigned char>(input_buffer[start]) & 0xC0) == 0x80) {
+                                    --start;
+                                }
+                                input_buffer.erase(start, cursor_pos - start);
+                                cursor_pos = start;
                             }
                         } else if (c == '\x1b' && i + 2 < n && buf[i + 1] == '[') {
                             // Escape sequence: \x1b[<char>
@@ -511,22 +521,40 @@ int main(int argc, char* argv[]) {
                                         }
                                     }
                                     break;
-                                case 'C': // Right
-                                    if (cursor_pos < input_buffer.size()) ++cursor_pos;
+                                case 'C': // Right — skip past the whole character
+                                    if (cursor_pos < input_buffer.size()) {
+                                        ++cursor_pos;
+                                        while (cursor_pos < input_buffer.size() &&
+                                               (static_cast<unsigned char>(input_buffer[cursor_pos]) & 0xC0) == 0x80) {
+                                            ++cursor_pos;
+                                        }
+                                    }
                                     break;
-                                case 'D': // Left
-                                    if (cursor_pos > 0) --cursor_pos;
+                                case 'D': // Left — step back to the character start
+                                    if (cursor_pos > 0) {
+                                        --cursor_pos;
+                                        while (cursor_pos > 0 &&
+                                               (static_cast<unsigned char>(input_buffer[cursor_pos]) & 0xC0) == 0x80) {
+                                            --cursor_pos;
+                                        }
+                                    }
                                     break;
                             }
                             i += 2;
-                        } else if (c >= 32 && c < 127) {
+                        } else if (static_cast<unsigned char>(c) >= 32) {
+                            // Accept any printable byte, including UTF-8
+                            // multibyte sequences (bytes >= 0x80; note the
+                            // unsigned cast — signed char makes them
+                            // negative). The old < 127 bound silently
+                            // dropped every non-ASCII character when pasting
+                            // e.g. Chinese filenames.
                             input_buffer.insert(cursor_pos, 1, c);
                             ++cursor_pos;
                         }
                     }
                 }
 
-                if (!cmd_line.empty()) {
+                for (std::string& cmd_line : cmd_lines) {
                     if (cmd_history.empty() || cmd_history.back() != cmd_line) {
                         cmd_history.push_back(cmd_line);
                     }
@@ -555,9 +583,18 @@ int main(int argc, char* argv[]) {
                         );
                     } else if (cmd_line[0] == 'a' && cmd_line.size() > 1) {
                         std::string rest = trim(cmd_line.substr(1));
-                        auto space = rest.find(' ');
-                        std::string tpath = (space != std::string::npos) ? trim(rest.substr(0, space)) : rest;
-                        std::string dpath = (space != std::string::npos) ? trim(rest.substr(space + 1)) : default_download_dir;
+                        // Paths may contain spaces: prefer interpreting the
+                        // whole rest as the torrent path when it exists, and
+                        // only split "path dest" when it doesn't.
+                        std::string tpath = rest;
+                        std::string dpath = default_download_dir;
+                        if (!std::filesystem::exists(tpath)) {
+                            auto space = rest.find(' ');
+                            if (space != std::string::npos) {
+                                tpath = trim(rest.substr(0, space));
+                                dpath = trim(rest.substr(space + 1));
+                            }
+                        }
                         if (std::filesystem::exists(tpath)) {
                             app.add_torrent(Mode::Hybrid, tpath, dpath, port);
                             command_log.info("Added: " + std::filesystem::path(tpath).filename().string());
