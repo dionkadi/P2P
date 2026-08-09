@@ -625,6 +625,13 @@ asio::awaitable<void> TorrentSession::tracker_announce_loop() {
         co_await self->announce_tracker_for(event);
         event = "";
 
+        if (self->shutting_down_) {
+            // stop() cancelled the timer while we were announcing; without
+            // this check the loop re-arms it for up to 30 minutes, pinning
+            // the io_context and stalling a graceful drain.
+            co_return;
+        }
+
         if (!self->state_->is_download_complete() && self->peerless_announces_ < 10) {
             // Peers can vanish en masse (seedbox rotation, tracker churn),
             // and waiting the full tracker interval (~30 min) would leave the
@@ -926,6 +933,9 @@ asio::awaitable<void> TorrentSession::discovered_peers_loop() {
             }
         }
 
+        if (shutting_down_) {
+            co_return;
+        }
         discovered_peers_timer_.expires_after(1min);
         boost::system::error_code ec;
         co_await discovered_peers_timer_.async_wait(asio::redirect_error(asio::use_awaitable, ec));
@@ -963,6 +973,13 @@ asio::awaitable<void> TorrentSession::dht_announce_loop() {
             if (ep.port() != peer_port_ || ep.address().to_string() != "127.0.0.1") {
                 peer_manager_->add_discovered_peer(ep);
             }
+        }
+
+        if (shutting_down_) {
+            // stop() cancelled the timer while we were in get_peers; without
+            // this check the loop re-arms it for up to 30 minutes, pinning
+            // the io_context and stalling a graceful drain.
+            co_return;
         }
 
         if (metadata_download_active_) {
@@ -2080,6 +2097,9 @@ asio::awaitable<void> TorrentSession::metadata_retry_loop() {
             if (conn->metadata_ext_id() != 0 && conn->metadata_size() > 0 && !conn->metadata_requested()) {
                 asio::co_spawn(io_context_, request_metadata_from_peer(conn), asio::detached);
             }
+        }
+        if (shutting_down_) {
+            co_return;
         }
         metadata_retry_timer_.expires_after(std::chrono::seconds(30));
         boost::system::error_code ec;

@@ -55,21 +55,29 @@ class UdpTrackerClient: public ITrackerClient, public std::enable_shared_from_th
 public:
     UdpTrackerClient(asio::io_context& io_context, std::string host, int port)
         : io_context_(io_context), socket_(io_context),
+          abort_timer_(io_context),
           host_(std::move(host)), port_(port),
           url_str_(std::format("{}:{}", host_, port_))
     {
         std::random_device rd;
         next_transaction_id_ = rd();
+        // Armed at max so the async_wait branches in the announce/connect
+        // compositions stay dormant until cancel() fires them.
+        abort_timer_.expires_at(asio::steady_timer::time_point::max());
     }
 
     asio::awaitable<TrackerAnnounceResult> announce(const AnnounceRequestParams& params) override;
     const std::string get_url() const override { return "udp://" + url_str_; }
     void cancel() override {
-        // Safe: asio completes all ops pending on a closed socket with
-        // operation_aborted, and UDP ops never close the socket themselves
-        // (no multi-endpoint iteration), so no concurrent deregister exists.
+        // Closing the socket completes a BARE pending receive with
+        // operation_aborted, but the `||` compositions in connect_to_tracker
+        // and announce do NOT complete when a branch errors — their retry
+        // timers (15s/30s/60s/120s backoff) would stay armed, holding the
+        // io_context alive for minutes after shutdown. Firing the abort
+        // timer completes those compositions via a success branch instead.
         boost::system::error_code ec;
         socket_.close(ec);
+        abort_timer_.expires_at(asio::steady_timer::time_point::min());
     }
 
 private:
@@ -78,6 +86,7 @@ private:
 
     asio::io_context& io_context_;
     asio::ip::udp::socket socket_;
+    asio::steady_timer abort_timer_;
     std::string host_;
     int port_;
     asio::ip::udp::endpoint tracker_endpoint_;
@@ -525,7 +534,8 @@ inline asio::awaitable<bool> UdpTrackerClient::connect_to_tracker() {
 
             auto result = co_await (
                 socket_.async_receive_from(asio::buffer(response_buffer), sender_endpoint, asio::use_awaitable) ||
-                timer.async_wait(asio::as_tuple(asio::use_awaitable))
+                timer.async_wait(asio::as_tuple(asio::use_awaitable)) ||
+                abort_timer_.async_wait(asio::as_tuple(asio::use_awaitable))
             );
 
             if (result.index() == 0) {
@@ -538,6 +548,8 @@ inline asio::awaitable<bool> UdpTrackerClient::connect_to_tracker() {
                         co_return true;
                     }
                 }
+            } else if (result.index() == 2) {
+                break; // cancelled (cancel() fired the abort timer)
             } else {
                 LOGWARN("UDP connect request timed out. Retrying...");
             }
@@ -599,7 +611,8 @@ inline asio::awaitable<TrackerAnnounceResult> UdpTrackerClient::announce(const A
 
             auto result = co_await (
                 socket_.async_receive_from(asio::buffer(response_buffer), sender_endpoint, asio::use_awaitable) ||
-                timer.async_wait(asio::as_tuple(asio::use_awaitable))
+                timer.async_wait(asio::as_tuple(asio::use_awaitable)) ||
+                abort_timer_.async_wait(asio::as_tuple(asio::use_awaitable))
             );
 
             if (result.index() == 0) {
@@ -622,6 +635,8 @@ inline asio::awaitable<TrackerAnnounceResult> UdpTrackerClient::announce(const A
                         co_return announce_result;
                     }
                 } 
+            } else if (result.index() == 2) {
+                break; // cancelled (cancel() fired the abort timer)
             } else {
                 LOGWARN("UDP announce request timed out. Retrying...");
             }
