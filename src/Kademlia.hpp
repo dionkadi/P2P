@@ -544,6 +544,10 @@ inline void DHTNode::stop() {
     }
     for (auto& query_ptr : queries) {
         query_ptr->completion(asio::error::operation_aborted, {});
+        // The self-bound expiry timer would otherwise keep its async_wait
+        // pending for up to KRPC_QUERY_TIMEOUT after shutdown, holding the
+        // io_context alive (graceful drains stall ~10s per in-flight query).
+        query_ptr->expiry_timer->cancel();
     }
 
     LOGINFO("DHT Node stopped.");

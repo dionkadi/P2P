@@ -168,6 +168,21 @@ void ClientApp::stop_all() {
         return;
     }
 
+    // Fallback: if run() hasn't finished within 5s of shutdown (a stuck op
+    // keeping the io_context alive — e.g. an uncancelled timer), force-stop
+    // so it returns. Woken early when the drain completes; joined in
+    // ~ClientApp before the io_context is destroyed. Created for every path,
+    // including the empty branch.
+    force_stop_thread_ = std::jthread([this](std::stop_token st) {
+        std::unique_lock lock(shutdown_mutex_);
+        if (!shutdown_cv_.wait_for(lock, st, std::chrono::seconds(5),
+                                   [this] { return run_finished_.load(); })) {
+            if (!io_context_.stopped()) {
+                io_context_.stop();
+            }
+        }
+    });
+
     std::map<InfoHash, std::shared_ptr<TorrentSession>> snapshot;
     {
         std::lock_guard lock(torrents_mutex_);
@@ -176,7 +191,17 @@ void ClientApp::stop_all() {
     }
 
     if (snapshot.empty()) {
-        io_context_.stop();
+        // No sessions to stop, but the shared DHT node may still be running
+        // (e.g. after 'r' removed the last torrent): it must be stopped or
+        // its loops keep the io_context alive forever. Cancel the
+        // permanently-armed signal wait too, then let run() drain naturally.
+        // io_context_.stop() here would abandon queued completions, leaking
+        // suspended coroutine frames (LSan).
+        if (dht_node_) {
+            dht_node_->stop();
+            dht_node_.reset();
+        }
+        signals_.cancel();
         return;
     }
 
@@ -207,22 +232,17 @@ void ClientApp::stop_all() {
                         dht_node_->stop();
                         dht_node_.reset();
                     }
-                    io_context_.stop();
+                    // Graceful drain: cancel the permanently-armed signal
+                    // wait, then let run() return once every queued
+                    // completion (cancelled timers/ops, loop unwinds) is
+                    // processed. io_context_.stop() here would abandon those
+                    // completions, leaking the suspended coroutine frames
+                    // they reference (LSan: awaitable_frame allocations).
+                    signals_.cancel();
                 }
             });
         }
     }
-
-    // Force-stop the io_context after a timeout if graceful shutdown stalls
-    // (e.g., pending HTTP tracker requests that never complete)
-    std::thread force_stop_thread([this] {
-        // Give shutdown enough time: stop() has a 2s announce timeout + 5s save timeout.
-        std::this_thread::sleep_for(std::chrono::seconds(5));
-        if (!io_context_.stopped()) {
-            io_context_.stop();
-        }
-    });
-    force_stop_thread.detach();
 }
 
 void ClientApp::init_dht(uint16_t port) {
@@ -294,6 +314,14 @@ int ClientApp::run() {
     for (auto& t : io_threads) {
         if (t.joinable()) t.join();
     }
+
+    // Signal the shutdown fallback thread that the drain finished (it wakes
+    // immediately instead of waiting out its 5s timeout).
+    {
+        std::lock_guard lock(shutdown_mutex_);
+        run_finished_ = true;
+    }
+    shutdown_cv_.notify_all();
 
     LOGINFO("ClientApp finished.");
     return 0;

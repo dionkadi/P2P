@@ -504,6 +504,12 @@ inline asio::awaitable<bool> UdpTrackerClient::connect_to_tracker() {
     const int max_retries = 4;
     
     while (n < max_retries) {
+        if (!socket_.is_open()) {
+            // Cancelled (client->cancel() closed the socket): stop retrying,
+            // or the exponential backoff timers (15s/30s/60s/120s) would keep
+            // the io_context alive for minutes after shutdown.
+            break;
+        }
         UdpConnectRequest req;
         req.transaction_id = htobe32(next_transaction_id_++);
 
@@ -562,6 +568,12 @@ inline asio::awaitable<TrackerAnnounceResult> UdpTrackerClient::announce(const A
     const int max_retries = 4;
     
     while (n <= max_retries) {
+        if (!socket_.is_open()) {
+            // Cancelled (client->cancel() closed the socket): stop retrying,
+            // or the exponential backoff timers (15s/30s/60s/120s) would keep
+            // the io_context alive for minutes after shutdown.
+            break;
+        }
         UdpAnnounceRequest req;
         req.connection_id = htobe64(connection_id_);
         req.transaction_id = htobe32(next_transaction_id_++);

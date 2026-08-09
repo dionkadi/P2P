@@ -6,6 +6,7 @@
 
 #include <boost/asio/signal_set.hpp>
 #include <atomic>
+#include <condition_variable>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -129,6 +130,17 @@ private:
     ClientConfig config_;
     std::vector<std::string> global_trackers_;
     std::atomic<bool> stopping_{false};
+
+    // Graceful-shutdown coordination: the io_context drains naturally after
+    // the last session stop completes (io_context_.stop() would abandon
+    // queued completions and leak suspended coroutine frames). The fallback
+    // thread force-stops after 5s if run() hasn't finished (a stuck op);
+    // it is joined here (before io_context_ is destroyed) and woken early
+    // when the drain completes.
+    std::jthread force_stop_thread_;
+    std::mutex shutdown_mutex_;
+    std::condition_variable_any shutdown_cv_; // supports wait_for(stop_token, ...)
+    std::atomic<bool> run_finished_{false};
 
     void spawn_session(const std::shared_ptr<TorrentSession>& session);
     void apply_global_trackers(std::shared_ptr<TorrentSession> session);
