@@ -54,6 +54,51 @@ static std::string trim(std::string s) {
     return s.substr(start, end - start + 1);
 }
 
+// Strip one pair of matching outer quotes (single or double). Used for
+// commands whose argument is the whole rest of the line (e.g. 'd'), where
+// the path itself may contain spaces.
+static std::string strip_outer_quotes(std::string s) {
+    if (s.size() >= 2 && ((s.front() == '"' && s.back() == '"') ||
+                          (s.front() == '\'' && s.back() == '\''))) {
+        return s.substr(1, s.size() - 2);
+    }
+    return s;
+}
+
+// Split a command line into whitespace-separated tokens, honoring single
+// and double quotes: quoted whitespace is preserved and the quote chars are
+// stripped. An unclosed quote keeps the partial token (best effort).
+static std::vector<std::string> tokenize_args(const std::string& s) {
+    std::vector<std::string> tokens;
+    std::string cur;
+    bool in_single = false, in_double = false;
+    for (char c : s) {
+        if (in_single) {
+            if (c == '\'') in_single = false;
+            else cur += c;
+        } else if (in_double) {
+            if (c == '"') in_double = false;
+            else cur += c;
+        } else if (c == '\'') {
+            in_single = true;
+        } else if (c == '"') {
+            in_double = true;
+        } else if (c == ' ' || c == '\t') {
+            if (!cur.empty()) {
+                tokens.push_back(std::move(cur));
+                cur.clear();
+            }
+        } else {
+            cur += c;
+        }
+    }
+    tokens.push_back(std::move(cur)); // includes the unclosed-quote partial
+    if (tokens.size() == 1 && tokens[0].empty()) {
+        tokens.clear();
+    }
+    return tokens;
+}
+
 // RAII terminal raw mode: disables echo and canonical (line-buffered) input
 // so we can read keystrokes character-by-character. Keeps ISIG so CTRL+C
 // still sends SIGINT for graceful shutdown.
@@ -583,16 +628,20 @@ int main(int argc, char* argv[]) {
                         );
                     } else if (cmd_line[0] == 'a' && cmd_line.size() > 1) {
                         std::string rest = trim(cmd_line.substr(1));
-                        // Paths may contain spaces: prefer interpreting the
-                        // whole rest as the torrent path when it exists, and
-                        // only split "path dest" when it doesn't.
-                        std::string tpath = rest;
-                        std::string dpath = default_download_dir;
-                        if (!std::filesystem::exists(tpath)) {
-                            auto space = rest.find(' ');
-                            if (space != std::string::npos) {
-                                tpath = trim(rest.substr(0, space));
-                                dpath = trim(rest.substr(space + 1));
+                        // Paths may contain spaces: if the whole rest exists
+                        // as a file (unquoted paste), use it verbatim;
+                        // otherwise tokenize — quotes preserve internal
+                        // spaces and separate "path dest".
+                        std::string tpath, dpath = default_download_dir;
+                        if (std::filesystem::exists(rest)) {
+                            tpath = rest;
+                        } else {
+                            auto tokens = tokenize_args(rest);
+                            if (tokens.empty()) {
+                                tpath = rest;
+                            } else {
+                                tpath = tokens[0];
+                                if (tokens.size() > 1) dpath = tokens[1];
                             }
                         }
                         if (std::filesystem::exists(tpath)) {
@@ -606,6 +655,7 @@ int main(int argc, char* argv[]) {
                         auto space = rest.find(' ');
                         std::string magnet = (space != std::string::npos) ? trim(rest.substr(0, space)) : rest;
                         std::string dpath = (space != std::string::npos) ? trim(rest.substr(space + 1)) : default_download_dir;
+                        magnet = strip_outer_quotes(magnet);
                         try {
                             app.add_torrent_magnet(magnet, dpath, port);
                             command_log.info("Magnet torrent added");
@@ -613,7 +663,7 @@ int main(int argc, char* argv[]) {
                             command_log.warning("Bad magnet URI: " + std::string(e.what()));
                         }
                     } else if (cmd_line[0] == 'd' && cmd_line.size() > 1) {
-                        default_download_dir = trim(cmd_line.substr(1));
+                        default_download_dir = strip_outer_quotes(trim(cmd_line.substr(1)));
                         command_log.info("Default download dir: " + default_download_dir);
                     } else if (cmd_line[0] == 't' && cmd_line.size() > 1) {
                         std::string url = trim(cmd_line.substr(1));
