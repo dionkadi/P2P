@@ -74,27 +74,26 @@ jobs:
       - name: Build
         run: cmake --build build --parallel "$(nproc)"
 
-      # The IntegrationFixture shares one io_context and ports across tests, so
-      # leaked state makes IntegrationTest.PEX / UdpTrackerAnnounce flaky when
-      # the full suite runs in one process (they pass in a fresh process — see
-      # AGENTS.md "rerun individually before chasing flakiness"). Retry exactly
-      # those in a new process; any other failure, or a persistent failure,
-      # still fails the job.
+      # The integration tests use fixed 60-180s wall-clock budgets and share
+      # one fixture, so on the 4-core ASan runner they flake randomly by test
+      # (observed: PEX, UdpTrackerAnnounce, TrackerFailover). Retrying a failed
+      # integration test in a fresh process passes (AGENTS.md: rerun
+      # individually before chasing flakiness). Unit-test failures and any
+      # failure that persists on the retry still fail the job.
       - name: Run tests
         run: |
           set +e
           ./build/p2p_test 2>&1 | tee test_run1.log
           status=${PIPESTATUS[0]}
           [ "$status" = "0" ] && exit 0
-          allowed="IntegrationTest.PEX IntegrationTest.UdpTrackerAnnounce"
           failed=$(grep -Eo '\[  FAILED  \] [A-Za-z0-9_]+\.[A-Za-z0-9_]+' test_run1.log | sed 's/.*\] //' | sort -u)
           echo "Failed tests: ${failed:-<none parsed — hard crash?>}"
           for t in $failed; do
-            [[ " $allowed " == *" $t "* ]] || { echo "Non-flaky failure: $t"; exit "$status"; }
+            [[ "$t" == IntegrationTest.* ]] || { echo "Non-integration failure: $t"; exit "$status"; }
           done
           [ -n "$failed" ] || { echo "Could not parse failed tests"; exit "$status"; }
           filter=$(echo "$failed" | paste -sd: -)
-          echo "Retrying known-flaky tests in a fresh process: $filter"
+          echo "Retrying flaky integration tests in a fresh process: $filter"
           ./build/p2p_test --gtest_filter="$filter" 2>&1 | tee test_run2.log
           exit "${PIPESTATUS[0]}"
 
