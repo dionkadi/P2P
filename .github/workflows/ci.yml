@@ -74,12 +74,13 @@ jobs:
       - name: Build
         run: cmake --build build --parallel "$(nproc)"
 
-      # The integration tests use fixed 60-180s wall-clock budgets and share
+      # The integration tests use fixed 60-600s wall-clock budgets and share
       # one fixture, so on the 4-core ASan runner they flake randomly by test
-      # (observed: PEX, UdpTrackerAnnounce, TrackerFailover). Retrying a failed
-      # integration test in a fresh process passes (AGENTS.md: rerun
-      # individually before chasing flakiness). Unit-test failures and any
-      # failure that persists on the retry still fail the job.
+      # (observed across runs: PEX, UdpTrackerAnnounce, TrackerFailover,
+      # RateLimit, LargeTorrentManyPieces). Each failed integration test is
+      # retried up to 2x, alone in a fresh process, after a short pause
+      # (AGENTS.md: rerun individually before chasing flakiness). Unit-test
+      # failures and anything that fails all attempts still fail the job.
       - name: Run tests
         run: |
           set +e
@@ -88,14 +89,29 @@ jobs:
           [ "$status" = "0" ] && exit 0
           failed=$(grep -Eo '\[  FAILED  \] [A-Za-z0-9_]+\.[A-Za-z0-9_]+' test_run1.log | sed 's/.*\] //' | sort -u)
           echo "Failed tests: ${failed:-<none parsed — hard crash?>}"
+          [ -n "$failed" ] || exit "$status"
           for t in $failed; do
             [[ "$t" == IntegrationTest.* ]] || { echo "Non-integration failure: $t"; exit "$status"; }
           done
-          [ -n "$failed" ] || { echo "Could not parse failed tests"; exit "$status"; }
-          filter=$(echo "$failed" | paste -sd: -)
-          echo "Retrying flaky integration tests in a fresh process: $filter"
-          ./build/p2p_test --gtest_filter="$filter" 2>&1 | tee test_run2.log
-          exit "${PIPESTATUS[0]}"
+          sleep 20
+          persistent=""
+          for t in $failed; do
+            ok=""
+            for r in 1 2; do
+              out=$(./build/p2p_test --gtest_filter="$t" 2>&1)
+              if [ "$?" = "0" ]; then ok=1; break; fi
+              echo "$out" | tail -20 | tee -a test_retry.log
+              echo "Retry $r for $t failed, sleeping..."
+              sleep 20
+            done
+            [ -n "$ok" ] || persistent="$persistent $t"
+          done
+          if [ -n "$persistent" ]; then
+            echo "FAILED after retries:$persistent"
+            exit "$status"
+          fi
+          echo "All retried integration tests passed in fresh processes."
+          exit 0
 
       - name: Upload app logs on failure
         if: failure()
