@@ -38,7 +38,7 @@ jobs:
           for i in 1 2 3; do
             if dnf install -y --setopt=install_weak_deps=False \
                  --disablerepo=fedora-cisco-openh264 \
-                 clang gcc gcc-c++ make cmake python3 \
+                 clang gcc gcc-c++ compiler-rt make cmake python3 \
                  git curl tar gzip which findutils \
                  openssl-devel spdlog-devel gtest-devel tbb-devel; then
               ok=1; break
@@ -46,7 +46,7 @@ jobs:
             echo "dnf attempt $i failed, retrying..." && sleep 5
           done
           [ "$ok" = "1" ]
-          rpm -q clang cmake spdlog-devel gtest-devel tbb-devel openssl-devel >/dev/null
+          rpm -q clang compiler-rt cmake spdlog-devel gtest-devel tbb-devel openssl-devel >/dev/null
 
       - uses: actions/checkout@v4
 
