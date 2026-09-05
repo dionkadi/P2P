@@ -1,5 +1,11 @@
 name: CI
 
+# The project targets a modern stack (clang 22 / libstdc++ 16 features such as
+# std::views::zip, and the Boost.Asio completion-token design from Boost 1.9x).
+# Ubuntu runners only ship Boost 1.83, so the job runs in the Fedora 44
+# container (same distro as the development host) and builds Boost 1.91.0
+# from source, installing only the subset this project links against.
+
 on:
   push:
     branches: [master]
@@ -13,34 +19,54 @@ concurrency:
 
 jobs:
   build-and-test:
-    name: Build & test (Debug + ASan)
+    name: Build & test (Fedora 44, clang + ASan)
     runs-on: ubuntu-24.04
+    container:
+      image: registry.fedoraproject.org/fedora:44
     timeout-minutes: 60
     env:
-      CC: gcc-14
-      CXX: g++-14
+      CC: clang
+      CXX: clang++
+      BOOST_VERSION: "1.91.0"
 
     steps:
-      - uses: actions/checkout@v4
-
+      # The openh264 repo is unneeded here and its mirror is flaky; retries
+      # guard against transient metalink/mirror resets.
       - name: Install toolchain and dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            g++-14 \
-            python3-pip \
-            libboost-dev \
-            libboost-url-dev \
-            libssl-dev \
-            libspdlog-dev \
-            libgtest-dev \
-            libtbb-dev
+          ok=0
+          for i in 1 2 3; do
+            if dnf install -y --setopt=install_weak_deps=False \
+                 --disablerepo=fedora-cisco-openh264 \
+                 clang gcc gcc-c++ make cmake python3 \
+                 git curl tar gzip which findutils \
+                 openssl-devel spdlog-devel gtest-devel tbb-devel; then
+              ok=1; break
+            fi
+            echo "dnf attempt $i failed, retrying..." && sleep 5
+          done
+          [ "$ok" = "1" ]
+          rpm -q clang cmake spdlog-devel gtest-devel tbb-devel openssl-devel >/dev/null
 
-      # Ubuntu 24.04's apt cmake is 3.28; this project requires CMake 4.0.
-      - name: Install CMake 4.x
+      - uses: actions/checkout@v4
+
+      - name: Restore Boost cache
+        id: boost-cache
+        uses: actions/cache@v4
+        with:
+          path: /usr/local
+          key: boost-${{ env.BOOST_VERSION }}-fedora44-clang-${{ runner.arch }}
+
+      - name: Build and install Boost ${{ env.BOOST_VERSION }}
+        if: steps.boost-cache.outputs.cache-hit != 'true'
         run: |
-          python3 -m pip install --user "cmake>=4.0,<5"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          set -euo pipefail
+          BOOST_UNDER="${BOOST_VERSION//./_}"
+          curl -fsSL "https://archives.boost.io/release/${BOOST_VERSION}/source/boost_${BOOST_UNDER}.tar.gz" -o /tmp/boost.tar.gz
+          tar -xzf /tmp/boost.tar.gz -C /tmp
+          cd "/tmp/boost_${BOOST_UNDER}"
+          ./bootstrap.sh --with-toolset=clang
+          ./b2 -j"$(nproc)" --with-url --with-random --with-system install
 
       - name: Configure
         run: cmake -B build -DCMAKE_BUILD_TYPE=Debug
